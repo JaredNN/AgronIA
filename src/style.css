@@ -195,6 +195,36 @@
   letter-spacing: 0.12em;
 }
 
+.topo-brand-drone {
+  position: absolute;
+  top: 2px;
+  right: 57px;
+  width: 25px;
+  height: 18px;
+  color: #dec66f;
+  filter: drop-shadow(0 0 6px rgba(222, 198, 111, 0.5));
+  pointer-events: none;
+  animation: brand-drone-hover 3.2s ease-in-out infinite;
+}
+
+.topo-brand-drone::after {
+  position: absolute;
+  top: 15px;
+  left: 50%;
+  width: 1px;
+  height: 15px;
+  background: linear-gradient(rgba(222, 198, 111, 0.5), transparent);
+  content: "";
+}
+
+.topo-brand-drone svg {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 .app-sidebar nav {
   padding-top: 16px;
   padding-bottom: 16px;
@@ -484,6 +514,11 @@
 @keyframes sidebar-drone-beacon {
   0% { opacity: 0.32; transform: scale(0.75); }
   70%, 100% { opacity: 0; transform: scale(1.55); }
+}
+
+@keyframes brand-drone-hover {
+  0%, 100% { transform: translateY(0) rotate(-3deg); }
+  50% { transform: translateY(3px) rotate(3deg); }
 }
 
 @media (max-width: 767px) {

@@ -104,6 +104,13 @@ const sidebarDrones = ['gold', 'orange', 'green', 'lime', 'teal']
         <img class="topo-brand-logo" :src="agroniaLogo" alt="AgronIA" />
       </div>
       <span class="topo-brand-version">FIELD</span>
+      <span class="topo-brand-drone" aria-hidden="true">
+        <svg viewBox="0 0 48 32" fill="none">
+          <path d="M24 13 13 5M24 13l11-8M24 18 13 27m11-9 11 9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+          <rect x="18" y="12" width="12" height="8" rx="3" fill="currentColor" />
+          <path class="topo-drone-rotor" d="M7 5h7m20 0h7M7 27h7m20 0h7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" />
+        </svg>
+      </span>
     </div>
     
     <nav class="topo-navigation flex-1 overflow-y-auto py-4" aria-label="Secciones de AgronIA">
