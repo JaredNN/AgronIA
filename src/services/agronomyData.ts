@@ -373,9 +373,17 @@ export const saveFieldMetric = async (metric: FieldMetricInput): Promise<void> =
 }
 
 export const saveFieldMetrics = async (metrics: FieldMetricInput[]): Promise<void> => {
+  if (metrics.length === 0) return
   const client = requireSupabase()
+  const { data: { user }, error: authError } = await client.auth.getUser()
+  if (authError) throw new Error(`No se pudo validar la sesión para guardar mediciones: ${authError.message}`)
+  if (!user) throw new Error('Inicia sesión para guardar mediciones.')
+
   for (let offset = 0; offset < metrics.length; offset += 500) {
-    const batch = metrics.slice(offset, offset + 500)
+    const batch = metrics.slice(offset, offset + 500).map(metric => ({
+      ...metric,
+      user_id: user.id,
+    }))
     const { error } = await client.from('field_metrics').insert(batch)
     if (error) {
       throw new Error(`No se pudieron guardar las mediciones ${offset + 1}-${offset + batch.length}: ${error.message}`)
