@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { supabase } from '../services/supabase'
 import { useMainStore } from '../stores'
+import agroniaLogo from '../assets/agronia-logo.png'
 import {
   Mail, Lock, Eye, EyeOff, Leaf, AlertCircle,
   Loader2, ShieldCheck, AlertTriangle, CheckCircle2, Sparkles
@@ -268,17 +269,7 @@ const translateError = (msg: string): string => {
 
     <!-- ═══ TARJETA PRINCIPAL ═══ -->
     <div class="login-card">
-      <!-- Logo con radar animado -->
-      <div class="logo-wrapper">
-        <div class="logo-ring ring-1"></div>
-        <div class="logo-ring ring-2"></div>
-        <div class="logo-pulse"></div>
-        <Leaf class="logo-icon" :size="30" :stroke-width="2.5" />
-      </div>
-
-      <h1 class="title">
-Agron<span class="accent">IA</span>
-      </h1>
+      <img class="login-brand-logo" :src="agroniaLogo" alt="AgronIA" />
 
       <div class="badge">
         <ShieldCheck :size="12" />
@@ -339,6 +330,10 @@ Agron<span class="accent">IA</span>
             </div>
           </transition>
         </div>
+
+        <RouterLink to="/recuperar-acceso" class="recovery-link reveal-item reveal-delay-2">
+          ¿Olvidaste tu contraseña o usuario?
+        </RouterLink>
 
         <transition name="fade">
           <div v-if="loading" class="progress-bar">
@@ -617,6 +612,14 @@ Agron<span class="accent">IA</span>
   text-align: center;
 }
 
+.login-brand-logo {
+  display: block;
+  width: min(220px, 72%);
+  height: auto;
+  margin: 0 auto 20px;
+  filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.3));
+}
+
 /* ═══════════════════════════════════════
    LOGO con radar
    ═══════════════════════════════════════ */
@@ -873,6 +876,25 @@ Agron<span class="accent">IA</span>
 .footer-link:hover {
   color: #34D399;
   text-decoration: underline;
+}
+
+.recovery-link {
+  align-self: flex-end;
+  margin-top: -6px;
+  color: #e5c355;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: color 0.2s ease, transform 0.2s ease;
+}
+.recovery-link:hover {
+  color: #ffdc72;
+  transform: translateX(2px);
+}
+.recovery-link:focus-visible {
+  outline: 2px solid var(--palette-gold);
+  outline-offset: 4px;
+  border-radius: 2px;
 }
 
 .bottom-credit {

@@ -3,7 +3,9 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { Home, Map, MapPin, PieChart, Database, Settings, LogOut, MonitorPlay, ShieldCheck, Users, ScanSearch, Sprout } from 'lucide-vue-next'
 import { useMainStore } from '../../stores'
 import { supabase } from '../../services/supabase'
+import { isDesktopApp } from '../../services/desktopRuntime'
 import { computed } from 'vue'
+import agroniaLogo from '../../assets/agronia-logo.png'
 
 const route = useRoute()
 const router = useRouter()
@@ -28,13 +30,13 @@ const menuItems = computed(() => [
   { name: 'Mapas', path: '/mapas', icon: Map, group: 'OPERACIÓN', accent: 'blue' },
   { name: 'Dashboards', path: '/dashboards', icon: PieChart, group: 'OPERACIÓN', accent: 'violet' },
   { name: 'Datos', path: '/datos', icon: Database, group: 'OPERACIÓN', accent: 'cyan' },
-  { name: 'Análisis IA', path: '/analisis', icon: ScanSearch, group: 'OPERACIÓN', accent: 'violet' },
-  { name: 'Diagnóstico', path: '/diagnostico', icon: ScanSearch, group: 'OPERACIÓN', accent: 'green' },
+  { name: 'Análisis IA', path: '/analisis', icon: ScanSearch, group: 'OPERACIÓN', accent: 'indigo' },
+  { name: 'Diagnóstico', path: '/diagnostico', icon: ScanSearch, group: 'OPERACIÓN', accent: 'lime' },
   { name: 'Simulación', path: '/simulacion', icon: MonitorPlay, group: 'OPERACIÓN', accent: 'gold' },
   { name: 'Usuarios', path: '/usuarios', icon: Users, group: 'GESTIÓN', accent: 'pink' },
   { name: 'Parcelas', path: '/parcelas', icon: MapPin, group: 'GESTIÓN', accent: 'orange' },
-  { name: 'Campos y registros', path: '/campos', icon: Sprout, group: 'GESTIÓN', accent: 'green' },
-  { name: 'Configuración', path: '/configuracion', icon: Settings, group: 'GESTIÓN', accent: 'slate' },
+  { name: 'Campos y registros', path: '/campos', icon: Sprout, group: 'GESTIÓN', accent: 'teal' },
+  { name: 'Configuración', path: '/configuracion', icon: Settings, group: 'GESTIÓN', accent: 'rose' },
 ].filter(item => item.path !== '/usuarios' || userRole.value === 'Administrador'))
 
 const isActive = (path: string) => route.path === path
@@ -75,35 +77,55 @@ const roleColor = computed(() => {
   if (userRole.value === 'Técnico') return 'text-orange-600'
   return 'text-blue-600'
 })
+
+
+const sidebarDrones = [
+  { id: 'gold-a', color: 'gold', top: '12%', size: '38px', duration: '19s', delay: '-2s', direction: 'right' },
+  { id: 'orange-a', color: 'orange', top: '27%', size: '34px', duration: '23s', delay: '-9s', direction: 'left' },
+  { id: 'green-a', color: 'green', top: '43%', size: '42px', duration: '21s', delay: '-14s', direction: 'right' },
+  { id: 'lime-a', color: 'lime', top: '58%', size: '36px', duration: '25s', delay: '-6s', direction: 'left' },
+  { id: 'teal-a', color: 'teal', top: '72%', size: '40px', duration: '22s', delay: '-18s', direction: 'right' },
+  { id: 'gold-b', color: 'gold', top: '88%', size: '32px', duration: '27s', delay: '-12s', direction: 'left' },
+]
+
 </script>
 
 <template>
   <aside class="app-sidebar topo-sidebar w-64 bg-white border-r border-gray-200 h-screen flex flex-col" aria-label="Navegación principal">
+
     <div class="topo-drone-scene" aria-hidden="true">
-      <svg v-for="drone in 4" :key="drone" class="topo-drone" :class="`topo-drone-${drone}`" viewBox="0 0 48 32" fill="none">
-        <path d="M24 13 13 5M24 13l11-8M24 18 13 27m11-9 11 9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
-        <rect x="18" y="12" width="12" height="8" rx="3" fill="currentColor" />
-        <path class="topo-drone-rotor" d="M7 5h7m20 0h7M7 27h7m20 0h7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" />
+      <svg
+        v-for="drone in sidebarDrones"
+        :key="drone.id"
+        class="topo-drone"
+        :class="[`topo-drone-${drone.color}`, `topo-drone-${drone.direction}`]"
+        :style="{
+          '--drone-top': drone.top,
+          '--drone-size': drone.size,
+          '--drone-duration': drone.duration,
+          '--drone-delay': drone.delay
+        }"
+        viewBox="0 0 64 32"
+        fill="none"
+      >
+        <ellipse class="topo-drone-rotor" cx="12" cy="10" rx="10" ry="2" fill="currentColor" opacity="0.62" />
+        <ellipse class="topo-drone-rotor" cx="52" cy="10" rx="10" ry="2" fill="currentColor" opacity="0.62" />
+        <path d="M24 14 12 10m28 4 12-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+        <rect x="24" y="12" width="16" height="8" rx="3" fill="#17200f" stroke="currentColor" stroke-width="1.5" />
+        <circle cx="32" cy="22" r="3" fill="currentColor" />
+        <circle class="topo-drone-beacon" cx="32" cy="22" r="6" fill="currentColor" />
       </svg>
     </div>
+
     <div class="topo-brand h-16 flex items-center px-6 border-b border-gray-100">
-      <div class="topo-brand-content flex items-center gap-2">
-        <div class="topo-brand-mark w-8 h-8 rounded-lg bg-agron-green flex items-center justify-center shadow-sm">
-          <span class="text-white font-bold text-xl leading-none">A</span>
-        </div>
-        <div class="topo-brand-copy">
-          <span class="topo-brand-name text-xl font-bold text-gray-900 tracking-tight">AgronIA</span>
-          <span class="block text-[10px] text-gray-400 leading-none -mt-0.5">Agricultura de Precisión</span>
+      <div class="topo-brand-content flex items-center">
+        <img class="topo-brand-logo" :src="agroniaLogo" alt="AgronIA" />
+        <div class="topo-brand-copy" aria-hidden="true">
+          <span>AGRICULTURA</span>
+          <strong>DE PRECISIÓN</strong>
         </div>
       </div>
-      <span class="topo-brand-version">FIELD</span>
-      <span class="topo-brand-drone" aria-hidden="true">
-        <svg viewBox="0 0 48 32" fill="none">
-          <path d="M24 13 13 5M24 13l11-8M24 18 13 27m11-9 11 9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
-          <rect x="18" y="12" width="12" height="8" rx="3" fill="currentColor" />
-          <path class="topo-drone-rotor" d="M7 5h7m20 0h7M7 27h7m20 0h7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" />
-        </svg>
-      </span>
+      <span class="topo-brand-version"><i aria-hidden="true"></i> {{ isDesktopApp ? 'DESKTOP' : 'FIELD' }}</span>
     </div>
     
     <nav class="topo-navigation flex-1 overflow-y-auto py-4" aria-label="Secciones de AgronIA">

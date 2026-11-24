@@ -4,21 +4,39 @@ import { useRouter } from 'vue-router'
 import { supabase } from '../services/supabase'
 import {
   Mail, Lock, Eye, EyeOff, Leaf, AlertCircle, UserRound,
-  Loader2, ShieldCheck, AlertTriangle, CheckCircle2, Sparkles
+  Loader2, ShieldCheck, AlertTriangle, CheckCircle2, Sparkles, RefreshCw
 } from 'lucide-vue-next'
 
 const router = useRouter()
+const agroniaMark = `${import.meta.env.BASE_URL}agronia-wordmark-mark.png`
+const agroniaWordmark = `${import.meta.env.BASE_URL}agronia-wordmark.png`
 const fullName = ref('')
 const email = ref('')
 const password = ref('')
+const verificationCode = ref('')
 const loading = ref(false)
 const error = ref('')
 const successMessage = ref('')
+const verificationStep = ref(false)
+const resendCooldown = ref(0)
 const showPassword = ref(false)
 const capsLockOn = ref(false)
 const progress = ref(0)
 const registerSuccess = ref(false)
 let successRedirectTimeout: ReturnType<typeof setTimeout> | undefined
+let resendInterval: ReturnType<typeof setInterval> | undefined
+
+const backgroundDrones = Array.from({ length: 8 }, (_, index) => ({
+  id: index,
+  color: ['#78964c', '#ffc400', '#f58a00', '#b4d18b'][index % 4],
+  style: {
+    '--drone-y': `${9 + index * 11}%`,
+    '--drone-size': `${38 + (index % 3) * 9}px`,
+    '--drone-duration': `${19 + (index % 5) * 3}s`,
+    '--drone-delay': `${-index * 2.7}s`,
+    '--drone-direction': index % 2 ? 'reverse' : 'normal'
+  }
+}))
 
 const passwordStrength = computed(() => {
   const value = password.value
@@ -45,7 +63,20 @@ onUnmounted(() => {
   window.removeEventListener('keydown', checkCapsLock)
   window.removeEventListener('keyup', checkCapsLock)
   if (successRedirectTimeout) clearTimeout(successRedirectTimeout)
+  if (resendInterval) clearInterval(resendInterval)
 })
+
+const startResendCooldown = () => {
+  if (resendInterval) clearInterval(resendInterval)
+  resendCooldown.value = 60
+  resendInterval = setInterval(() => {
+    resendCooldown.value -= 1
+    if (resendCooldown.value <= 0 && resendInterval) {
+      clearInterval(resendInterval)
+      resendInterval = undefined
+    }
+  }, 1000)
+}
 
 const handleRegister = async () => {
   loading.value = true
@@ -62,7 +93,7 @@ const handleRegister = async () => {
       return
     }
 
-    const { error: authError } = await supabase.auth.signUp({
+    const { data, error: authError } = await supabase.auth.signUp({
       email: email.value.trim(),
       password: password.value,
       options: {
@@ -78,12 +109,18 @@ const handleRegister = async () => {
     if (authError) {
       error.value = translateError(authError.message)
       progress.value = 0
+    } else if (data.session) {
+      const { error: signOutError } = await supabase.auth.signOut({ scope: 'local' })
+      if (signOutError) throw signOutError
+      error.value = 'El proyecto no está exigiendo confirmar el correo. Activa la confirmación de email en Supabase para completar el registro con código.'
+      progress.value = 0
     } else {
-      registerSuccess.value = true
+      verificationStep.value = true
+      successMessage.value = `Enviamos un código de verificación a ${email.value.trim()}.`
+      startResendCooldown()
       progress.value = 100
-      successRedirectTimeout = setTimeout(() => router.push('/login'), 3500)
     }
-  } catch (err: any) {
+  } catch (err: unknown) {
     error.value = err instanceof Error
       ? translateError(err.message)
       : 'Error inesperado al registrar. Intenta de nuevo.'
@@ -93,9 +130,93 @@ const handleRegister = async () => {
   }
 }
 
+const handleVerifyCode = async () => {
+  loading.value = true
+  error.value = ''
+  progress.value = 35
+
+  try {
+    if (!supabase) {
+      error.value = 'La configuración de Supabase no está disponible. Revisa las variables de entorno.'
+      progress.value = 0
+      return
+    }
+
+    const { data, error: verifyError } = await supabase.auth.verifyOtp({
+      email: email.value.trim(),
+      token: verificationCode.value.trim(),
+      type: 'signup',
+    })
+
+    if (verifyError) {
+      error.value = translateError(verifyError.message)
+      progress.value = 0
+      return
+    }
+
+    if (!data.session) {
+      error.value = 'No se pudo confirmar la cuenta. Solicita un nuevo código e inténtalo otra vez.'
+      progress.value = 0
+      return
+    }
+
+    const { error: signOutError } = await supabase.auth.signOut({ scope: 'local' })
+    if (signOutError) throw signOutError
+
+    progress.value = 100
+    registerSuccess.value = true
+    successRedirectTimeout = setTimeout(() => router.push('/login'), 3500)
+  } catch (err: unknown) {
+    error.value = err instanceof Error
+      ? translateError(err.message)
+      : 'Error inesperado al verificar el correo. Intenta de nuevo.'
+    progress.value = 0
+  } finally {
+    loading.value = false
+  }
+}
+
+const resendVerificationCode = async () => {
+  if (!supabase || resendCooldown.value > 0 || loading.value) return
+
+  loading.value = true
+  error.value = ''
+  successMessage.value = ''
+
+  try {
+    const { error: resendError } = await supabase.auth.resend({
+      type: 'signup',
+      email: email.value.trim(),
+    })
+
+    if (resendError) {
+      error.value = translateError(resendError.message)
+      return
+    }
+
+    successMessage.value = `Enviamos un nuevo código a ${email.value.trim()}.`
+    verificationCode.value = ''
+    startResendCooldown()
+  } catch (err: unknown) {
+    error.value = err instanceof Error
+      ? translateError(err.message)
+      : 'No se pudo reenviar el código. Intenta de nuevo.'
+  } finally {
+    loading.value = false
+  }
+}
+
+const handleSubmit = () => verificationStep.value ? handleVerifyCode() : handleRegister()
+
 const translateError = (msg: string): string => {
   if (msg.includes('Password should')) return 'La contraseña es demasiado corta'
   if (msg.includes('User already registered')) return 'Este correo ya está registrado'
+  if (/invalid.*(token|otp)|token.*(expired|invalid)|otp.*expired/i.test(msg)) {
+    return 'El código no es válido o ya venció. Solicita uno nuevo e inténtalo otra vez.'
+  }
+  if (/too many requests|rate limit/i.test(msg)) {
+    return 'Se hicieron demasiados intentos. Espera un momento antes de volver a intentarlo.'
+  }
   if (/abort|timeout|timed out|failed to fetch|networkerror/i.test(msg)) {
     return 'No se pudo conectar con el servicio de registro. Comprueba tu conexión y la configuración de Supabase.'
   }
@@ -105,11 +226,30 @@ const translateError = (msg: string): string => {
 
 <template>
   <div class="login-root">
+    <div class="drone-fleet" aria-hidden="true">
+      <div
+        v-for="drone in backgroundDrones"
+        :key="'drone-' + drone.id"
+        class="drone"
+        :style="{ ...drone.style, color: drone.color }"
+      >
+        <svg viewBox="0 0 64 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <ellipse cx="12" cy="10" rx="10" ry="2" fill="currentColor" opacity="0.42" />
+          <ellipse cx="52" cy="10" rx="10" ry="2" fill="currentColor" opacity="0.42" />
+          <rect x="24" y="12" width="16" height="8" rx="3" fill="#17200f" stroke="currentColor" stroke-width="1.5" />
+          <path d="M24 14 12 10m28 4 12-4" stroke="currentColor" stroke-width="1.5" />
+          <circle cx="32" cy="22" r="3" fill="currentColor" />
+          <circle cx="32" cy="22" r="6" fill="currentColor" opacity="0.28">
+            <animate attributeName="r" values="6;9;6" dur="1.8s" repeatCount="indefinite" />
+            <animate attributeName="opacity" values="0.28;0;0.28" dur="1.8s" repeatCount="indefinite" />
+          </circle>
+        </svg>
+      </div>
+    </div>
     <div class="auth-shell">
       <aside class="story-panel">
         <RouterLink to="/" class="story-brand" aria-label="AgronIA, inicio">
-          <span class="story-brand-mark"><Leaf :size="21" :stroke-width="2.2" /></span>
-          <span>Agron<span>IA</span></span>
+          <img class="story-brand-wordmark" :src="agroniaWordmark" alt="" />
         </RouterLink>
 
         <div class="story-copy">
@@ -145,17 +285,21 @@ const translateError = (msg: string): string => {
       <main class="login-card">
         <div class="form-heading">
           <div class="logo-wrapper">
-            <Leaf class="logo-icon" :size="25" :stroke-width="2.2" />
+            <img class="form-brand-mark" :src="agroniaMark" alt="" />
           </div>
           <div class="form-heading-copy">
             <p class="badge"><ShieldCheck :size="13" /><span>Acceso a AgronIA</span></p>
-            <h1 class="title">Crea tu cuenta</h1>
+            <h1 class="title">{{ verificationStep ? 'Verifica tu correo' : 'Crea tu cuenta' }}</h1>
           </div>
         </div>
 
-        <p class="subtitle">Empieza a tomar decisiones con más contexto y confianza.</p>
+        <p class="subtitle">
+          {{ verificationStep
+            ? 'Confirma que esta dirección de correo te pertenece para continuar.'
+            : 'Empieza a tomar decisiones con más contexto y confianza.' }}
+        </p>
 
-        <form @submit.prevent="handleRegister" class="form">
+        <form @submit.prevent="handleSubmit" class="form">
           <div v-if="error" class="error-box reveal-item">
             <AlertCircle :size="16" />
             <span>{{ translateError(error) }}</span>
@@ -166,6 +310,7 @@ const translateError = (msg: string): string => {
             <span>{{ successMessage }}</span>
           </div>
 
+          <template v-if="!verificationStep">
           <div class="input-wrapper reveal-item reveal-delay-1">
             <label class="field-label" for="register-name">Nombre completo</label>
             <div class="input-group">
@@ -262,6 +407,37 @@ const translateError = (msg: string): string => {
               </div>
             </transition>
           </div>
+          </template>
+
+            <div v-else class="verification-panel reveal-item">
+              <div class="verification-icon"><Mail :size="21" /></div>
+              <p class="verification-label">Código de 6 dígitos</p>
+              <div class="input-group verification-input-group">
+                <input
+                  id="register-verification-code"
+                  v-model="verificationCode"
+                  type="text"
+                  inputmode="numeric"
+                  autocomplete="one-time-code"
+                  pattern="[0-9]{6}"
+                  maxlength="6"
+                  required
+                  placeholder="000000"
+                  :disabled="loading"
+                  aria-label="Código de verificación de seis dígitos"
+                />
+              </div>
+              <p class="verification-hint">Revisa también la carpeta de correo no deseado.</p>
+              <button
+                type="button"
+                class="resend-code"
+                :disabled="loading || resendCooldown > 0"
+                @click="resendVerificationCode"
+              >
+                <RefreshCw :size="14" :class="{ 'spin': loading }" />
+                {{ resendCooldown > 0 ? `Reenviar código en ${resendCooldown}s` : 'Enviar un nuevo código' }}
+              </button>
+            </div>
 
           <transition name="fade">
             <div v-if="loading" class="progress-bar reveal-item">
@@ -272,14 +448,17 @@ const translateError = (msg: string): string => {
           <button
             type="submit"
             class="btn-login reveal-item reveal-delay-4"
-            :disabled="loading"
+            :disabled="loading || (verificationStep && verificationCode.length !== 6)"
           >
             <Loader2 v-if="loading" class="spin" :size="18" />
-            <span>{{ loading ? 'Registrando usuario...' : 'Crear cuenta' }}</span>
+            <span>{{ loading
+              ? (verificationStep ? 'Verificando código...' : 'Registrando usuario...')
+              : (verificationStep ? 'Verificar y continuar' : 'Crear cuenta') }}</span>
           </button>
         </form>
 
-        <p class="review-note"><ShieldCheck :size="15" /> Cada cuenta requiere aprobación antes de activar el acceso.</p>
+        <p v-if="!verificationStep" class="review-note"><ShieldCheck :size="15" /> Cada cuenta requiere aprobación antes de activar el acceso.</p>
+        <p v-else class="review-note"><ShieldCheck :size="15" /> Después de confirmar tu correo, un administrador revisará tu solicitud.</p>
 
         <p class="footer-text reveal-item reveal-delay-5">
           ¿Ya tienes cuenta?
@@ -299,9 +478,9 @@ const translateError = (msg: string): string => {
             <CheckCircle2 :size="42" :stroke-width="1.8" />
             <Sparkles class="success-sparkle" :size="20" />
           </div>
-          <p class="success-eyebrow" style="color: #f58a00">Solicitud Recibida</p>
-          <h2>Esperando Confirmación</h2>
-          <p>Un administrador revisará tu solicitud pronto...</p>
+          <p class="success-eyebrow" style="color: #f58a00">Correo verificado</p>
+          <h2>Solicitud recibida</h2>
+          <p>Un administrador revisará tu solicitud antes de activar el acceso.</p>
           <div class="success-progress"><span style="background: linear-gradient(90deg, #f58a00, #ffc400)"></span></div>
         </div>
       </div>
@@ -1335,6 +1514,8 @@ const translateError = (msg: string): string => {
 }
 
 .auth-shell {
+  position: relative;
+  z-index: 2;
   display: grid;
   grid-template-columns: minmax(0, 1.03fr) minmax(400px, 0.97fr);
   width: min(1080px, 100%);
@@ -1397,17 +1578,12 @@ const translateError = (msg: string): string => {
   text-decoration: none;
 }
 
-.story-brand > span:last-child > span { color: #d8b36d; }
-
-.story-brand-mark {
-  display: grid;
-  width: 36px;
-  height: 36px;
-  place-items: center;
-  border: 1px solid rgba(226, 207, 155, 0.28);
-  border-radius: 12px;
-  color: #e2c477;
-  background: rgba(248, 247, 233, 0.08);
+.story-brand-wordmark {
+  display: block;
+  width: clamp(112px, 12vw, 142px);
+  height: auto;
+  object-fit: contain;
+  filter: drop-shadow(0 5px 14px rgba(0, 0, 0, 0.2));
 }
 
 .story-copy {
@@ -1473,6 +1649,71 @@ const translateError = (msg: string): string => {
     linear-gradient(180deg, transparent 5%, rgba(13, 34, 24, 0.16) 100%);
   mask-image: linear-gradient(to bottom, transparent 0%, #000 16%, #000 90%, transparent 100%);
 }
+
+.verification-panel {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  padding: 18px 0 4px;
+  text-align: center;
+}
+
+.verification-icon {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border: 1px solid #e1e8dc;
+  border-radius: 15px;
+  color: #527456;
+  background: #eff4eb;
+}
+
+.verification-label {
+  margin: 3px 0 0;
+  color: #39463a;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.verification-input-group {
+  width: min(100%, 300px);
+  justify-content: center;
+}
+
+.verification-input-group input {
+  flex: 0 1 190px;
+  text-align: center;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.45em;
+  font-variant-numeric: tabular-nums;
+}
+
+.verification-hint {
+  margin: 0;
+  color: #858d81;
+  font-size: 10px;
+}
+
+.resend-code {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  color: #527456;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.resend-code:hover:not(:disabled) { background: #eff4eb; }
+.resend-code:disabled { color: #a4aaa0; cursor: not-allowed; }
+.resend-code:focus-visible { outline: 2px solid #8a7043; outline-offset: 2px; }
 
 .field-orbit {
   position: absolute;
@@ -1623,6 +1864,39 @@ const translateError = (msg: string): string => {
   animation: none;
 }
 
+.story-brand-wordmark {
+  animation: brand-arrive 0.8s 0.08s cubic-bezier(0.2, 0.75, 0.25, 1) both;
+  transition: transform 0.3s ease, filter 0.3s ease;
+}
+
+.story-brand:hover .story-brand-wordmark {
+  filter: drop-shadow(0 8px 18px rgba(0, 0, 0, 0.28));
+  transform: translateY(-2px);
+}
+
+.story-copy {
+  animation: story-arrive 0.75s 0.18s cubic-bezier(0.2, 0.75, 0.25, 1) both;
+}
+
+.field-visual {
+  animation: field-arrive 0.9s 0.3s cubic-bezier(0.2, 0.75, 0.25, 1) both;
+}
+
+.logo-wrapper {
+  animation: logo-arrive 0.65s 0.12s cubic-bezier(0.2, 0.75, 0.25, 1) both;
+}
+
+.form-brand-mark {
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+  transition: transform 0.35s cubic-bezier(0.2, 0.75, 0.25, 1);
+}
+
+.logo-wrapper:hover .form-brand-mark {
+  transform: rotate(-7deg) scale(1.05);
+}
+
 .logo-icon {
   z-index: 1;
   color: #3d6747;
@@ -1673,42 +1947,75 @@ const translateError = (msg: string): string => {
   color: #39463a;
   font-size: 11px;
   font-weight: 650;
+  transition: color 0.22s ease, transform 0.22s ease;
+}
+
+.input-wrapper:focus-within .field-label {
+  color: #456b4d;
+  transform: translateX(2px);
 }
 
 .input-group {
+  position: relative;
   min-height: 49px;
   padding: 0 14px;
   border: 1px solid #e4e7df;
   border-radius: 11px;
   background: #fff;
   box-shadow: 0 1px 2px rgba(26, 43, 30, 0.025);
+  transition: border-color 0.28s ease, background 0.28s ease, box-shadow 0.28s ease, transform 0.28s ease;
+}
+
+.input-group::after {
+  position: absolute;
+  right: 14px;
+  bottom: -1px;
+  left: 14px;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #6e8c6f, #cfaa61);
+  content: '';
+  pointer-events: none;
+  transform: scaleX(0);
+  transform-origin: center;
+  transition: transform 0.32s cubic-bezier(0.2, 0.75, 0.25, 1);
 }
 
 .input-group:hover {
   border-color: #c8d3c5;
-  transform: none;
+  transform: translateY(-1px);
   box-shadow: 0 3px 10px rgba(37, 67, 45, 0.05);
 }
 
 .input-group:focus-within {
   border-color: #65846a;
   background: #fff;
-  box-shadow: 0 0 0 3px rgba(92, 128, 97, 0.12);
-  transform: none;
+  box-shadow: 0 0 0 3px rgba(92, 128, 97, 0.1), 0 8px 18px rgba(37, 67, 45, 0.07);
+  transform: translateY(-1px);
 }
 
+.input-group:focus-within::after { transform: scaleX(1); }
+
 .input-icon { color: #98a095; }
-.input-group:focus-within .input-icon { color: #56765b; }
+.input-group:focus-within .input-icon {
+  color: #56765b;
+  filter: drop-shadow(0 2px 3px rgba(86, 118, 91, 0.16));
+}
 
 .input-group input {
   padding: 13px 0;
   color: #28372c;
   font-size: 12px;
+  transition: color 0.2s ease;
 }
 
 .input-group input::placeholder { color: #aab0a7; }
 .toggle-pass { color: #8a9389; }
-.toggle-pass:hover { color: #456b4d; background: #eff3ed; }
+.toggle-pass:hover {
+  color: #456b4d;
+  background: #eff3ed;
+  transform: rotate(-6deg) scale(1.06);
+}
 
 .password-strength {
   gap: 7px;
@@ -1720,7 +2027,7 @@ const translateError = (msg: string): string => {
 .strength-segment { height: 3px; background: #e8ebe4; }
 .strength-segment.active {
   background: linear-gradient(90deg, #789476, #cfaa61);
-  box-shadow: none;
+  box-shadow: 0 0 8px rgba(120, 148, 118, 0.2);
 }
 
 .caps-warning {
@@ -1763,6 +2070,22 @@ const translateError = (msg: string): string => {
   transition: transform 0.2s ease, box-shadow 0.2s ease, filter 0.2s ease;
 }
 
+.btn-login::before {
+  left: 0;
+  width: 42%;
+  transform: translateX(-150%);
+  transition: transform 0.7s ease;
+  animation: button-shine 6.5s 1.2s ease-in-out infinite;
+}
+
+.btn-login:hover:not(:disabled)::before {
+  left: 0;
+  transform: translateX(310%);
+  animation: none;
+}
+
+.btn-login:disabled::before { animation: none; }
+
 .btn-login:hover:not(:disabled) {
   filter: brightness(1.06);
   transform: translateY(-1px);
@@ -1785,6 +2108,7 @@ const translateError = (msg: string): string => {
 }
 
 .review-note svg { color: #788d71; }
+.review-note:hover svg { animation: shield-nod 0.55s ease; }
 
 .footer-text {
   margin: 20px 0 0;
@@ -1799,7 +2123,12 @@ const translateError = (msg: string): string => {
   font-weight: 700;
 }
 
-.footer-link:hover { color: #2f5739; }
+.footer-link { transition: color 0.2s ease, transform 0.2s ease; }
+.footer-link:hover {
+  display: inline-block;
+  color: #2f5739;
+  transform: translateX(2px);
+}
 
 .bottom-credit {
   position: static;
@@ -1830,7 +2159,9 @@ const translateError = (msg: string): string => {
     border-radius: 22px;
   }
 
+
   .story-panel { min-height: 250px; padding: 24px 27px 20px; }
+  .story-brand-wordmark { width: 108px; }
   .story-copy { margin-top: 31px; }
   .story-copy h2 { font-size: 32px; }
   .story-eyebrow { margin-bottom: 12px; font-size: 9px; }
@@ -1848,6 +2179,7 @@ const translateError = (msg: string): string => {
 @media (max-width: 420px) {
   .login-root { padding: 12px; }
   .story-panel { min-height: 232px; padding: 20px 21px 17px; }
+  .story-brand-wordmark { width: 100px; }
   .story-copy { margin-top: 28px; }
   .story-copy h2 { font-size: 29px; }
   .story-description { max-width: 260px; }
@@ -1866,11 +2198,204 @@ const translateError = (msg: string): string => {
 
 @media (prefers-reduced-motion: reduce) {
   .auth-shell, .login-card, .reveal-item, .error-box, .success-box,
-  .progress-fill::after, .password-strength, .strength-segment.active {
+  .progress-fill::after, .password-strength, .strength-segment.active,
+  .story-brand-wordmark, .story-copy, .field-visual, .logo-wrapper,
+  .review-note:hover svg, .btn-login::before {
     animation: none !important;
     transition-duration: 0.01ms !important;
   }
+
+  .login-card:hover, .story-brand:hover .story-brand-wordmark { transform: none; }
+  .input-group:hover, .input-group:focus-within, .toggle-pass:hover,
+  .footer-link:hover, .logo-wrapper:hover .form-brand-mark {
+    transform: none;
+  }
+  .btn-login:hover:not(:disabled), .btn-login:active:not(:disabled),
+  .btn-login:hover:not(:disabled)::before { transform: none; }
+  .input-group::after { transition-duration: 0.01ms !important; }
+}
+
+@keyframes button-shine {
+  0%, 68% { transform: translateX(-150%); }
+  82%, 100% { transform: translateX(310%); }
+}
+
+@keyframes shield-nod {
+  35% { transform: rotate(-12deg) scale(1.12); }
+  70% { transform: rotate(8deg) scale(1.05); }
+}
+
+@keyframes brand-arrive {
+  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes story-arrive {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes field-arrive {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes logo-arrive {
+  from { opacity: 0; transform: translateY(6px) scale(0.92); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.auth-shell {
+  border-color: rgba(215, 187, 121, 0.24);
+  background: #172a21;
+  box-shadow: 0 32px 90px rgba(0, 0, 0, 0.42), 0 1px 0 rgba(255, 255, 255, 0.035) inset;
+}
+
+.login-card {
+  color: #e8eddf;
+  background:
+    radial-gradient(ellipse at 100% 0%, rgba(120, 150, 76, 0.1), transparent 38%),
+    linear-gradient(155deg, #1d3428 0%, #172b22 52%, #14251d 100%);
+  box-shadow: inset 1px 0 0 rgba(215, 187, 121, 0.12);
+}
+
+.title { color: #f4f1e7; }
+.badge { color: #d7bc7e; }
+.subtitle { color: #b2bdad; }
+.field-label { color: #dce2d5; }
+
+.input-group {
+  border-color: rgba(190, 207, 183, 0.2);
+  background: rgba(10, 25, 18, 0.6);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.input-group:hover {
+  border-color: rgba(196, 171, 107, 0.48);
+  background: rgba(14, 33, 24, 0.82);
+  box-shadow: 0 6px 16px rgba(5, 15, 9, 0.2);
+}
+
+.input-group:focus-within {
+  border-color: #c8a960;
+  background: rgba(14, 33, 24, 0.92);
+  box-shadow: 0 0 0 3px rgba(200, 169, 96, 0.13), 0 8px 18px rgba(5, 15, 9, 0.2);
+}
+
+.input-icon { color: #a5b3a0; }
+.input-group:focus-within .input-icon { color: #e0c47a; }
+.input-group input { color: #f0f1e7; }
+.input-group input::placeholder { color: #9aa895; }
+.toggle-pass { color: #a5b3a0; }
+.toggle-pass:hover { color: #e0c47a; background: rgba(215, 187, 121, 0.12); }
+
+.strength-heading { color: #bdc5b6; }
+.strength-hint { color: #9ea99b; }
+.strength-segment { background: rgba(197, 209, 187, 0.16); }
+
+.verification-icon {
+  border-color: rgba(215, 187, 121, 0.28);
+  color: #e0c47a;
+  background: rgba(215, 187, 121, 0.1);
+}
+
+.verification-label { color: #e0e5d8; }
+.verification-hint { color: #a5b1a0; }
+.resend-code { color: #d8bc75; }
+.resend-code:hover:not(:disabled) { background: rgba(215, 187, 121, 0.1); }
+.resend-code:disabled { color: #879486; }
+
+.caps-warning {
+  border-color: rgba(224, 185, 102, 0.3);
+  color: #e7c77f;
+  background: rgba(224, 185, 102, 0.09);
+}
+
+.error-box {
+  border-color: rgba(248, 142, 120, 0.26);
+  color: #ffc0ad;
+  background: rgba(130, 48, 39, 0.22);
+}
+
+.success-box {
+  border-color: rgba(162, 199, 143, 0.25);
+  color: #d0e6bd;
+  background: rgba(75, 111, 63, 0.2);
+}
+
+.progress-bar { background: rgba(197, 209, 187, 0.14); }
+.review-note { color: #a9b5a4; }
+.review-note svg { color: #c5ae6f; }
+.footer-text {
+  border-color: rgba(197, 209, 187, 0.14);
+  color: #aab5a5;
+}
+
+.footer-link { color: #dfc37a; }
+.footer-link:hover { color: #f1d991; }
+
+.logo-wrapper {
+  border-color: rgba(215, 187, 121, 0.3);
+  background: linear-gradient(145deg, rgba(91, 128, 82, 0.34), rgba(31, 63, 44, 0.72));
+  box-shadow: 0 10px 24px rgba(4, 14, 8, 0.24), 0 0 22px rgba(215, 187, 121, 0.08);
+  animation: logo-arrive 0.65s 0.12s cubic-bezier(0.2, 0.75, 0.25, 1) both, logo-bob 5s 1s ease-in-out infinite;
+}
+
+.form-brand-mark {
+  filter: drop-shadow(0 2px 6px rgba(225, 190, 94, 0.24));
+}
+
+.story-panel::before { animation: field-current 18s ease-in-out infinite alternate; }
+.story-eyebrow span { animation: status-pulse 2.8s ease-out infinite; }
+.field-orbit { animation: orbit-drift 54s linear infinite; }
+.field-orbit-inner { animation-direction: reverse; animation-duration: 72s; }
+.field-sun { animation: sun-breathe 5s ease-in-out infinite; }
+.field-row-one { animation: furrow-glow 7s ease-in-out infinite; }
+.field-row-two { animation: furrow-glow 7s 1.2s ease-in-out infinite; }
+.field-row-three { animation: furrow-glow 7s 2.4s ease-in-out infinite; }
+.field-row-four { animation: furrow-glow 7s 3.6s ease-in-out infinite; }
+.field-pin { animation: pin-float 4s ease-in-out infinite; }
+.field-data-card { animation: data-card-float 6s ease-in-out infinite; }
+
+@keyframes logo-bob {
+  0%, 100% { translate: 0 0; }
+  50% { translate: 0 -3px; }
+}
+
+@keyframes field-current {
+  from { translate: 0 0; }
+  to { translate: 12px -9px; }
+}
+
+@keyframes orbit-drift {
+  from { transform: translateX(-50%) rotate(0); }
+  to { transform: translateX(-50%) rotate(360deg); }
+}
+
+@keyframes sun-breathe {
+  0%, 100% { scale: 1; opacity: 0.65; }
+  50% { scale: 1.12; opacity: 1; }
+}
+
+@keyframes furrow-glow {
+  0%, 100% { border-color: rgba(215, 198, 147, 0.14); }
+  50% { border-color: rgba(215, 198, 147, 0.34); }
+}
+
+@keyframes pin-float {
+  0%, 100% { translate: 0 0; }
+  50% { translate: 0 -6px; }
+}
+
+@keyframes data-card-float {
+  0%, 100% { translate: 0 0; }
+  50% { translate: 0 -4px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .story-panel::before, .story-eyebrow span, .field-orbit, .field-sun,
+  .field-row, .field-pin, .field-data-card, .logo-wrapper {
+    animation: none !important;
+  }
 }
 </style>
-
-

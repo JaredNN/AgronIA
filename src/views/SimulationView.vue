@@ -2,8 +2,14 @@
 import { computed, ref, onMounted, onBeforeUnmount, shallowRef } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import { Download, Pause, Play, Wind } from 'lucide-vue-next'
+import { Cpu, Download, LocateFixed, Maximize2, Minimize2, Move, Pause, Play, Wind } from 'lucide-vue-next'
 import DroneConnectionPanel from '../components/simulation/DroneConnectionPanel.vue'
+import {
+  detectHardwareGpuModel,
+  graphicsQuality,
+  setGraphicsQuality,
+  type GraphicsQualityPreset,
+} from '../services/desktopRuntime'
 import {
   createAlert,
   createSimulation,
@@ -12,16 +18,16 @@ import {
   type FieldRecord,
 } from '../services/agronomyData'
 import { projectFieldGeometry, type FieldPoint, type ProjectedField } from '../services/fieldGeometry'
+import { advancePlantWaterStress, planCoverageRoute, type CoverageRoute } from '../services/simulationModel'
 
 interface PlantData {
   id: string; x: number; z: number; health: number; ndvi: number; temp: number; status: string; stage: number
+  waterStress: number; dead: boolean; irrigated: boolean
 }
 
 interface StressCenter {
   id: string; x: number; z: number; intensity: number; radius: number; type: 'DROUGHT' | 'OVERHYDRATION' | 'PEST'
 }
-
-type FieldPresetId = 'mixed' | 'sin_plagas' | 'estres_hidrico' | 'sobre_hidratacion' | 'con_plagas'
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const containerRef = ref<HTMLDivElement | null>(null)
@@ -51,16 +57,32 @@ const liveDrone = ref<{
   heading: null,
 })
 const currentMode = ref<'rgb' | 'ndvi' | 'thermal'>('rgb')
-const activeFieldPreset = ref<FieldPresetId>('mixed')
 const droneState = ref<'IDLE' | 'SCANNING' | 'FLYING' | 'ACTION' | 'RETURNING' | 'CENTINELAS'>('IDLE')
 const currentAction = ref<'NONE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS'>('NONE')
 const simulationPaused = ref(false)
 const windEnabled = ref(true)
+const cameraFollowEnabled = ref(true)
+const cameraPanMode = ref(false)
+const isFullscreen = ref(false)
 
-// Datos de interacción
+const coverageRoute = ref<CoverageRoute | null>(null)
+const trendHistory = ref<Array<{ elapsed: number; health: number; humidity: number; ndvi: number }>>([])
+const simulationElapsedSeconds = ref(0)
+const affectedPlants = ref<PlantData[]>([])
+
+const liveFps = ref(60)
+const frameTimeMs = ref(16.6)
+const gpuRendererName = ref(detectHardwareGpuModel())
+let mainDirLight: THREE.DirectionalLight | null = null
+let pointerDirty = true
+
+
+// Datos de interacción (panel fijo de inspección en la columna izquierda)
 const hoveredPlant = ref<PlantData | null>(null)
+const lastInspectedPlant = ref<PlantData | null>(null)
+const inspectedPlant = computed(() => hoveredPlant.value ?? lastInspectedPlant.value)
+const inspectedPlantGps = computed(() => inspectedPlant.value ? plantGps(inspectedPlant.value) : null)
 const hoveredSector = ref<StressCenter | null>(null)
-const tooltipPos = ref({ x: 0, y: 0 })
 const actionFeedback = ref('')
 
 // Three.js variables
@@ -104,6 +126,7 @@ let particleSystem: THREE.Points
 let particleGeo: THREE.BufferGeometry
 let activeTargets: StressCenter[] = []
 let activeTargetIndex = 0
+let scanRouteLine: THREE.Line | null = null
 
 let dronePath: THREE.Vector3[] = []
 let currentPathIndex = 0
@@ -112,7 +135,6 @@ let feedbackTimeout: ReturnType<typeof setTimeout> | undefined
 // Enjambre de Centinelas
 let centinelaGroup: THREE.Group | null = null
 let centinelaPropellers: THREE.Mesh[] = []
-let centinelaFrameCounter = 0
 
 const DRONE_BASE = new THREE.Vector3(-15, 0.5, 15)
 const FLIGHT_HEIGHT = 8
@@ -136,7 +158,9 @@ const telemetry = ref({
   avgNDVI: 0,
   avgTemp: 0,
   plantCount: 0,
-  stressZones: 0
+  stressZones: 0,
+  stressedPlants: 0,
+  deadPlants: 0,
 })
 
 const fieldDimensionsLabel = computed(() => {
@@ -144,6 +168,65 @@ const fieldDimensionsLabel = computed(() => {
   if (!field) return ''
   return `${field.widthMeters.toFixed(1)} m × ${field.depthMeters.toFixed(1)} m · ${field.areaHectares.toFixed(2)} ha`
 })
+const scaleX = computed(() =>
+  selectedFieldGeometry.value ? selectedFieldGeometry.value.widthMeters / BASE_CROP_WIDTH : 1,
+)
+const scaleZ = computed(() =>
+  selectedFieldGeometry.value ? selectedFieldGeometry.value.depthMeters / BASE_CROP_DEPTH : 1,
+)
+const estimatedAreaHectares = computed(() => selectedFieldGeometry.value?.areaHectares ?? 1)
+const currency = new Intl.NumberFormat('es-MX', { style: 'currency', currency: 'MXN', maximumFractionDigits: 0 })
+const affectedPlantRatio = computed(() =>
+  telemetry.value.plantCount > 0 ? telemetry.value.stressedPlants / telemetry.value.plantCount : 0,
+)
+const treatmentCostAmount = computed(() => estimatedAreaHectares.value * 1650)
+const preventionCostAmount = computed(() => estimatedAreaHectares.value * 520)
+const estimatedSavingsAmount = computed(() =>
+  estimatedAreaHectares.value * 2400 * affectedPlantRatio.value,
+)
+const projectedSavingsNetAmount = computed(() => Math.max(
+  0,
+  estimatedSavingsAmount.value - preventionCostAmount.value,
+))
+const treatmentCost = computed(() => currency.format(treatmentCostAmount.value))
+const preventionCost = computed(() => currency.format(preventionCostAmount.value))
+const estimatedSavings = computed(() => currency.format(estimatedSavingsAmount.value))
+const projectedSavingsNet = computed(() => currency.format(projectedSavingsNetAmount.value))
+
+const trendPoints = (key: 'health' | 'humidity' | 'ndvi') => {
+  const history = trendHistory.value
+  if (history.length < 2) return ''
+  return history.map((sample, index) => {
+    const x = (index / (history.length - 1)) * 300
+    const y = 90 - Math.min(100, Math.max(0, sample[key])) * 0.8
+    return `${x.toFixed(1)},${y.toFixed(1)}`
+  }).join(' ')
+}
+
+const plantGps = (plant: PlantData) => {
+  const field = selectedFieldGeometry.value
+  if (!field) return null
+  const point = { x: plant.x * scaleX.value, z: plant.z * scaleZ.value }
+  return field.contains(point) ? field.unprojectGps(point) : null
+}
+
+const handleSelectedFieldChange = () => {
+  applySelectedField()
+  if (!allPlants.length) return
+  if (!relocatePlantsToSelectedField()) {
+    setActionFeedback('No se pudo encontrar una ubicación de muestra dentro de esta parcela; se conservaron las posiciones demostrativas.')
+  }
+  allPlants.forEach(plant => {
+    plant.waterStress = 0
+    plant.dead = false
+    plant.irrigated = false
+  })
+  generateRandomStressCenters()
+  regenerateFieldHealth()
+  trendHistory.value = []
+  simulationElapsedSeconds.value = 0
+  addTrendSample()
+}
 
 const disposeGroupChildren = (group: THREE.Group) => {
   for (const child of [...group.children]) {
@@ -165,12 +248,49 @@ const clearLiveDroneTrail = () => {
   liveDroneTrail = null
 }
 
+const clearScanRouteLine = () => {
+  if (!scanRouteLine) return
+  scene.value?.remove(scanRouteLine)
+  scanRouteLine.geometry.dispose()
+  const materials = Array.isArray(scanRouteLine.material) ? scanRouteLine.material : [scanRouteLine.material]
+  materials.forEach(material => material.dispose())
+  scanRouteLine = null
+}
+
+const frameCameraOnField = () => {
+  if (!camera.value || !controls.value) return
+
+  const geometry = selectedFieldGeometry.value
+  controls.value.target.set(0, 0, 0)
+  if (!geometry) {
+    camera.value.position.set(0, 29, 42)
+    controls.value.minDistance = 3
+    controls.value.maxDistance = 180
+  } else {
+    const maxDimension = Math.max(geometry.widthMeters, geometry.depthMeters)
+    const fieldRadius = Math.hypot(geometry.widthMeters, geometry.depthMeters) / 2
+    const aspect = Math.max(camera.value.aspect, 0.01)
+    const halfVerticalFov = THREE.MathUtils.degToRad(camera.value.fov / 2)
+    const halfFitFov = Math.atan(Math.tan(halfVerticalFov) * Math.min(aspect, 1))
+    const distance = fieldRadius / Math.sin(halfFitFov) * 1.2
+    camera.value.position.set(0, distance * 0.58, distance * 0.82)
+    controls.value.minDistance = 3
+    controls.value.maxDistance = Math.max(120, distance * 2, maxDimension * 4)
+    camera.value.far = Math.max(1000, distance * 4)
+    camera.value.updateProjectionMatrix()
+  }
+  controls.value.update()
+}
+
 const applySelectedField = () => {
   const field = fields.value.find(item => item.id === selectedFieldId.value)
   selectedFieldGeometry.value = field ? projectFieldGeometry(field.geojson_data) : null
+  cameraFollowEnabled.value = true
   liveDronePath = []
   fallbackGpsOrigin = null
   clearLiveDroneTrail()
+  clearScanRouteLine()
+  coverageRoute.value = null
   if (!scene.value || !cropGroup || !parcelOutlineGroup) return
   const outlineGroup = parcelOutlineGroup
 
@@ -180,6 +300,7 @@ const applySelectedField = () => {
     cropGroup.scale.set(1, 1, 1)
     DRONE_BASE.set(-15, 0.5, 15)
     if (droneGroupReady) droneGroup.position.copy(DRONE_BASE)
+    frameCameraOnField()
     return
   }
 
@@ -208,13 +329,82 @@ const applySelectedField = () => {
     })
   }
 
-  const maxDimension = Math.max(geometry.widthMeters, geometry.depthMeters)
-  camera.value?.position.set(0, Math.max(18, maxDimension * 0.7), Math.max(35, maxDimension * 0.95))
-  if (controls.value) {
-    controls.value.target.set(0, 0, 0)
-    controls.value.maxDistance = Math.max(75, maxDimension * 2)
-    controls.value.update()
+  frameCameraOnField()
+}
+
+const relocatePlantsToSelectedField = () => {
+  const field = selectedFieldGeometry.value
+  if (!field || !allPlants.length) return true
+
+  const candidates: FieldPoint[] = []
+  const columns = 60
+  const rows = 60
+  for (let column = 0; column < columns; column++) {
+    const x = -field.widthMeters / 2 + ((column + 0.5) / columns) * field.widthMeters
+    for (let row = 0; row < rows; row++) {
+      const z = -field.depthMeters / 2 + ((row + 0.5) / rows) * field.depthMeters
+      const point = { x, z }
+      if (field.contains(point)) candidates.push(point)
+    }
   }
+  if (candidates.length === 0) return false
+
+  const offsets = allPlants.map(() => ({ x: 0, z: 0 }))
+  allPlants.forEach((plant, index) => {
+    const currentPoint = { x: plant.x * scaleX.value, z: plant.z * scaleZ.value }
+    if (field.contains(currentPoint)) return
+    let nearest = candidates[0]
+    let nearestDistance = Math.hypot(currentPoint.x - nearest.x, currentPoint.z - nearest.z)
+    for (let candidateIndex = 1; candidateIndex < candidates.length; candidateIndex++) {
+      const candidate = candidates[candidateIndex]
+      const candidateDistance = Math.hypot(currentPoint.x - candidate.x, currentPoint.z - candidate.z)
+      if (candidateDistance < nearestDistance) {
+        nearest = candidate
+        nearestDistance = candidateDistance
+      }
+    }
+    const nextX = nearest.x / scaleX.value
+    const nextZ = nearest.z / scaleZ.value
+    offsets[index] = { x: nextX - plant.x, z: nextZ - plant.z }
+    plant.x = nextX
+    plant.z = nextZ
+  })
+
+  if (trunkMesh && hitboxMesh && leafMesh) {
+    const dummy = new THREE.Object3D()
+    allPlants.forEach((plant, index) => {
+      const offset = offsets[index]
+      if (offset.x === 0 && offset.z === 0) return
+      trunkMesh.getMatrixAt(index, dummy.matrix)
+      dummy.matrix.setPosition(plant.x, 0, plant.z)
+      trunkMesh.setMatrixAt(index, dummy.matrix)
+      hitboxMesh.getMatrixAt(index, dummy.matrix)
+      dummy.matrix.setPosition(plant.x, 0, plant.z)
+      hitboxMesh.setMatrixAt(index, dummy.matrix)
+    })
+    const shiftInstances = (mesh: THREE.InstancedMesh, plantIndices: number[]) => {
+      plantIndices.forEach((plantIndex, instanceIndex) => {
+        const offset = offsets[plantIndex]
+        if (offset.x === 0 && offset.z === 0) return
+        mesh.getMatrixAt(instanceIndex, dummy.matrix)
+        dummy.matrix.elements[12] += offset.x
+        dummy.matrix.elements[14] += offset.z
+        mesh.setMatrixAt(instanceIndex, dummy.matrix)
+      })
+      mesh.instanceMatrix.needsUpdate = true
+    }
+    trunkMesh.instanceMatrix.needsUpdate = true
+    hitboxMesh.instanceMatrix.needsUpdate = true
+    shiftInstances(leafMesh, leafToPlantMap)
+    shiftInstances(tasselMesh, tasselToPlantMap)
+    shiftInstances(earMesh, earToPlantMap)
+    trunkMesh.computeBoundingSphere()
+    hitboxMesh.computeBoundingSphere()
+    leafMesh.computeBoundingSphere()
+    tasselMesh.computeBoundingSphere()
+    earMesh.computeBoundingSphere()
+  }
+  return true
 }
 
 const updateLiveDrone = () => {
@@ -298,6 +488,25 @@ const updateLiveDrone = () => {
   }
 }
 
+const updateCameraFollow = () => {
+  if (!cameraFollowEnabled.value || !controls.value || !camera.value) return
+  const targetDrone = liveDroneGroup?.visible
+    ? liveDroneGroup
+    : droneState.value !== 'IDLE'
+      ? droneGroup
+      : null
+  if (!targetDrone) return
+
+  const nextTarget = new THREE.Vector3(
+    targetDrone.position.x,
+    Math.max(0, targetDrone.position.y * 0.65),
+    targetDrone.position.z,
+  )
+  const delta = nextTarget.sub(controls.value.target).multiplyScalar(0.055)
+  controls.value.target.add(delta)
+  camera.value.position.add(delta)
+}
+
 const handleDroneTelemetry = (snapshot: {
   connected: boolean
   hasHeartbeat: boolean
@@ -325,21 +534,66 @@ const handleDroneTelemetry = (snapshot: {
 const updateTelemetry = () => {
   if (!allPlants || allPlants.length === 0) return
   const count = allPlants.length
-  let sumHealth = 0, sumNDVI = 0, sumTemp = 0
+  let sumHealth = 0, sumNDVI = 0, sumTemp = 0, sumMoisture = 0
   for (const p of allPlants) {
     sumHealth += p.health
     sumNDVI += p.ndvi
     sumTemp += p.temp
+    sumMoisture += 1 - p.waterStress
   }
+  const stressedPlants = allPlants.filter(plant =>
+    plant.waterStress >= 0.15 || plant.health < 0.7 || plant.dead,
+  ).length
   telemetry.value = {
     avgHealth: parseFloat(((sumHealth / count) * 100).toFixed(1)),
-    avgHumidity: parseFloat((((sumHealth / count) * 0.8 + 0.1) * 100).toFixed(1)),
+    avgHumidity: parseFloat(((sumMoisture / count) * 100).toFixed(1)),
     avgPestIndex: parseFloat((Math.max(0, 1 - (sumNDVI / count)) * 100 * 0.5).toFixed(1)),
     avgNDVI: parseFloat((sumNDVI / count).toFixed(2)),
     avgTemp: parseFloat((sumTemp / count).toFixed(1)),
     plantCount: count,
-    stressZones: stressCenters.length
+    stressZones: stressCenters.length,
+    stressedPlants,
+    deadPlants: allPlants.filter(plant => plant.dead).length,
   }
+}
+
+const getDroughtPressure = (plant: PlantData, center: StressCenter) => {
+  const x = plant.x * scaleX.value
+  const z = plant.z * scaleZ.value
+  const distance = Math.hypot(x - center.x, z - center.z)
+  return distance < center.radius
+    ? center.intensity * (1 - distance / center.radius)
+    : 0
+}
+
+const addTrendSample = () => {
+  trendHistory.value.push({
+    elapsed: simulationElapsedSeconds.value,
+    health: telemetry.value.avgHealth,
+    humidity: telemetry.value.avgHumidity,
+    ndvi: telemetry.value.avgNDVI * 100,
+  })
+  if (trendHistory.value.length > 24) trendHistory.value.shift()
+}
+
+const advanceFieldSimulation = (elapsedSeconds: number) => {
+  for (const center of stressCenters) {
+    if (center.type === 'DROUGHT') {
+      center.intensity = Math.min(1, center.intensity + elapsedSeconds * 0.0015)
+    }
+  }
+
+  for (const plant of allPlants) {
+    const droughtPressure = stressCenters
+      .filter(center => center.type === 'DROUGHT')
+      .reduce((highest, center) => Math.max(highest, getDroughtPressure(plant, center)), 0)
+    Object.assign(
+      plant,
+      advancePlantWaterStress(plant, droughtPressure, elapsedSeconds),
+    )
+  }
+  regenerateFieldHealth()
+  simulationElapsedSeconds.value += elapsedSeconds
 }
 
 const createSoilTexture = () => {
@@ -443,7 +697,8 @@ const createTasselGeometry = () => {
 
 const lerpColor = (c1: THREE.Color, c2: THREE.Color, t: number) => new THREE.Color().lerpColors(c1, c2, t)
 
-const getStatusName = (health: number) => {
+const getStatusName = (health: number, dead = false) => {
+  if (dead) return 'Muerta'
   if (health >= 0.7) return 'Alto Vigor'
   if (health >= 0.4) return 'Moderado'
   if (health >= 0.25) return 'Bajo Vigor'
@@ -462,6 +717,7 @@ const getSectorColor = (type: string, intensity: number) => {
 }
 
 const getColorForPlant = (plant: PlantData, mode: 'rgb' | 'ndvi' | 'thermal') => {
+  if (plant.dead) return new THREE.Color(0x57534e)
   if (mode === 'rgb') return lerpColor(new THREE.Color(0x84cc16), new THREE.Color(0x15803d), plant.health)
   if (mode === 'ndvi') {
     if (plant.ndvi < 0.33) return lerpColor(new THREE.Color(0xdc2626), new THREE.Color(0xf97316), plant.ndvi / 0.33)
@@ -501,18 +757,32 @@ const updateMaterials = (mode: 'rgb' | 'ndvi' | 'thermal') => {
   if (groundMaterial) groundMaterial.color.setHex(mode === 'rgb' ? 0xffffff : (mode === 'ndvi' ? 0x1e40af : 0x450a0a))
   if (!trunkMesh || !leafMesh) return
 
-  for (let i = 0; i < allPlants.length; i++) trunkMesh.setColorAt(i, mode === 'rgb' ? new THREE.Color(0x84cc16) : getColorForPlant(allPlants[i], mode))
+  for (let i = 0; i < allPlants.length; i++) {
+    trunkMesh.setColorAt(i, mode === 'rgb' && !allPlants[i].dead
+      ? new THREE.Color(0x84cc16)
+      : getColorForPlant(allPlants[i], mode))
+  }
   trunkMesh.instanceColor!.needsUpdate = true
 
   for (let i = 0; i < leafToPlantMap.length; i++) leafMesh.setColorAt(i, getColorForPlant(allPlants[leafToPlantMap[i]], mode))
   leafMesh.instanceColor!.needsUpdate = true
 
   if (tasselMesh) {
-    for (let i = 0; i < tasselToPlantMap.length; i++) tasselMesh.setColorAt(i, mode === 'rgb' ? new THREE.Color(0xfef08a) : getColorForPlant(allPlants[tasselToPlantMap[i]], mode))
+    for (let i = 0; i < tasselToPlantMap.length; i++) {
+      const plant = allPlants[tasselToPlantMap[i]]
+      tasselMesh.setColorAt(i, mode === 'rgb' && !plant.dead
+        ? new THREE.Color(0xfef08a)
+        : getColorForPlant(plant, mode))
+    }
     tasselMesh.instanceColor!.needsUpdate = true
   }
   if (earMesh) {
-    for (let i = 0; i < earToPlantMap.length; i++) earMesh.setColorAt(i, mode === 'rgb' ? new THREE.Color(0xeab308) : getColorForPlant(allPlants[earToPlantMap[i]], mode))
+    for (let i = 0; i < earToPlantMap.length; i++) {
+      const plant = allPlants[earToPlantMap[i]]
+      earMesh.setColorAt(i, mode === 'rgb' && !plant.dead
+        ? new THREE.Color(0xeab308)
+        : getColorForPlant(plant, mode))
+    }
     earMesh.instanceColor!.needsUpdate = true
   }
 }
@@ -553,24 +823,36 @@ const createParticles = () => {
   scene.value?.add(particleSystem)
 }
 
-const generateRandomStressCenters = (preset: FieldPresetId = activeFieldPreset.value) => {
+const generateRandomStressCenters = () => {
   stressCenters = []
   clearSectorMarkers()
-  if (preset === 'sin_plagas') return
 
-  const halfWidth = (selectedFieldGeometry.value?.widthMeters ?? 50) / 2
-  const halfDepth = (selectedFieldGeometry.value?.depthMeters ?? 40) / 2
-  const numCenters = preset === 'mixed' ? Math.floor(Math.random() * 3) + 2 : 3
+  const halfWidth = (selectedFieldGeometry.value?.widthMeters ?? BASE_CROP_WIDTH) / 2
+  const halfDepth = (selectedFieldGeometry.value?.depthMeters ?? BASE_CROP_DEPTH) / 2
+  const numCenters = Math.floor(Math.random() * 3) + 2
   for (let i = 0; i < numCenters; i++) {
-    let type: StressCenter['type'] = 'DROUGHT'
-    if (preset === 'sobre_hidratacion') type = 'OVERHYDRATION'
-    else if (preset === 'con_plagas') type = 'PEST'
-    else if (preset === 'mixed') type = Math.random() > 0.5 ? 'DROUGHT' : 'PEST'
+    const type: StressCenter['type'] = i === 0 || Math.random() > 0.5 ? 'DROUGHT' : 'PEST'
+    const fallbackPlant = allPlants[Math.floor(Math.random() * allPlants.length)]
+    let location = fallbackPlant
+      ? { x: fallbackPlant.x * scaleX.value, z: fallbackPlant.z * scaleZ.value }
+      : { x: 0, z: 0 }
+
+    if (!fallbackPlant) {
+      for (let attempt = 0; attempt < 30; attempt++) {
+        const candidate = {
+          x: (Math.random() * 1.6 - 0.8) * halfWidth,
+          z: (Math.random() * 1.6 - 0.8) * halfDepth,
+        }
+        if (!selectedFieldGeometry.value || selectedFieldGeometry.value.contains(candidate)) {
+          location = candidate
+          break
+        }
+      }
+    }
 
     stressCenters.push({
       id: `SEC-${i + 1}`,
-      x: (Math.random() * 1.6 - 0.8) * halfWidth,
-      z: (Math.random() * 1.6 - 0.8) * halfDepth,
+      ...location,
       intensity: 0.68 + Math.random() * 0.3,
       radius: Math.max(2, Math.min(halfWidth, halfDepth) * (0.08 + Math.random() * 0.08)),
       type,
@@ -591,10 +873,31 @@ const saveScenarioSnapshot = async (saveAlerts = false) => {
         visualization_mode: currentMode.value,
         wind_enabled: windEnabled.value,
         field_id: fieldId,
+        data_source: 'simulated',
+        route: coverageRoute.value
+          ? {
+              distance_meters: coverageRoute.value.lengthMeters,
+              lane_count: coverageRoute.value.laneCount,
+              orientation: coverageRoute.value.orientation,
+            }
+          : null,
       },
       results: {
         telemetry: { ...telemetry.value },
-        plants: allPlants.map(plant => ({ ...plant })),
+        timeline: trendHistory.value.map(sample => ({ ...sample })),
+        estimated_costs: {
+          currency: 'MXN',
+          area_hectares: estimatedAreaHectares.value,
+          treatment: treatmentCostAmount.value,
+          prevention: preventionCostAmount.value,
+          gross_savings: estimatedSavingsAmount.value,
+          net_preventive_savings: projectedSavingsNetAmount.value,
+          assumptions: 'Referencia editable: tratamiento 1650 MXN/ha, prevención 520 MXN/ha, pérdida potencial evitada 2400 MXN/ha.',
+        },
+        plants: allPlants.map(plant => ({
+          ...plant,
+          gps: plantGps(plant),
+        })),
         stress_centers: stressCenters.map(center => ({ ...center })),
       },
     })
@@ -612,6 +915,9 @@ const saveScenarioSnapshot = async (saveAlerts = false) => {
             pest_index: telemetry.value.avgPestIndex,
             plant_count: telemetry.value.plantCount,
             stress_zones: telemetry.value.stressZones,
+            stressed_plants: telemetry.value.stressedPlants,
+            dead_plants: telemetry.value.deadPlants,
+            data_source: 'simulated',
           },
         }),
       ]
@@ -646,7 +952,10 @@ const regenerateFieldHealth = () => {
   allPlants.forEach(plant => {
     let dStress = 0, pStress = 0, oStress = 0
     for (const center of stressCenters) {
-      const dist = Math.sqrt(Math.pow(plant.x - center.x, 2) + Math.pow(plant.z - center.z, 2))
+      const dist = Math.hypot(
+        plant.x * scaleX.value - center.x,
+        plant.z * scaleZ.value - center.z,
+      )
       if (dist < center.radius) {
         const effect = center.intensity * (1 - (dist / center.radius))
         if (center.type === 'DROUGHT') dStress = Math.max(dStress, effect)
@@ -654,28 +963,28 @@ const regenerateFieldHealth = () => {
         if (center.type === 'PEST') pStress = Math.max(pStress, effect)
       }
     }
-    plant.health = Math.max(0.1, 0.92 + Math.random() * 0.08 - dStress - pStress - oStress * 0.75)
-    plant.temp = 25 + (dStress * 12) + (pStress * 3) - (oStress * 5.2)
-    plant.ndvi = Math.max(0.1, 0.84 - (pStress * 0.65) - (dStress * 0.32) - (oStress * 0.38))
-    plant.status = getStatusName(plant.health)
+    if (dStress > 0 && plant.waterStress >= 0.98) plant.dead = true
+    plant.health = plant.dead
+      ? 0
+      : Math.max(0, 0.96 - (plant.waterStress * 0.75) - (dStress * 0.32) - (pStress * 0.4) - (oStress * 0.25))
+    plant.temp = 25 + (dStress * 12) + (pStress * 3) - (oStress * 5.2) + (plant.waterStress * 4)
+    plant.ndvi = plant.dead
+      ? 0
+      : Math.max(0, 0.84 - (pStress * 0.65) - (dStress * 0.32) - (oStress * 0.38) - (plant.waterStress * 0.2))
+    plant.status = getStatusName(plant.health, plant.dead)
   })
+  affectedPlants.value = allPlants
+    .filter(plant => plant.waterStress >= 0.15 || plant.health < 0.7 || plant.dead)
+    .sort((left, right) => Number(right.dead) - Number(left.dead) || right.waterStress - left.waterStress)
+    .slice(0, 8)
+  if (!lastInspectedPlant.value && allPlants.length > 0) {
+    lastInspectedPlant.value = allPlants[0]
+  } else if (lastInspectedPlant.value) {
+    const refreshed = allPlants.find(p => p.id === lastInspectedPlant.value?.id)
+    if (refreshed) lastInspectedPlant.value = refreshed
+  }
   updateMaterials(currentMode.value)
   updateTelemetry()
-}
-
-const applyFieldPreset = (preset: FieldPresetId) => {
-  if (droneState.value !== 'IDLE') return
-  activeFieldPreset.value = preset
-  generateRandomStressCenters(preset)
-  regenerateFieldHealth()
-  const labels: Record<FieldPresetId, string> = {
-    mixed: 'Escenario mixto aplicado.',
-    sin_plagas: 'Preset aplicado: Sin Plagas · Cultivo en vigor óptimo.',
-    estres_hidrico: 'Preset aplicado: Estrés Hídrico (Sequía y aumento térmico foliar).',
-    sobre_hidratacion: 'Preset aplicado: Sobrehidratación (Exceso de agua y enfriamiento basal).',
-    con_plagas: 'Preset aplicado: Con Plagas (Focos de infestación y caída de NDVI).'
-  }
-  setActionFeedback(labels[preset])
 }
 
 const handleAction = (action: 'ANALYZE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS') => {
@@ -719,22 +1028,32 @@ const handleAction = (action: 'ANALYZE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS') =
     if (droneState.value !== 'IDLE') return
     setActionFeedback('Escaneo del cultivo en curso…', false)
     droneState.value = 'SCANNING'
+    simulationElapsedSeconds.value = 0
+    trendHistory.value = []
     generateRandomStressCenters()
     regenerateFieldHealth()
-    void saveScenarioSnapshot(true)
-    
-    // Ruta de escaneo (Zigzag sobre el campo)
-    const halfWidth = (selectedFieldGeometry.value?.widthMeters ?? 50) * 0.45
-    const halfDepth = (selectedFieldGeometry.value?.depthMeters ?? 40) * 0.45
-    dronePath = [
-       new THREE.Vector3(-halfWidth, FLIGHT_HEIGHT, -halfDepth),
-       new THREE.Vector3(halfWidth, FLIGHT_HEIGHT, -halfDepth),
-       new THREE.Vector3(halfWidth, FLIGHT_HEIGHT, 0),
-       new THREE.Vector3(-halfWidth, FLIGHT_HEIGHT, 0),
-       new THREE.Vector3(-halfWidth, FLIGHT_HEIGHT, halfDepth),
-       new THREE.Vector3(halfWidth, FLIGHT_HEIGHT, halfDepth),
-       DRONE_BASE
-    ]
+    addTrendSample()
+
+    const width = selectedFieldGeometry.value?.widthMeters ?? BASE_CROP_WIDTH
+    const depth = selectedFieldGeometry.value?.depthMeters ?? BASE_CROP_DEPTH
+    coverageRoute.value = planCoverageRoute({
+      widthMeters: width,
+      depthMeters: depth,
+      laneSpacingMeters: Math.max(6, Math.min(width, depth) / 8),
+      start: { x: DRONE_BASE.x, z: DRONE_BASE.z },
+    })
+    dronePath = coverageRoute.value.points.map(point =>
+      new THREE.Vector3(point.x, FLIGHT_HEIGHT, point.z),
+    )
+    clearScanRouteLine()
+    scanRouteLine = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(
+        dronePath.map(point => new THREE.Vector3(point.x, 0.24, point.z)),
+      ),
+      new THREE.LineBasicMaterial({ color: 0x4dd0e1, transparent: true, opacity: 0.8 }),
+    )
+    scanRouteLine.renderOrder = 3
+    scene.value?.add(scanRouteLine)
     currentPathIndex = 0
     return
   }
@@ -767,9 +1086,8 @@ const handleAction = (action: 'ANALYZE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS') =
 
 const resetCamera = () => {
   if (!camera.value || !controls.value) return
-  camera.value.position.set(0, 18, 35)
-  controls.value.target.set(0, 0, 0)
-  controls.value.update()
+  cameraFollowEnabled.value = false
+  frameCameraOnField()
 }
 
 const zoomCamera = (direction: 'in' | 'out') => {
@@ -779,13 +1097,62 @@ const zoomCamera = (direction: 'in' | 'out') => {
   controls.value.update()
 }
 
+const toggleCameraFollow = () => {
+  cameraFollowEnabled.value = !cameraFollowEnabled.value
+  setActionFeedback(cameraFollowEnabled.value
+    ? 'Seguimiento de dron activado. La cámara seguirá su posición y altura.'
+    : 'Seguimiento desactivado. Puedes explorar el campo libremente.')
+}
+
+const toggleCameraPanMode = () => {
+  cameraPanMode.value = !cameraPanMode.value
+  if (controls.value) {
+    controls.value.mouseButtons.LEFT = cameraPanMode.value ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE
+  }
+  setActionFeedback(cameraPanMode.value
+    ? 'Modo desplazar activado. Arrastra para recorrer el campo.'
+    : 'Modo orbitar activado. Arrastra para girar la vista.')
+}
+
+const onFullscreenChange = () => {
+  isFullscreen.value = document.fullscreenElement === containerRef.value
+  onWindowResize()
+}
+
+const toggleFullscreen = async () => {
+  const stage = containerRef.value
+  if (!stage) return
+
+  try {
+    if (document.fullscreenElement === stage) {
+      await document.exitFullscreen()
+    } else {
+      await stage.requestFullscreen()
+    }
+  } catch (error) {
+    setActionFeedback(error instanceof Error
+      ? `No se pudo cambiar a pantalla completa: ${error.message}`
+      : 'No se pudo cambiar a pantalla completa.')
+  }
+}
+
 const createNewScenario = async () => {
   if (droneState.value !== 'IDLE' || simulationPaused.value) return
   if (centinelaGroup) centinelaGroup.visible = false
   currentAction.value = 'NONE'
   particleSystem.visible = false
+  clearScanRouteLine()
+  coverageRoute.value = null
+  allPlants.forEach(plant => {
+    plant.waterStress = 0
+    plant.dead = false
+    plant.irrigated = false
+  })
+  simulationElapsedSeconds.value = 0
+  trendHistory.value = []
   generateRandomStressCenters()
   regenerateFieldHealth()
+  addTrendSample()
   setActionFeedback('Nuevo escenario generado. Analiza el cultivo para detectar las zonas de estrés.')
   void saveScenarioSnapshot()
 }
@@ -804,17 +1171,21 @@ const toggleWind = () => {
 
 const exportCropData = () => {
   const rows = [
-    ['ID de planta', 'Etapa', 'Estado', 'Salud (%)', 'NDVI', 'Temperatura (°C)', 'Coordenada X', 'Coordenada Z'],
-    ...allPlants.map(plant => [
-      plant.id,
-      plant.stage === 1 ? 'Brote' : plant.stage === 2 ? 'Desarrollo' : 'Madurez',
-      plant.status,
-      (plant.health * 100).toFixed(1),
-      plant.ndvi.toFixed(2),
-      plant.temp.toFixed(1),
-      plant.x.toFixed(2),
-      plant.z.toFixed(2),
-    ]),
+    ['ID de planta', 'Etapa', 'Estado', 'Salud (%)', 'NDVI', 'Temperatura (°C)', 'Estrés hídrico (%)', 'Latitud simulada', 'Longitud simulada'],
+    ...allPlants.map(plant => {
+      const gps = plantGps(plant)
+      return [
+        plant.id,
+        plant.stage === 1 ? 'Brote' : plant.stage === 2 ? 'Desarrollo' : 'Madurez',
+        plant.status,
+        (plant.health * 100).toFixed(1),
+        plant.ndvi.toFixed(2),
+        plant.temp.toFixed(1),
+        (plant.waterStress * 100).toFixed(1),
+        gps?.latitude.toFixed(6) ?? '',
+        gps?.longitude.toFixed(6) ?? '',
+      ]
+    }),
   ]
   const csv = rows.map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\r\n')
   const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' })
@@ -831,42 +1202,68 @@ const initThree = () => {
   if (!canvasRef.value || !containerRef.value) return
   const width = canvasRef.value.clientWidth, height = canvasRef.value.clientHeight
   const isSmallScreen = window.matchMedia('(max-width: 767px)').matches
-  renderer.value = new THREE.WebGLRenderer({ canvas: canvasRef.value, antialias: !isSmallScreen })
-  renderer.value.setPixelRatio(Math.min(window.devicePixelRatio, isSmallScreen ? 1.5 : 2))
+  const quality = graphicsQuality.value
+  renderer.value = new THREE.WebGLRenderer({
+    canvas: canvasRef.value,
+    antialias: quality !== 'performance' && !isSmallScreen,
+    powerPreference: 'high-performance',
+    precision: 'highp',
+  })
+  gpuRendererName.value = detectHardwareGpuModel(renderer.value.getContext())
+  const targetPixelRatio =
+    quality === 'ultra'
+      ? Math.min(window.devicePixelRatio, 2.5)
+      : quality === 'balanced'
+        ? Math.min(window.devicePixelRatio, 1.75)
+        : 1.0
+  renderer.value.setPixelRatio(isSmallScreen ? Math.min(window.devicePixelRatio, 1.5) : targetPixelRatio)
   renderer.value.setSize(width, height, false)
-  renderer.value.shadowMap.enabled = !isSmallScreen
-  renderer.value.shadowMap.type = THREE.PCFSoftShadowMap
+  renderer.value.shadowMap.enabled = quality !== 'performance' && !isSmallScreen
+  renderer.value.shadowMap.type = quality === 'ultra' ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap
   renderer.value.outputColorSpace = THREE.SRGBColorSpace
   renderer.value.toneMapping = THREE.ACESFilmicToneMapping
-  renderer.value.toneMappingExposure = 1.12
+  renderer.value.toneMappingExposure = 1.14
 
   scene.value = new THREE.Scene()
-  scene.value.background = new THREE.Color(0xb4c2aa)
-  scene.value.fog = new THREE.FogExp2(0xb4c2aa, 0.007)
+  scene.value.background = new THREE.Color(0x9fc6d7)
+  scene.value.fog = quality === 'performance' ? null : new THREE.FogExp2(0x9fc6d7, 0.0038)
 
   camera.value = new THREE.PerspectiveCamera(60, width / height, 0.1, 1000)
-  camera.value.position.set(0, 18, 35)
+  camera.value.position.set(0, 29, 42)
   controls.value = new OrbitControls(camera.value, renderer.value.domElement)
   controls.value.target.set(0, 0, 0)
   controls.value.enableDamping = true
   controls.value.dampingFactor = 0.075
-  controls.value.minDistance = 12
-  controls.value.maxDistance = 75
-  controls.value.maxPolarAngle = Math.PI / 2.05
+  controls.value.enablePan = true
+  controls.value.screenSpacePanning = true
+  controls.value.mouseButtons.LEFT = THREE.MOUSE.ROTATE
+  controls.value.minDistance = 3
+  controls.value.maxDistance = 180
+  controls.value.maxPolarAngle = Math.PI / 2.02
+  controls.value.addEventListener('start', () => {
+    cameraFollowEnabled.value = false
+  })
+  controls.value.addEventListener('change', () => {
+    pointerDirty = true
+  })
 
-  scene.value.add(new THREE.HemisphereLight(0xeaf1df, 0x493b2c, 1.45))
-  const dirLight = new THREE.DirectionalLight(0xfff0d2, 2.1)
+  scene.value.add(new THREE.HemisphereLight(0xeaf1df, 0x493b2c, 1.48))
+  const dirLight = new THREE.DirectionalLight(0xfff0d2, 2.15)
   dirLight.position.set(-35, 65, 25)
-  dirLight.castShadow = true
-  dirLight.shadow.mapSize.set(2048, 2048)
-  dirLight.shadow.camera.left = -40
-  dirLight.shadow.camera.right = 40
-  dirLight.shadow.camera.top = 40
-  dirLight.shadow.camera.bottom = -40
+  dirLight.castShadow = quality !== 'performance'
+  const shadowRes = quality === 'ultra' ? 4096 : quality === 'balanced' ? 2048 : 1024
+  dirLight.shadow.mapSize.set(shadowRes, shadowRes)
+  dirLight.shadow.camera.left = -45
+  dirLight.shadow.camera.right = 45
+  dirLight.shadow.camera.top = 45
+  dirLight.shadow.camera.bottom = -45
   dirLight.shadow.bias = -0.0002
+  mainDirLight = dirLight
   scene.value.add(dirLight)
 
-  groundMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff, map: createSoilTexture() })
+  const soilTex = createSoilTexture()
+  soilTex.anisotropy = renderer.value.capabilities.getMaxAnisotropy() || 16
+  groundMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff, map: soilTex })
   sectorFalloffTexture = createSectorFalloffTexture()
   const fieldExtent = selectedFieldGeometry.value
     ? Math.max(selectedFieldGeometry.value.widthMeters, selectedFieldGeometry.value.depthMeters)
@@ -921,16 +1318,33 @@ const initThree = () => {
 
   for (let i = -7; i < 7; i++) {
     for (let j = -10; j < 10; j++) {
+      const x = i * 3.5 + (Math.random() * 0.8 - 0.4)
+      const z = j * 2.2 + (Math.random() * 0.8 - 0.4)
+      if (selectedFieldGeometry.value && !selectedFieldGeometry.value.contains({
+        x: x * scaleX.value,
+        z: z * scaleZ.value,
+      })) continue
+
       const stage = Math.random() > 0.6 ? 3 : (Math.random() > 0.3 ? 2 : 1)
       leafCount += stage === 1 ? 5 : (stage === 2 ? 10 : 14)
       if (stage === 3) { tasselCount++; earCount += 2 } else if (stage === 2) { earCount += 1 }
 
-      const x = i * 3.5 + (Math.random() * 0.8 - 0.4), z = j * 2.2 + (Math.random() * 0.8 - 0.4)
-      
       // Usamos valores dummy iniciales, regenerateFieldHealth recalculará los reales
       const health = 1, temp = 25, ndvi = 1
 
-      allPlants.push({ id: `P-${i+7}-${j+10}`, x, z, health, ndvi, temp, status: getStatusName(health), stage })
+      allPlants.push({
+        id: `P-${i + 7}-${j + 10}`,
+        x,
+        z,
+        health,
+        ndvi,
+        temp,
+        status: getStatusName(health),
+        stage,
+        waterStress: 0,
+        dead: false,
+        irrigated: false,
+      })
     }
   }
 
@@ -1023,33 +1437,88 @@ const initThree = () => {
 
   let actionTimer = 0
 
+  let stressTickElapsed = 0
+  let trendTickElapsed = 0
+  let lastAnimationFrameAt = performance.now()
+
+  let lastFrameTimestamp = performance.now()
+  let fpsFrameCounter = 0
+  let fpsWindowStart = performance.now()
+  let raycastTick = 0
+
+
   const animate = () => {
     animationId.value = requestAnimationFrame(animate)
+    const now = performance.now()
+
+    const frameDelta = Math.min(0.1, Math.max(0, (now - lastAnimationFrameAt) / 1000))
+    lastAnimationFrameAt = now
+
+    const deltaSec = Math.min(0.05, Math.max(0.001, (now - lastFrameTimestamp) / 1000))
+    const dtScale = deltaSec * 60
+    lastFrameTimestamp = now
+
+    fpsFrameCounter++
+    if (now - fpsWindowStart >= 500) {
+      const elapsed = now - fpsWindowStart
+      const currentFps = Math.round((fpsFrameCounter * 1000) / elapsed)
+      liveFps.value = Math.max(1, Math.min(240, currentFps))
+      frameTimeMs.value = Number((elapsed / fpsFrameCounter).toFixed(1))
+      fpsFrameCounter = 0
+      fpsWindowStart = now
+    }
+
+
     controls.value?.update()
     updateLiveDrone()
+    updateCameraFollow()
     if (simulationPaused.value) {
       if (renderer.value && scene.value && camera.value) renderer.value.render(scene.value, camera.value)
       return
     }
-    simulationTime += 0.016
+
+    simulationTime += frameDelta
+    stressTickElapsed += frameDelta
+    trendTickElapsed += frameDelta
+
+    simulationTime += deltaSec
+
     if (leafWindUniform) leafWindUniform.value = simulationTime
     if (leafWindStrengthUniform) leafWindStrengthUniform.value = windEnabled.value ? 1 : 0
+    if (stressTickElapsed >= 2) {
+      advanceFieldSimulation(stressTickElapsed)
+      stressTickElapsed = 0
+      sectorMarkers.forEach(mesh => {
+        const center = mesh.userData as StressCenter
+        ;(mesh.material as THREE.MeshBasicMaterial).color.setHex(getSectorColor(center.type, center.intensity))
+      })
+    }
+    if (trendTickElapsed >= 10) {
+      addTrendSample()
+      trendTickElapsed = 0
+    }
 
     if (droneState.value === 'IDLE') {
-      const hover = Math.sin(performance.now() * 0.0018) * 0.08
+      const hover = Math.sin(now * 0.0018) * 0.08
       droneGroup.position.y = DRONE_BASE.y + hover
-      droneGroup.rotation.z = Math.sin(performance.now() * 0.0012) * 0.012
+      droneGroup.rotation.z = Math.sin(now * 0.0012) * 0.012
       propellers.forEach((propeller, index) => {
-        propeller.rotation.y += index % 2 === 0 ? 0.12 : -0.12
+        propeller.rotation.y += (index % 2 === 0 ? 0.12 : -0.12) * dtScale
       })
     }
     
-    // Raycaster para Plantas y Zonas
-    if (raycaster.value && mouse.value && camera.value && scene.value) {
+    // Raycaster optimizado: solo evalúa intersecciones cuando el cursor se mueve o durante barrido activo
+    raycastTick++
+    if ((pointerDirty || (droneState.value !== 'IDLE' && raycastTick % 12 === 0)) && raycaster.value && mouse.value && camera.value && scene.value) {
+      pointerDirty = false
       raycaster.value.setFromCamera(mouse.value, camera.value)
       
       const plantHits = raycaster.value.intersectObject(hitboxMesh)
-      hoveredPlant.value = (plantHits.length > 0 && plantHits[0].instanceId !== undefined) ? allPlants[plantHits[0].instanceId] : null
+      const hitPlant = (plantHits.length > 0 && plantHits[0].instanceId !== undefined) ? allPlants[plantHits[0].instanceId] : null
+      hoveredPlant.value = hitPlant
+      if (hitPlant) {
+        lastInspectedPlant.value = hitPlant
+      }
       
       if (sectorMarkers.length > 0) {
         const sectorHits = raycaster.value.intersectObjects(sectorMarkers)
@@ -1061,23 +1530,9 @@ const initThree = () => {
 
     // Drone Animation Logic
     if (droneState.value === 'CENTINELAS') {
-      centinelaFrameCounter++
       centinelaPropellers.forEach((p, i) => p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5))
       if (centinelaGroup) {
         centinelaGroup.rotation.y += 0.005 // Rotar lentamente alrededor del campo
-      }
-      
-      // Simular actualización en tiempo real frecuente
-      if (centinelaFrameCounter % 120 === 0) { // Cada ~2 segundos (a 60fps)
-        // Modificar ligeramente la intensidad de estrés para que se vea vivo
-        stressCenters.forEach(c => c.intensity = Math.max(0.2, Math.min(1.0, c.intensity + (Math.random()-0.5)*0.1)))
-        regenerateFieldHealth()
-        
-        // Actualizar los colores de los marcadores de sector en tiempo real
-        sectorMarkers.forEach(mesh => {
-           const center = mesh.userData as StressCenter
-           ;(mesh.material as THREE.MeshBasicMaterial).color.setHex(getSectorColor(center.type, center.intensity))
-        })
       }
     } else if (droneState.value !== 'IDLE') {
       propellers.forEach((p, i) => p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5)) // Girar hélices
@@ -1113,6 +1568,7 @@ const initThree = () => {
               scene.value?.add(mesh)
               sectorMarkers.push(mesh)
             })
+            void saveScenarioSnapshot(true)
           }
         }
       } 
@@ -1159,6 +1615,11 @@ const initThree = () => {
             
             // "Curar" la zona tratada
             const treatedCenter = activeTargets[activeTargetIndex]
+            if (currentAction.value === 'WATER') {
+              for (const plant of allPlants) {
+                if (getDroughtPressure(plant, treatedCenter) > 0) plant.irrigated = true
+              }
+            }
             stressCenters = stressCenters.filter(c => c.id !== treatedCenter.id)
             const markerIndex = sectorMarkers.findIndex(m => m.userData.id === treatedCenter.id)
             if (markerIndex !== -1) {
@@ -1183,7 +1644,7 @@ const initThree = () => {
             const completedAction = currentAction.value
             currentAction.value = 'NONE'
             setActionFeedback(completedAction === 'WATER'
-              ? 'Misión de riego completada. Se actualizaron las métricas del cultivo.'
+              ? 'Riego aplicado. La humedad y el vigor de las plantas afectadas se recuperarán gradualmente.'
               : 'Misión de fumigación completada. Se actualizaron las métricas del cultivo.')
           }
         }
@@ -1197,6 +1658,7 @@ const initThree = () => {
   window.addEventListener('resize', onWindowResize)
   resizeObserver.value = new ResizeObserver(onWindowResize)
   resizeObserver.value.observe(canvasRef.value)
+  resizeObserver.value.observe(containerRef.value)
   containerRef.value.addEventListener('pointermove', onMouseMove)
 }
 
@@ -1205,10 +1667,39 @@ const onMouseMove = (event: PointerEvent) => {
   const rect = canvasRef.value.getBoundingClientRect()
   mouse.value.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
   mouse.value.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
-  tooltipPos.value = {
-    x: Math.max(12, Math.min(event.clientX + 15, window.innerWidth - 280)),
-    y: Math.min(event.clientY + 15, window.innerHeight - 24)
+  pointerDirty = true
+}
+
+const onGraphicsQualityChange = (preset: GraphicsQualityPreset) => {
+  setGraphicsQuality(preset)
+  if (!renderer.value || !scene.value) return
+  const isSmallScreen = window.matchMedia('(max-width: 767px)').matches
+  const targetPixelRatio =
+    preset === 'ultra'
+      ? Math.min(window.devicePixelRatio, 2.5)
+      : preset === 'balanced'
+        ? Math.min(window.devicePixelRatio, 1.75)
+        : 1.0
+  renderer.value.setPixelRatio(isSmallScreen ? Math.min(window.devicePixelRatio, 1.5) : targetPixelRatio)
+  renderer.value.shadowMap.enabled = preset !== 'performance' && !isSmallScreen
+  renderer.value.shadowMap.type = preset === 'ultra' ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap
+  renderer.value.shadowMap.needsUpdate = true
+  scene.value.fog = preset === 'performance' ? null : new THREE.FogExp2(0x9fc6d7, 0.0038)
+  if (mainDirLight) {
+    mainDirLight.castShadow = preset !== 'performance'
+    const shadowRes = preset === 'ultra' ? 4096 : preset === 'balanced' ? 2048 : 1024
+    mainDirLight.shadow.mapSize.set(shadowRes, shadowRes)
+    mainDirLight.shadow.map?.dispose()
+    mainDirLight.shadow.map = null
   }
+  onWindowResize()
+  setActionFeedback(
+    preset === 'ultra'
+      ? `Motor Gráfico Ultra PC activado: Sombras 4K, Supersampling GPU (${targetPixelRatio.toFixed(2)}x) y Anisotropía 16x.`
+      : preset === 'balanced'
+        ? 'Motor Gráfico Equilibrado activado: Sombras 2K y consumo optimizado.'
+        : 'Modo Máximo Rendimiento (FPS Desbloqueados) activado.'
+  )
 }
 
 const onWindowResize = () => {
@@ -1218,12 +1709,21 @@ const onWindowResize = () => {
   camera.value.aspect = width / height
   camera.value.updateProjectionMatrix()
   const isSmallScreen = window.matchMedia('(max-width: 767px)').matches
-  renderer.value.shadowMap.enabled = !isSmallScreen
-  renderer.value.setPixelRatio(Math.min(window.devicePixelRatio, isSmallScreen ? 1.5 : 2))
+  const preset = graphicsQuality.value
+  const targetPixelRatio =
+    preset === 'ultra'
+      ? Math.min(window.devicePixelRatio, 2.5)
+      : preset === 'balanced'
+        ? Math.min(window.devicePixelRatio, 1.75)
+        : 1.0
+  renderer.value.shadowMap.enabled = preset !== 'performance' && !isSmallScreen
+  renderer.value.setPixelRatio(isSmallScreen ? Math.min(window.devicePixelRatio, 1.5) : targetPixelRatio)
   renderer.value.setSize(width, height, false)
+  pointerDirty = true
 }
 
 onMounted(async () => {
+  document.addEventListener('fullscreenchange', onFullscreenChange)
   try {
     fields.value = await listFields()
     selectedFieldId.value = fields.value[0]?.id ?? ''
@@ -1238,10 +1738,14 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   cancelAnimationFrame(animationId.value); window.removeEventListener('resize', onWindowResize)
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
   if (feedbackTimeout) clearTimeout(feedbackTimeout)
   resizeObserver.value?.disconnect()
   if (containerRef.value) containerRef.value.removeEventListener('pointermove', onMouseMove)
   controls.value?.dispose()
+  clearLiveDroneTrail()
+  clearScanRouteLine()
+  clearSectorMarkers()
   groundMaterial?.map?.dispose()
   sectorFalloffTexture?.dispose()
   renderer.value?.dispose()
@@ -1253,17 +1757,39 @@ onBeforeUnmount(() => {
     <!-- Header -->
     <div class="simulation-header px-6 py-4 bg-white border-b border-gray-200 flex justify-between items-center z-20 shadow-sm relative">
       <div>
-        <span class="simulation-eyebrow">LABORATORIO AGRÍCOLA</span>
+        <div class="flex items-center gap-2.5 flex-wrap">
+          <span class="simulation-eyebrow">LABORATORIO AGRÍCOLA · MOTOR GPU</span>
+          <span
+            class="inline-flex items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-950/60 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-300"
+            :title="`Aceleración por hardware activa: ${gpuRendererName}`"
+          >
+            <Cpu :size="12" class="text-emerald-400" />
+            <span>{{ liveFps }} FPS · {{ frameTimeMs }} ms</span>
+            <span class="hidden xl:inline text-emerald-400/75">· {{ gpuRendererName.slice(0, 28) }}</span>
+          </span>
+        </div>
         <h1 class="text-2xl font-bold text-gray-900">Simulador de cultivos</h1>
-        <p class="text-sm text-gray-500 mt-1">Explora el cultivo, analiza su vigor y ejecuta misiones con drones.</p>
+        <p class="text-sm text-gray-500 mt-1">Explora el cultivo con aceleración GPU dedicada, analiza su vigor y ejecuta misiones con drones.</p>
       </div>
       
       <div class="simulation-header-actions">
         <select
+          :value="graphicsQuality"
+          class="simulation-field-select"
+          aria-label="Calidad gráfica y aceleración de hardware"
+          title="Nivel de optimización y calidad gráfica GPU"
+          @change="onGraphicsQualityChange(($event.target as HTMLSelectElement).value as GraphicsQualityPreset)"
+        >
+          <option value="ultra">Gráficos: Ultra PC (4K · 16x)</option>
+          <option value="balanced">Gráficos: Equilibrado (2K)</option>
+          <option value="performance">Gráficos: Máx. FPS</option>
+        </select>
+        <select
           v-model="selectedFieldId"
           class="simulation-field-select"
           aria-label="Asociar simulación a un campo"
-          @change="applySelectedField"
+          :disabled="droneState !== 'IDLE'"
+          @change="handleSelectedFieldChange"
         >
           <option value="">Sin campo asociado</option>
           <option v-for="field in fields" :key="field.id" :value="field.id">{{ field.name }}</option>
@@ -1293,22 +1819,6 @@ onBeforeUnmount(() => {
           <Download :size="15" />
           Exportar CSV
         </button>
-        <label class="simulation-toolbar-button gap-2" title="Preset de simulación del cultivo">
-          <span class="text-xs text-stone-300">Preset:</span>
-          <select
-            :value="activeFieldPreset"
-            :disabled="droneState !== 'IDLE'"
-            aria-label="Seleccionar preset de estrés o plagas del cultivo"
-            class="bg-transparent text-xs font-bold text-amber-200 focus:outline-none"
-            @change="applyFieldPreset(($event.target as HTMLSelectElement).value as FieldPresetId)"
-          >
-            <option value="mixed">Escenario Mixto</option>
-            <option value="sin_plagas">Sin Plagas · Óptimo</option>
-            <option value="estres_hidrico">Estrés Hídrico (Sequía)</option>
-            <option value="sobre_hidratacion">Sobrehidratación (Exceso)</option>
-            <option value="con_plagas">Con Plagas (Infestación)</option>
-          </select>
-        </label>
         <button class="simulation-new-scenario" type="button" @click="createNewScenario" :disabled="droneState !== 'IDLE' || simulationPaused || savingSnapshot">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
             <path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.64 5.64l2.12 2.12m8.48 8.48 2.12 2.12m0-12.72-2.12 2.12m-8.48 8.48-2.12 2.12M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" />
@@ -1339,12 +1849,10 @@ onBeforeUnmount(() => {
     
     <div ref="containerRef" class="simulation-stage flex-1 relative bg-gray-900 cursor-crosshair">
       <canvas ref="canvasRef" class="w-full h-full outline-none" role="img" aria-label="Vista tridimensional interactiva del cultivo. Usa el ratón o gestos para explorar."></canvas>
-      <p class="simulation-touch-hint">Arrastra para explorar · Pellizca para acercar</p>
-      <div class="simulation-demo-badge" :aria-label="selectedFieldGeometry ? 'Geometría real del campo a escala métrica; cultivo visual demostrativo' : 'Entorno demostrativo'">
-        <span class="simulation-demo-dot"></span>
-        <span>{{ selectedFieldGeometry ? 'GEOMETRÍA REAL · ESCALA 1:1' : 'ENTORNO DEMOSTRATIVO · DATOS SIMULADOS' }}</span>
-        <small v-if="selectedFieldGeometry">{{ fieldDimensionsLabel }} · cultivo visual demostrativo</small>
-      </div>
+      <p class="simulation-touch-hint">
+        <span class="desktop-camera-hint">Arrastra para orbitar · botón derecho para desplazar · rueda para zoom</span>
+        <span class="mobile-camera-hint">Un dedo: orbitar · dos dedos: desplazar y zoom</span>
+      </p>
       <div class="simulation-live-badge" :class="{ 'is-tracking': liveDrone.connected && liveDrone.hasHeartbeat }" role="status">
         <span></span>
         {{ liveDrone.connected && liveDrone.hasHeartbeat
@@ -1352,6 +1860,24 @@ onBeforeUnmount(() => {
           : 'Esperando telemetría real' }}
       </div>
       <div class="simulation-camera-tools" role="group" aria-label="Controles de cámara">
+        <button
+          type="button"
+          @click="toggleCameraPanMode"
+          :aria-pressed="cameraPanMode"
+          :aria-label="cameraPanMode ? 'Cambiar a modo orbitar' : 'Cambiar a modo desplazar'"
+          :title="cameraPanMode ? 'Modo desplazar activo' : 'Activar modo desplazar'"
+        >
+          <Move />
+        </button>
+        <button
+          type="button"
+          @click="toggleCameraFollow"
+          :aria-pressed="cameraFollowEnabled"
+          :aria-label="cameraFollowEnabled ? 'Desactivar seguimiento del dron' : 'Seguir al dron'"
+          :title="cameraFollowEnabled ? 'Desactivar seguimiento del dron' : 'Seguir al dron'"
+        >
+          <LocateFixed />
+        </button>
         <button type="button" @click="zoomCamera('out')" aria-label="Alejar vista" title="Alejar">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8" /><path d="m16 16 4.5 4.5M7.8 10.8h6" stroke-linecap="round" /></svg>
         </button>
@@ -1362,226 +1888,369 @@ onBeforeUnmount(() => {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path d="M3 12a9 9 0 1 0 2.64-6.36L3 8m0-5v5h5" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" /></svg>
           <span>Restablecer</span>
         </button>
+        <button
+          type="button"
+          @click="toggleFullscreen"
+          :aria-label="isFullscreen ? 'Salir de pantalla completa' : 'Expandir simulador a pantalla completa'"
+          :title="isFullscreen ? 'Salir de pantalla completa' : 'Pantalla completa'"
+        >
+          <Minimize2 v-if="isFullscreen" />
+          <Maximize2 v-else />
+        </button>
       </div>
 
-      <!-- Menú de Dron / Análisis -->
-      <div class="simulation-panel simulation-controls absolute top-6 right-6 bg-black/80 backdrop-blur-md border border-white/10 rounded-xl p-4 text-white shadow-2xl z-10 w-64 transition-all">
-        <div class="simulation-panel-heading">
-          <span class="simulation-panel-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
-              <path d="m5 10 7-4 7 4v4l-7 4-7-4v-4Zm2 1 5 3 5-3M12 6v8m-7-1-3 2m17-2 3 2" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" />
-            </svg>
-          </span>
-          <span class="simulation-panel-title"><strong>Centro de misión</strong><small>Operaciones autónomas</small></span>
-          <span class="simulation-status" :class="droneState === 'IDLE' ? 'status-ready' : 'status-active'">
-            <span></span>
-            {{ droneState === 'IDLE' ? 'Disponible' : (droneState === 'SCANNING' ? 'Escaneando' : (droneState === 'CENTINELAS' ? 'Centinelas' : 'En misión')) }}
-          </span>
+
+      <!-- Columna Izquierda Fija: Estado + Leyenda + Inspector Fijo de Planta -->
+      <div class="simulation-hud-left">
+        <div class="simulation-demo-badge" :aria-label="selectedFieldGeometry ? 'Geometría real del campo a escala métrica; cultivo visual demostrativo' : 'Entorno demostrativo'">
+          <span class="simulation-demo-dot"></span>
+          <span>{{ selectedFieldGeometry ? 'PARCELA REAL · PLANTAS SIMULADAS' : 'ENTORNO DEMOSTRATIVO · DATOS SIMULADOS' }}</span>
+          <small v-if="selectedFieldGeometry">{{ fieldDimensionsLabel }} · sin lectura satelital real</small>
+
         </div>
-        
-        <p class="simulation-control-hint">
-          {{ simulationPaused ? 'Simulación pausada.' : 'Selecciona una operación para el dron.' }}
-        </p>
-        <div class="space-y-2">
-          <button @click="handleAction('ANALYZE')" :disabled="droneState !== 'IDLE' || simulationPaused" class="simulation-action simulation-action-primary w-full disabled:cursor-not-allowed p-2 rounded-lg text-sm font-medium flex items-center justify-center gap-2">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
-            Analizar cultivo
-          </button>
-          
-          <button @click="handleAction('CENTINELAS')" :disabled="simulationPaused || (droneState !== 'IDLE' && droneState !== 'CENTINELAS')" class="simulation-action simulation-action-sentinel w-full disabled:cursor-not-allowed p-2 rounded-lg text-sm font-medium flex items-center justify-center gap-2 mt-2">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
-            {{ droneState === 'CENTINELAS' ? 'Detener Centinelas' : 'Activar Centinelas' }}
-          </button>
-          
-          <div class="grid grid-cols-2 gap-2 mt-2">
-            <button @click="handleAction('WATER')" :disabled="droneState !== 'IDLE' || simulationPaused" class="simulation-action simulation-action-water disabled:cursor-not-allowed p-2 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1M4.22 4.22l.71.71m14.14 14.14l.71.71M1 12h1m20 0h1M4.22 19.78l.71-.71M18.07 5.93l.71-.71M12 6a6 6 0 100 12 6 6 0 000-12z"/></svg>
-              Regar
-            </button>
-            <button @click="handleAction('FUMIGATE')" :disabled="droneState !== 'IDLE' || simulationPaused" class="simulation-action simulation-action-fumigate disabled:cursor-not-allowed p-2 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
-              Fumigar
-            </button>
+
+        <!-- Leyendas -->
+        <div v-if="currentMode === 'rgb'" class="simulation-panel simulation-legend p-3.5 text-white shadow-2xl w-64 transition-all">
+          <h3 class="font-bold text-sm mb-2 border-b border-white/20 pb-1.5">Vista natural · RGB</h3>
+          <p class="text-xs text-gray-300 mb-2.5">Representación visual del estado general de las plantas.</p>
+          <div class="simulation-color-key">
+            <span><i class="key-healthy"></i> Vigor alto</span>
+            <span><i class="key-stressed"></i> Vigor bajo</span>
           </div>
         </div>
-      </div>
 
-      <!-- Leyendas -->
-      <div v-if="currentMode === 'rgb'" class="simulation-panel simulation-legend absolute top-6 left-6 bg-black/80 backdrop-blur-md border border-white/10 rounded-xl p-4 text-white shadow-2xl z-10 w-64 transition-all">
-        <h3 class="font-bold text-sm mb-3 border-b border-white/20 pb-2">Vista natural · RGB</h3>
-        <p class="text-xs text-gray-300 mb-3">Representación visual del estado general de las plantas.</p>
-        <div class="simulation-color-key">
-          <span><i class="key-healthy"></i> Vigor alto</span>
-          <span><i class="key-stressed"></i> Vigor bajo</span>
-        </div>
-      </div>
-
-      <div v-if="currentMode === 'ndvi'" class="simulation-panel simulation-legend absolute top-6 left-6 bg-black/80 backdrop-blur-md border border-white/10 rounded-xl p-4 text-white shadow-2xl z-10 w-64 transition-all">
-        <h3 class="font-bold text-sm mb-3 border-b border-white/20 pb-2">Índice de vegetación · NDVI</h3>
-        <p class="text-xs text-gray-300 mb-3">Lectura visual del vigor vegetal. Es una simulación, no un diagnóstico agronómico.</p>
-        <div class="space-y-3">
-          <div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-6 h-4 bg-[#16a34a] rounded-sm"></div><span class="text-sm font-medium">Alto Vigor</span></div></div>
-          <div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-6 h-4 bg-[#facc15] rounded-sm"></div><span class="text-sm font-medium">Moderado</span></div></div>
-          <div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-6 h-4 bg-[#f97316] rounded-sm"></div><span class="text-sm font-medium">Bajo Vigor</span></div></div>
-          <div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-6 h-4 bg-[#dc2626] rounded-sm"></div><span class="text-sm font-medium">Plaga Severa</span></div></div>
-        </div>
-      </div>
-
-      <div v-if="currentMode === 'thermal'" class="simulation-panel simulation-legend absolute top-6 left-6 bg-black/80 backdrop-blur-md border border-white/10 rounded-xl p-4 text-white shadow-2xl z-10 w-64 transition-all">
-        <h3 class="font-bold text-lg mb-3 border-b border-white/20 pb-2">Térmico (Sequía)</h3>
-        <p class="text-xs text-gray-300 mb-3">La falta de agua dispara la temperatura de la planta.</p>
-        <div class="flex gap-4">
-          <div class="w-4 rounded-full bg-gradient-to-b from-[#ef4444] via-[#fde047] to-[#1d4ed8] h-32"></div>
-          <div class="flex flex-col justify-between py-1 flex-1">
-            <div class="flex justify-between items-center"><span class="text-sm font-medium text-red-400">Crítico (>35°C)</span></div>
-            <div class="flex justify-between items-center"><span class="text-sm font-medium text-yellow-400">Alerta (30°C)</span></div>
-            <div class="flex justify-between items-center"><span class="text-sm font-medium text-blue-400">Óptimo (25°C)</span></div>
+        <div v-if="currentMode === 'ndvi'" class="simulation-panel simulation-legend p-3.5 text-white shadow-2xl w-64 transition-all">
+          <h3 class="font-bold text-sm mb-2 border-b border-white/20 pb-1.5">Índice de vegetación · NDVI</h3>
+          <p class="text-xs text-gray-300 mb-2.5">Lectura visual del vigor vegetal en el cultivo.</p>
+          <div class="space-y-2">
+            <div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-5 h-3.5 bg-[#16a34a] rounded-sm"></div><span class="text-xs font-medium">Alto Vigor</span></div></div>
+            <div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-5 h-3.5 bg-[#facc15] rounded-sm"></div><span class="text-xs font-medium">Moderado</span></div></div>
+            <div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-5 h-3.5 bg-[#f97316] rounded-sm"></div><span class="text-xs font-medium">Bajo Vigor</span></div></div>
+            <div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-5 h-3.5 bg-[#dc2626] rounded-sm"></div><span class="text-xs font-medium">Plaga Severa</span></div></div>
           </div>
         </div>
-      </div>
 
-      <!-- Leyenda de Sectores -->
-      <div v-if="droneState !== 'IDLE' || sectorMarkers.length > 0" class="simulation-panel simulation-severity absolute bottom-6 left-6 bg-black/80 backdrop-blur-md border border-white/10 rounded-xl p-4 text-white shadow-2xl z-10 w-64 transition-all">
-        <h3 class="font-bold text-sm mb-3 border-b border-white/20 pb-2">Severidad de Sectores</h3>
-        <div class="space-y-4 text-xs">
-          <div>
-            <span class="block mb-1 text-gray-300 font-medium">Sequía (Requiere Riego)</span>
-            <div class="h-2 w-full bg-gradient-to-r from-[#facc15] to-[#ea580c] rounded-full"></div>
-            <div class="flex justify-between mt-1 text-gray-400"><span>Leve</span><span>Crítica</span></div>
-          </div>
-          <div>
-            <span class="block mb-1 text-gray-300 font-medium">Plaga (Requiere Fumigación)</span>
-            <div class="h-2 w-full bg-gradient-to-r from-[#c084fc] to-[#7e22ce] rounded-full"></div>
-            <div class="flex justify-between mt-1 text-gray-400"><span>Leve</span><span>Crítica</span></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Panel de Telemetría en Tiempo Real -->
-      <div class="simulation-panel simulation-telemetry absolute bottom-6 right-6 bg-black/85 backdrop-blur-md border border-white/10 rounded-xl p-4 text-white shadow-2xl z-10 w-64">
-        <h3 class="font-bold text-sm mb-3 border-b border-white/20 pb-2 flex items-center gap-2">
-          <span class="w-2 h-2 rounded-full bg-agron-green animate-pulse"></span>
-          Estado del cultivo
-        </h3>
-        <div class="space-y-2.5 text-xs">
-          <div class="flex justify-between items-center">
-            <span class="text-gray-400">Plantas monitoreadas</span>
-            <span class="font-bold text-white">{{ telemetry.plantCount }}</span>
-          </div>
-          <div>
-            <div class="flex justify-between mb-1">
-              <span class="text-gray-400">Salud promedio</span>
-              <span class="font-bold" :class="telemetry.avgHealth > 60 ? 'text-green-400' : telemetry.avgHealth > 40 ? 'text-yellow-400' : 'text-red-400'">{{ telemetry.avgHealth }}%</span>
-            </div>
-            <div class="w-full bg-white/10 rounded-full h-1">
-              <div class="h-1 rounded-full transition-all duration-500" :class="telemetry.avgHealth > 60 ? 'bg-green-400' : telemetry.avgHealth > 40 ? 'bg-yellow-400' : 'bg-red-400'" :style="`width: ${telemetry.avgHealth}%`"></div>
+        <div v-if="currentMode === 'thermal'" class="simulation-panel simulation-legend p-3.5 text-white shadow-2xl w-64 transition-all">
+          <h3 class="font-bold text-sm mb-2 border-b border-white/20 pb-1.5">Térmico (Sequía)</h3>
+          <p class="text-xs text-gray-300 mb-2.5">La falta de agua dispara la temperatura de la planta.</p>
+          <div class="flex gap-3">
+            <div class="w-3.5 rounded-full bg-gradient-to-b from-[#ef4444] via-[#fde047] to-[#1d4ed8] h-24"></div>
+            <div class="flex flex-col justify-between py-0.5 flex-1">
+              <div class="flex justify-between items-center"><span class="text-xs font-medium text-red-400">Crítico (>35°C)</span></div>
+              <div class="flex justify-between items-center"><span class="text-xs font-medium text-yellow-400">Alerta (30°C)</span></div>
+              <div class="flex justify-between items-center"><span class="text-xs font-medium text-blue-400">Óptimo (25°C)</span></div>
             </div>
           </div>
-          <div>
-            <div class="flex justify-between mb-1">
-              <span class="text-gray-400">Humedad suelo</span>
-              <span class="font-bold text-blue-400">{{ telemetry.avgHumidity }}%</span>
-            </div>
-            <div class="w-full bg-white/10 rounded-full h-1">
-              <div class="h-1 rounded-full bg-blue-400 transition-all duration-500" :style="`width: ${telemetry.avgHumidity}%`"></div>
-            </div>
-          </div>
-          <div>
-            <div class="flex justify-between mb-1">
-              <span class="text-gray-400">Índice de plagas</span>
-              <span class="font-bold" :class="telemetry.avgPestIndex > 30 ? 'text-red-400' : telemetry.avgPestIndex > 15 ? 'text-orange-400' : 'text-green-400'">{{ telemetry.avgPestIndex }}%</span>
-            </div>
-            <div class="w-full bg-white/10 rounded-full h-1">
-              <div class="h-1 rounded-full transition-all duration-500" :class="telemetry.avgPestIndex > 30 ? 'bg-red-400' : telemetry.avgPestIndex > 15 ? 'bg-orange-400' : 'bg-green-400'" :style="`width: ${telemetry.avgPestIndex}%`"></div>
-            </div>
-          </div>
-          <div class="flex justify-between items-center">
-            <span class="text-gray-400">NDVI promedio</span>
-            <span class="font-bold text-green-400">{{ telemetry.avgNDVI }}</span>
-          </div>
-          <div class="flex justify-between items-center">
-            <span class="text-gray-400">Temperatura prom.</span>
-            <span class="font-bold" :class="telemetry.avgTemp > 32 ? 'text-red-400' : 'text-orange-300'">{{ telemetry.avgTemp }} °C</span>
-          </div>
-          <div class="flex justify-between items-center border-t border-white/10 pt-2">
-            <span class="text-gray-400">Zonas de estrés</span>
-            <span class="font-bold" :class="telemetry.stressZones > 0 ? 'text-yellow-400' : 'text-green-400'">{{ telemetry.stressZones }}</span>
-          </div>
         </div>
-      </div>
-    </div>
 
-    <DroneConnectionPanel @telemetry="handleDroneTelemetry" />
-    
-    <!-- Tooltip Combinado (Planta + Sector) -->
-    <div 
-      v-if="hoveredPlant || hoveredSector"
-      class="simulation-tooltip fixed bg-white border border-gray-200 rounded-xl shadow-2xl p-4 pointer-events-none z-50 w-64 transform -translate-y-full"
-      :style="{ left: `${tooltipPos.x}px`, top: `${tooltipPos.y - 10}px` }"
-    >
-      <template v-if="hoveredPlant">
-        <div class="flex items-center gap-2 mb-2 pb-2 border-b border-gray-100">
-          <div class="w-2 h-2 rounded-full" :class="hoveredPlant.health > 0.6 ? 'bg-green-500' : 'bg-red-500'"></div>
-          <h4 class="font-bold text-gray-900 text-sm">Planta {{ hoveredPlant.id }}</h4>
-        </div>
-        <div class="space-y-2">
-          <div class="flex justify-between text-xs pb-1 border-b border-gray-50">
-            <span class="text-gray-500">Etapa</span>
-            <span class="font-medium text-green-700">{{ hoveredPlant.stage === 1 ? 'Brote' : (hoveredPlant.stage === 2 ? 'Desarrollo' : 'Madurez') }}</span>
-          </div>
-          <div>
-            <div class="flex justify-between text-xs mb-1">
-              <span class="text-gray-500">NDVI</span>
-              <span class="font-medium text-gray-900">{{ hoveredPlant.ndvi.toFixed(2) }}</span>
+        <!-- Campo Fijo de Inspección de Planta y Sector (debajo de Vista natural · RGB) -->
+        <div
+          v-if="inspectedPlant"
+          class="simulation-panel simulation-inspector p-3.5 text-white shadow-2xl w-64 transition-all"
+          aria-live="polite"
+        >
+          <div class="flex items-center justify-between gap-2 mb-2 pb-1.5 border-b border-white/15">
+            <div class="flex items-center gap-2">
+              <span
+                class="w-2.5 h-2.5 rounded-full shrink-0"
+                :class="inspectedPlant.health > 0.6 ? 'bg-green-400' : 'bg-red-400'"
+              ></span>
+              <h4 class="font-bold text-white text-sm">Planta {{ inspectedPlant.id }}</h4>
             </div>
-            <div class="w-full bg-gray-100 h-1.5 rounded-full overflow-hidden">
-              <div class="h-full bg-green-500 rounded-full" :style="`width: ${(hoveredPlant.ndvi / 1) * 100}%`"></div>
+            <span
+              class="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
+              :class="
+                hoveredPlant
+                  ? 'bg-emerald-400/20 text-emerald-300 border border-emerald-400/30'
+                  : 'bg-white/10 text-gray-300'
+              "
+            >
+              {{ hoveredPlant ? 'En cursor' : 'Fija' }}
+            </span>
+          </div>
+
+          <div class="space-y-2 text-xs">
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">Etapa</span>
+              <span class="font-semibold text-emerald-400">
+                {{ inspectedPlant.stage === 1 ? 'Brote' : (inspectedPlant.stage === 2 ? 'Desarrollo' : 'Madurez') }}
+              </span>
             </div>
+            <div>
+              <div class="flex justify-between mb-1">
+                <span class="text-gray-400">NDVI</span>
+                <span class="font-bold text-white">{{ inspectedPlant.ndvi.toFixed(2) }}</span>
+              </div>
+              <div class="w-full bg-white/10 h-1.5 rounded-full overflow-hidden">
+                <div
+                  class="h-full bg-green-400 rounded-full transition-all duration-200"
+                  :style="`width: ${Math.min(100, Math.max(0, inspectedPlant.ndvi * 100))}%`"
+                ></div>
+              </div>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">Estrés hídrico simulado</span>
+              <span class="font-bold text-sky-300">{{ (inspectedPlant.waterStress * 100).toFixed(0) }}%</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">Temperatura</span>
+              <span
+                class="font-bold"
+                :class="inspectedPlant.temp > 30 ? 'text-red-400' : 'text-sky-400'"
+              >
+                {{ inspectedPlant.temp.toFixed(1) }} °C
+              </span>
+            </div>
+            <div class="flex justify-between items-center pt-1 border-t border-white/10">
+              <span class="text-gray-400">Estado</span>
+              <span class="font-bold text-white">{{ inspectedPlant.status }}</span>
+            </div>
+            <div v-if="inspectedPlantGps" class="simulation-plant-location">
+              Ubicación GPS simulada: {{ inspectedPlantGps.latitude.toFixed(5) }}, {{ inspectedPlantGps.longitude.toFixed(5) }}
+            </div>
+            <small v-else class="simulation-location-note">Sin coordenada de parcela asociada; posición demostrativa.</small>
           </div>
-          <div class="flex justify-between text-xs">
-            <span class="text-gray-500">Temperatura</span>
-            <span class="font-medium" :class="hoveredPlant.temp > 30 ? 'text-red-500' : 'text-blue-500'">{{ hoveredPlant.temp.toFixed(1) }} °C</span>
-          </div>
-          <div class="flex justify-between text-xs pt-1">
-            <span class="text-gray-500">Estado</span>
-            <span class="font-semibold text-gray-900">{{ hoveredPlant.status }}</span>
-          </div>
-        </div>
-      </template>
 
-
-      <!-- Divisor si hay ambos -->
-      <div v-if="hoveredPlant && hoveredSector" class="my-3 border-t border-dashed border-gray-300"></div>
-
-      <template v-if="hoveredSector">
-        <div class="flex items-center gap-2 mb-2">
-          <div class="w-3 h-3 rounded-full animate-pulse shadow-sm" :class="hoveredSector.type === 'DROUGHT' ? 'bg-orange-500' : 'bg-purple-500'"></div>
-          <h4 class="font-bold text-sm text-gray-900">
-            {{ hoveredSector.type === 'DROUGHT' ? 'Sector de Sequía' : 'Sector de Plaga' }}
-          </h4>
-        </div>
-        <div class="space-y-3">
-          <div>
-            <div class="flex justify-between items-end mb-1">
-              <span class="text-xs text-gray-500 block">Severidad</span>
-              <span class="text-xs font-bold" :class="hoveredSector.type === 'DROUGHT' ? 'text-orange-500' : 'text-purple-500'">
+          <template v-if="hoveredSector">
+            <div class="my-2.5 border-t border-dashed border-white/20"></div>
+            <div class="flex items-center gap-2 mb-1.5">
+              <div
+                class="w-2.5 h-2.5 rounded-full animate-pulse"
+                :class="hoveredSector.type === 'DROUGHT' ? 'bg-orange-400' : 'bg-purple-400'"
+              ></div>
+              <h5 class="font-bold text-xs text-white">
+                {{ hoveredSector.type === 'DROUGHT' ? 'Sector de Sequía' : 'Sector de Plaga' }}
+              </h5>
+              <span
+                class="ml-auto text-xs font-bold"
+                :class="hoveredSector.type === 'DROUGHT' ? 'text-orange-400' : 'text-purple-300'"
+              >
                 {{ (hoveredSector.intensity * 100).toFixed(0) }}%
               </span>
             </div>
-            <div class="w-full bg-gray-100 h-1.5 rounded-full overflow-hidden">
-              <div class="h-full rounded-full transition-all" :class="hoveredSector.type === 'DROUGHT' ? 'bg-gradient-to-r from-yellow-400 to-orange-600' : 'bg-gradient-to-r from-purple-400 to-purple-800'" :style="`width: ${(hoveredSector.intensity / 1) * 100}%`"></div>
+            <div class="rounded-lg bg-white/5 px-2.5 py-1.5 border border-white/10 text-[11px]">
+              <span class="text-gray-400 block">Recomendación Autónoma:</span>
+              <strong :class="hoveredSector.type === 'DROUGHT' ? 'text-sky-300' : 'text-emerald-300'">
+                {{ hoveredSector.type === 'DROUGHT' ? 'Requiere Irrigación' : 'Requiere Fumigación' }}
+              </strong>
+            </div>
+          </template>
+        </div>
+
+      </div>
+
+        <!-- Leyenda de Sectores -->
+        <div v-if="droneState !== 'IDLE' || sectorMarkers.length > 0" class="simulation-panel simulation-severity p-3.5 text-white shadow-2xl w-64 transition-all">
+          <h3 class="font-bold text-xs mb-2 border-b border-white/20 pb-1.5">Severidad de Sectores</h3>
+          <div class="space-y-2.5 text-xs">
+            <div>
+              <span class="block mb-1 text-gray-300 font-medium">Sequía (Requiere Riego)</span>
+              <div class="h-1.5 w-full bg-gradient-to-r from-[#facc15] to-[#ea580c] rounded-full"></div>
+            </div>
+            <div>
+              <span class="block mb-1 text-gray-300 font-medium">Plaga (Requiere Fumigación)</span>
+              <div class="h-1.5 w-full bg-gradient-to-r from-[#c084fc] to-[#7e22ce] rounded-full"></div>
             </div>
           </div>
-          <div class="bg-gray-50 rounded p-2 border border-gray-200">
-            <span class="text-xs text-gray-500 block mb-1">Recomendación Autónoma:</span>
-            <span class="text-xs font-bold block" :class="hoveredSector.type === 'DROUGHT' ? 'text-blue-500' : 'text-emerald-500'">
-              {{ hoveredSector.type === 'DROUGHT' ? 'Requiere Irrigación' : 'Requiere Fumigación' }}
+        </div>
+      <!-- Columna Derecha Fija: Centro de Misión + Estado del Cultivo (sin superposición) -->
+      <div class="simulation-hud-right">
+        <!-- Menú de Dron / Análisis -->
+        <div class="simulation-panel simulation-controls p-3.5 text-white shadow-2xl w-64 transition-all">
+          <div class="simulation-panel-heading">
+            <span class="simulation-panel-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <path d="m5 10 7-4 7 4v4l-7 4-7-4v-4Zm2 1 5 3 5-3M12 6v8m-7-1-3 2m17-2 3 2" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" />
+              </svg>
+            </span>
+            <span class="simulation-panel-title"><strong>Centro de misión</strong><small>Operaciones autónomas</small></span>
+            <span class="simulation-status" :class="droneState === 'IDLE' ? 'status-ready' : 'status-active'">
+              <span></span>
+              {{ droneState === 'IDLE' ? 'Disponible' : (droneState === 'SCANNING' ? 'Escaneando' : (droneState === 'CENTINELAS' ? 'Centinelas' : 'En misión')) }}
             </span>
           </div>
+          
+          <p class="simulation-control-hint">
+            {{ simulationPaused ? 'Simulación pausada.' : 'Selecciona una operación para el dron.' }}
+          </p>
+
+          <div class="simulation-actions">
+            <button @click="handleAction('ANALYZE')" :disabled="droneState !== 'IDLE' || simulationPaused" class="simulation-action simulation-action-wide simulation-action-primary w-full disabled:cursor-not-allowed p-2 rounded-lg text-sm font-medium flex items-center justify-center gap-2">
+
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+              Analizar cultivo
+            </button>
+            
+            <button @click="handleAction('CENTINELAS')" :disabled="simulationPaused || (droneState !== 'IDLE' && droneState !== 'CENTINELAS')" class="simulation-action simulation-action-wide simulation-action-sentinel w-full disabled:cursor-not-allowed p-2 rounded-lg text-sm font-medium flex items-center justify-center gap-2">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+              {{ droneState === 'CENTINELAS' ? 'Detener Centinelas' : 'Activar Centinelas' }}
+            </button>
+            
+
+            <div class="simulation-action-row">
+              <button @click="handleAction('WATER')" :disabled="droneState !== 'IDLE' || simulationPaused" class="simulation-action simulation-action-water disabled:cursor-not-allowed p-2 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5">
+
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1M4.22 4.22l.71.71m14.14 14.14l.71.71M1 12h1m20 0h1M4.22 19.78l.71-.71M18.07 5.93l.71-.71M12 6a6 6 0 100 12 6 6 0 000-12z"/></svg>
+                Regar
+              </button>
+              <button @click="handleAction('FUMIGATE')" :disabled="droneState !== 'IDLE' || simulationPaused || savingSnapshot" class="simulation-action simulation-action-fumigate disabled:cursor-not-allowed p-2 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
+                Fumigar
+              </button>
+            </div>
+          </div>
         </div>
-      </template>
+
+        <!-- Panel de Telemetría en Tiempo Real -->
+        <div class="simulation-panel simulation-telemetry p-3.5 text-white shadow-2xl w-64">
+          <h3 class="font-bold text-sm mb-2 border-b border-white/20 pb-1.5 flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-agron-green animate-pulse"></span>
+            Estado del cultivo
+          </h3>
+          <div class="space-y-2 text-xs">
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">Plantas monitoreadas</span>
+              <span class="font-bold text-white">{{ telemetry.plantCount }}</span>
+            </div>
+            <div>
+              <div class="flex justify-between mb-1">
+                <span class="text-gray-400">Salud promedio</span>
+                <span class="font-bold" :class="telemetry.avgHealth > 60 ? 'text-green-400' : telemetry.avgHealth > 40 ? 'text-yellow-400' : 'text-red-400'">{{ telemetry.avgHealth }}%</span>
+              </div>
+              <div class="w-full bg-white/10 rounded-full h-1">
+                <div class="h-1 rounded-full transition-all duration-500" :class="telemetry.avgHealth > 60 ? 'bg-green-400' : telemetry.avgHealth > 40 ? 'bg-yellow-400' : 'bg-red-400'" :style="`width: ${telemetry.avgHealth}%`"></div>
+              </div>
+            </div>
+            <div>
+              <div class="flex justify-between mb-1">
+                <span class="text-gray-400">Humedad simulada</span>
+                <span class="font-bold text-blue-400">{{ telemetry.avgHumidity }}%</span>
+              </div>
+              <div class="w-full bg-white/10 rounded-full h-1">
+                <div class="h-1 rounded-full bg-blue-400 transition-all duration-500" :style="`width: ${telemetry.avgHumidity}%`"></div>
+              </div>
+            </div>
+            <div>
+              <div class="flex justify-between mb-1">
+                <span class="text-gray-400">Índice de plagas</span>
+                <span class="font-bold" :class="telemetry.avgPestIndex > 30 ? 'text-red-400' : telemetry.avgPestIndex > 15 ? 'text-orange-400' : 'text-green-400'">{{ telemetry.avgPestIndex }}%</span>
+              </div>
+              <div class="w-full bg-white/10 rounded-full h-1">
+                <div class="h-1 rounded-full transition-all duration-500" :class="telemetry.avgPestIndex > 30 ? 'bg-red-400' : telemetry.avgPestIndex > 15 ? 'bg-orange-400' : 'bg-green-400'" :style="`width: ${telemetry.avgPestIndex}%`"></div>
+              </div>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">NDVI promedio</span>
+              <span class="font-bold text-green-400">{{ telemetry.avgNDVI }}</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">Temperatura prom.</span>
+              <span class="font-bold" :class="telemetry.avgTemp > 32 ? 'text-red-400' : 'text-orange-300'">{{ telemetry.avgTemp }} °C</span>
+            </div>
+            <div class="flex justify-between items-center border-t border-white/10 pt-1.5">
+              <span class="text-gray-400">Zonas de estrés</span>
+              <span class="font-bold" :class="telemetry.stressZones > 0 ? 'text-yellow-400' : 'text-green-400'">{{ telemetry.stressZones }}</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">Plantas afectadas</span>
+              <span class="font-bold text-yellow-300">{{ telemetry.stressedPlants }}</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">Plantas perdidas (sim.)</span>
+              <span class="font-bold text-red-300">{{ telemetry.deadPlants }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
+    <section class="simulation-insights" aria-labelledby="simulation-insights-title">
+      <header class="simulation-insights-heading">
+        <div>
+          <span class="simulation-eyebrow">RESULTADOS DEL ESCENARIO</span>
+          <h2 id="simulation-insights-title">Seguimiento y costos estimados</h2>
+          <p>Datos simulados sobre {{ fields.find(field => field.id === selectedFieldId)?.name ?? 'un campo demostrativo' }}. No son mediciones satelitales ni una cotización.</p>
+        </div>
+        <span class="simulation-source-badge">SIMULACIÓN · {{ telemetry.stressedPlants }} plantas con afectación</span>
+      </header>
+
+      <div class="simulation-insights-grid">
+        <article class="simulation-insight-card simulation-trend-card">
+          <div class="simulation-insight-title">
+            <div><h3>Tendencia del cultivo</h3><p>Últimos {{ trendHistory.length }} registros · escala de 0 a 100</p></div>
+            <span class="simulation-trend-live"><i></i> Actualiza cada 10 s</span>
+          </div>
+          <svg class="simulation-trend-chart" viewBox="0 0 300 100" role="img" aria-label="Gráfica simulada de salud, humedad y NDVI del cultivo">
+            <line v-for="y in [10, 30, 50, 70, 90]" :key="y" x1="0" :y1="y" x2="300" :y2="y" />
+            <polyline class="trend-health" :points="trendPoints('health')" />
+            <polyline class="trend-moisture" :points="trendPoints('humidity')" />
+            <polyline class="trend-ndvi" :points="trendPoints('ndvi')" />
+          </svg>
+          <div class="simulation-chart-legend">
+            <span><i class="trend-health-key"></i> Salud {{ telemetry.avgHealth }}%</span>
+            <span><i class="trend-moisture-key"></i> Humedad {{ telemetry.avgHumidity }}%</span>
+            <span><i class="trend-ndvi-key"></i> NDVI {{ telemetry.avgNDVI }}</span>
+          </div>
+          <p class="simulation-chart-disclaimer">La evolución se acelera para demostración; el estrés sin tratar puede causar pérdida simulada de plantas.</p>
+        </article>
+
+        <article class="simulation-insight-card">
+          <div class="simulation-insight-title">
+            <div><h3>Tratamiento y prevención</h3><p>{{ selectedFieldGeometry ? `Referencia por ${estimatedAreaHectares.toFixed(2)} ha` : 'Área demostrativa de referencia: 1.00 ha' }}</p></div>
+            <span class="simulation-cost-icon">$</span>
+          </div>
+          <div class="simulation-cost-row">
+            <span><strong>Tratamiento correctivo</strong><small>Riego localizado para las zonas detectadas</small></span>
+            <b>{{ treatmentCost }}</b>
+          </div>
+          <div class="simulation-cost-row">
+            <span><strong>Prevención recomendada</strong><small>Revisar humedad y emisores por sector</small></span>
+            <b>{{ preventionCost }}</b>
+          </div>
+          <div class="simulation-savings">
+            <span><strong>Ahorro potencial estimado</strong><small>Valor bruto {{ estimatedSavings }} · neto preventivo {{ projectedSavingsNet }}</small></span>
+            <b>{{ projectedSavingsNet }}</b>
+          </div>
+          <p class="simulation-chart-disclaimer">Supuestos orientativos en MXN: tratamiento $1,650/ha, prevención $520/ha y pérdida potencial evitada hasta $2,400/ha, ajustada por plantas afectadas. Confirma precios locales y cultivo antes de decidir.</p>
+        </article>
+
+        <article class="simulation-insight-card simulation-route-card">
+          <div class="simulation-insight-title">
+            <div><h3>Ruta eficiente del dron</h3><p>Plan heurístico de cobertura por franjas</p></div>
+            <span class="simulation-route-icon">↗</span>
+          </div>
+          <template v-if="coverageRoute">
+            <div class="simulation-route-metrics">
+              <div><b>{{ coverageRoute.lengthMeters.toFixed(0) }} m</b><small>trayecto estimado</small></div>
+              <div><b>{{ Math.max(1, Math.ceil(coverageRoute.lengthMeters / 5 / 60)) }} min</b><small>a 5 m/s</small></div>
+              <div><b>{{ coverageRoute.laneCount }}</b><small>pasadas</small></div>
+            </div>
+            <p class="simulation-chart-disclaimer">Compara orientación y punto de inicio para reducir distancia y giros sobre la envolvente rectangular. Valida límites y obstáculos: es solo visual, no se envía al autopiloto ni estima combustible sin el modelo del dron.</p>
+          </template>
+          <p v-else class="simulation-empty-route">Ejecuta «Analizar cultivo» para calcular y visualizar la ruta sobre la parcela seleccionada.</p>
+        </article>
+
+        <article class="simulation-insight-card simulation-affected-card">
+          <div class="simulation-insight-title">
+            <div><h3>Plantas afectadas</h3><p>Ubicaciones generadas para este escenario</p></div>
+            <span class="simulation-affected-count">{{ telemetry.stressedPlants }}</span>
+          </div>
+          <div v-if="affectedPlants.length" class="simulation-affected-list">
+            <div v-for="plant in affectedPlants" :key="plant.id" class="simulation-affected-row">
+              <span><i :class="plant.dead ? 'is-dead' : ''"></i><strong>{{ plant.id }}</strong><small>{{ plant.status }} · estrés {{ (plant.waterStress * 100).toFixed(0) }}%</small></span>
+              <span v-if="plantGps(plant)" class="simulation-affected-location">
+                {{ plantGps(plant)?.latitude.toFixed(5) }}, {{ plantGps(plant)?.longitude.toFixed(5) }}
+              </span>
+              <small v-else>Coordenada no disponible</small>
+            </div>
+          </div>
+          <p v-else class="simulation-empty-route">No se han marcado plantas afectadas. Inicia un análisis para actualizar el escenario.</p>
+          <p class="simulation-chart-disclaimer">Puntos y coordenadas aproximados de la simulación; verifica la planta en campo antes de tratarla.</p>
+        </article>
+      </div>
+    </section>
+
+    <DroneConnectionPanel @telemetry="handleDroneTelemetry" />
   </div>
 </template>
 
@@ -1753,8 +2422,9 @@ onBeforeUnmount(() => {
       }
 
       .simulation-stage {
-        min-height: clamp(560px, 72vh, 850px);
-        min-height: clamp(560px, 72dvh, 850px);
+        height: clamp(600px, 75vh, 860px);
+        height: clamp(600px, 75dvh, 860px);
+        flex: 0 0 auto;
         overflow: hidden;
         border: 1px solid rgba(196, 218, 147, 0.14);
         border-radius: 18px;
@@ -1767,32 +2437,107 @@ onBeforeUnmount(() => {
 
       .simulation-stage > canvas {
         display: block;
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
         touch-action: none;
         cursor: grab;
       }
 
       .simulation-stage > canvas:active { cursor: grabbing; }
-      .simulation-touch-hint { display: none; }
+
+      .simulation-hud-left {
+        position: absolute;
+        z-index: 10;
+        top: 0.9rem;
+        left: 0.9rem;
+        bottom: 3.3rem;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0.55rem;
+        width: min(15.5rem, calc(50% - 1.25rem));
+        overflow-y: auto;
+        overflow-x: hidden;
+        pointer-events: none;
+        scrollbar-width: thin;
+      }
+
+      .simulation-hud-right {
+        position: absolute;
+        z-index: 10;
+        top: 0.9rem;
+        right: 0.9rem;
+        bottom: 0.9rem;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        justify-content: flex-start;
+        gap: 0.55rem;
+        width: min(15.5rem, calc(50% - 1.25rem));
+        overflow-y: auto;
+        overflow-x: hidden;
+        pointer-events: none;
+        scrollbar-width: thin;
+      }
+
+      .simulation-hud-left > *,
+      .simulation-hud-right > * {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+        pointer-events: auto;
+        flex-shrink: 0;
+
+      }
+
+      .simulation-touch-hint {
+        position: absolute;
+        z-index: 3;
+        bottom: 0.85rem;
+        left: 0.9rem;
+        display: block;
+        margin: 0;
+        padding: 6px 10px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 9px;
+        color: #e4ecdf;
+        background: rgba(13, 20, 16, 0.76);
+        backdrop-filter: blur(10px);
+        font-size: 0.62rem;
+        pointer-events: none;
+      }
+      .mobile-camera-hint { display: none; }
 
       .simulation-demo-badge {
-        position: absolute;
+        position: relative;
         z-index: 2;
+
         top: 1rem;
-        left: 1rem;
+        left: 50%;
+
+        width: fit-content;
+        max-width: 100%;
+
         display: grid;
         grid-template-columns: 6px auto;
         align-items: center;
         column-gap: 8px;
-        row-gap: 3px;
-        padding: 8px 11px;
+        row-gap: 2px;
+        padding: 6px 10px;
         border: 1px solid rgba(255, 255, 255, 0.14);
-        border-radius: 999px;
+        border-radius: 14px;
         color: #eff1e9;
-        background: rgba(13, 20, 16, 0.75);
+        background: rgba(13, 20, 16, 0.78);
         backdrop-filter: blur(12px);
-        font-size: 0.58rem;
+        font-size: 0.56rem;
         font-weight: 750;
         letter-spacing: 0.08em;
+        transform: translateX(-50%);
+
+        letter-spacing: 0.06em;
+
         pointer-events: none;
       }
 
@@ -1884,6 +2629,77 @@ onBeforeUnmount(() => {
       }
 
       .simulation-camera-tools svg { width: 16px; height: 16px; }
+      .simulation-camera-tools button[aria-pressed="true"] {
+        border-color: rgba(85, 230, 208, 0.45);
+        color: #8af0dd;
+        background: rgba(38, 161, 140, 0.18);
+      }
+
+      .simulation-stage:fullscreen {
+        width: 100vw;
+        height: 100vh;
+        height: 100dvh;
+        min-height: 100vh;
+        min-height: 100dvh;
+        max-height: 100dvh;
+        flex: none;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: #9fc6d7;
+      }
+
+      .simulation-stage:fullscreen > canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        border-radius: 0;
+      }
+
+      .simulation-stage:fullscreen > .simulation-legend {
+        position: absolute;
+        inset: 1rem auto auto 1rem;
+        width: min(270px, calc(100vw - 2rem));
+      }
+
+      .simulation-stage:fullscreen > .simulation-hud-left {
+        top: 1rem;
+        left: 1rem;
+        bottom: 3.6rem;
+        max-height: calc(100dvh - 4.8rem);
+      }
+
+      .simulation-stage:fullscreen > .simulation-hud-right {
+        top: 1rem;
+        right: 1rem;
+        bottom: 1rem;
+
+        max-height: calc(100dvh - 2rem);
+      }
+
+      .simulation-stage:fullscreen > .simulation-severity {
+        position: absolute;
+        inset: auto auto 4.5rem 1rem;
+        width: min(270px, calc(100vw - 2rem));
+        max-height: calc(100dvh - 7rem);
+        overflow: auto;
+      }
+
+      .simulation-stage:fullscreen > .simulation-camera-tools {
+        top: auto;
+        right: auto;
+        bottom: 1rem;
+        left: 50%;
+        transform: translateX(-50%);
+      }
+
+      .simulation-stage:fullscreen > .simulation-touch-hint {
+        top: auto;
+        bottom: 1.1rem;
+        left: 1rem;
+      }
 
       .simulation-panel {
         border: 1px solid rgba(196, 218, 147, 0.18);
@@ -1899,6 +2715,7 @@ onBeforeUnmount(() => {
       .simulation-panel-heading {
         display: flex;
         align-items: center;
+        flex-wrap: wrap;
         gap: 10px;
         margin-bottom: 12px;
         padding-bottom: 12px;
@@ -1918,7 +2735,7 @@ onBeforeUnmount(() => {
       }
 
       .simulation-panel-icon svg { width: 19px; height: 19px; }
-      .simulation-panel-title { min-width: 0; }
+      .simulation-panel-title { min-width: 0; flex: 1 1 5rem; }
       .simulation-panel-title strong,
       .simulation-panel-title small { display: block; }
       .simulation-panel-title strong { color: #f1f2eb; font-size: 0.86rem; }
@@ -1960,6 +2777,12 @@ onBeforeUnmount(() => {
       }
 
       .simulation-controls button:disabled { opacity: 0.48; }
+      .simulation-controls { box-sizing: border-box; min-width: 0; }
+      .simulation-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; }
+      .simulation-action-wide { grid-column: 1 / -1; }
+      .simulation-action-row { display: grid; grid-column: 1 / -1; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; }
+      .simulation-actions .simulation-action { width: 100%; min-width: 0; padding-inline: 0.45rem; line-height: 1.25; white-space: normal; }
+      .simulation-actions .simulation-action svg { flex: 0 0 auto; }
 
       .simulation-action {
         color: #f2f2e9;
@@ -2000,6 +2823,191 @@ onBeforeUnmount(() => {
       .simulation-color-key .key-healthy { background: #15803d; }
       .simulation-color-key .key-stressed { background: #84cc16; }
 
+      .simulation-insights {
+        display: grid;
+        gap: 1rem;
+        padding: 1.15rem;
+        border: 1px solid rgba(196, 218, 147, 0.13);
+        border-radius: 16px;
+        background: rgba(25, 30, 22, 0.82);
+      }
+
+      .simulation-insights-heading,
+      .simulation-insight-title {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+
+      .simulation-insights-heading h2 {
+        margin-top: 0.25rem;
+        color: #f0f2e9;
+        font-size: 1.25rem;
+        font-weight: 750;
+        letter-spacing: -0.035em;
+      }
+
+      .simulation-insights-heading p,
+      .simulation-insight-title p {
+        margin-top: 0.3rem;
+        color: #9aa38f;
+        font-size: 0.74rem;
+      }
+
+      .simulation-source-badge,
+      .simulation-trend-live {
+        display: inline-flex;
+        flex: 0 0 auto;
+        align-items: center;
+        gap: 0.45rem;
+        padding: 0.42rem 0.65rem;
+        border: 1px solid rgba(211, 189, 103, 0.2);
+        border-radius: 999px;
+        color: #e7d48e;
+        background: rgba(211, 189, 103, 0.07);
+        font-size: 0.62rem;
+        font-weight: 750;
+      }
+
+      .simulation-insights-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.8rem;
+      }
+
+      .simulation-insight-card {
+        min-width: 0;
+        padding: 1rem;
+        border: 1px solid rgba(196, 218, 147, 0.12);
+        border-radius: 13px;
+        background: linear-gradient(145deg, rgba(33, 39, 29, 0.92), rgba(17, 23, 18, 0.88));
+      }
+
+      .simulation-insight-title { align-items: center; margin-bottom: 0.8rem; }
+      .simulation-insight-title h3 { color: #f0f2e9; font-size: 0.88rem; font-weight: 750; }
+      .simulation-trend-live { color: #b7d89a; border-color: rgba(143, 191, 111, 0.18); background: rgba(143, 191, 111, 0.07); }
+      .simulation-trend-live i,
+      .simulation-affected-row > span > i {
+        display: block;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #a3d477;
+      }
+
+      .simulation-trend-chart {
+        display: block;
+        width: 100%;
+        height: 8rem;
+        overflow: visible;
+      }
+
+      .simulation-trend-chart line { stroke: rgba(226, 232, 220, 0.11); stroke-width: 1; }
+      .simulation-trend-chart polyline { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+      .simulation-trend-chart .trend-health { stroke: #a3d477; }
+      .simulation-trend-chart .trend-moisture { stroke: #60a5fa; }
+      .simulation-trend-chart .trend-ndvi { stroke: #f6d977; }
+
+      .simulation-chart-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.55rem 1rem;
+        color: #d3dacb;
+        font-size: 0.67rem;
+      }
+
+      .simulation-chart-legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
+      .simulation-chart-legend i { width: 9px; height: 9px; border-radius: 3px; }
+      .trend-health-key { background: #a3d477; }
+      .trend-moisture-key { background: #60a5fa; }
+      .trend-ndvi-key { background: #f6d977; }
+      .simulation-chart-disclaimer { margin-top: 0.8rem; color: #929d86; font-size: 0.63rem; line-height: 1.55; }
+
+      .simulation-cost-icon,
+      .simulation-route-icon,
+      .simulation-affected-count {
+        display: grid;
+        flex: 0 0 auto;
+        width: 2rem;
+        height: 2rem;
+        place-items: center;
+        border: 1px solid rgba(211, 189, 103, 0.2);
+        border-radius: 10px;
+        color: #e8d286;
+        background: rgba(211, 189, 103, 0.08);
+        font-size: 1rem;
+        font-weight: 800;
+      }
+
+      .simulation-cost-row,
+      .simulation-savings {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.8rem;
+        padding: 0.7rem 0;
+        border-top: 1px solid rgba(255, 255, 255, 0.075);
+      }
+
+      .simulation-cost-row span,
+      .simulation-savings span,
+      .simulation-affected-row > span {
+        display: grid;
+        gap: 0.18rem;
+        min-width: 0;
+      }
+
+      .simulation-cost-row strong,
+      .simulation-savings strong { color: #e7eadf; font-size: 0.72rem; }
+      .simulation-cost-row small,
+      .simulation-savings small { color: #929d86; font-size: 0.62rem; }
+      .simulation-cost-row b { color: #f0f2e9; font-size: 0.88rem; white-space: nowrap; }
+      .simulation-savings { margin-top: 0.3rem; padding: 0.8rem; border: 1px solid rgba(143, 191, 111, 0.18); border-radius: 10px; background: rgba(143, 191, 111, 0.07); }
+      .simulation-savings strong,
+      .simulation-savings b { color: #bce29a; }
+      .simulation-savings b { font-size: 1rem; white-space: nowrap; }
+
+      .simulation-route-metrics {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 0.5rem;
+      }
+
+      .simulation-route-metrics > div {
+        display: grid;
+        gap: 0.22rem;
+        padding: 0.7rem 0.5rem;
+        border: 1px solid rgba(196, 218, 147, 0.11);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.025);
+      }
+
+      .simulation-route-metrics b { color: #c7e9ef; font-size: 0.95rem; }
+      .simulation-route-metrics small { color: #929d86; font-size: 0.6rem; }
+      .simulation-empty-route { padding: 0.85rem; border: 1px dashed rgba(196, 218, 147, 0.16); border-radius: 10px; color: #a5ad9b; font-size: 0.72rem; line-height: 1.5; }
+
+      .simulation-affected-list { display: grid; max-height: 17rem; overflow: auto; }
+      .simulation-affected-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 0.65rem;
+        padding: 0.55rem 0;
+        border-top: 1px solid rgba(255, 255, 255, 0.075);
+      }
+
+      .simulation-affected-row > span { grid-template-columns: 8px 1fr; align-items: center; }
+      .simulation-affected-row > span > i.is-dead { background: #ef7373; }
+      .simulation-affected-row strong { color: #e7eadf; font-size: 0.68rem; }
+      .simulation-affected-row > span small { grid-column: 2; color: #929d86; font-size: 0.59rem; }
+      .simulation-affected-location,
+      .simulation-affected-row > small { color: #9bc9fb; font-size: 0.59rem; text-align: right; text-decoration: underline; text-underline-offset: 2px; }
+      .simulation-affected-location { justify-self: end; text-decoration: none; }
+      .simulation-affected-row > small { color: #929d86; text-decoration: none; }
+      .simulation-plant-location { padding-top: 0.5rem; border-top: 1px solid rgba(255, 255, 255, 0.08); color: #9bc9fb; font-size: 0.61rem; line-height: 1.5; }
+      .simulation-location-note { display: block; color: #929d86; font-size: 0.61rem; line-height: 1.5; }
+
       @keyframes simulation-enter {
         from { opacity: 0; transform: translateY(10px); }
         to { opacity: 1; transform: translateY(0); }
@@ -2016,11 +3024,14 @@ onBeforeUnmount(() => {
       }
 
       @media (min-width: 768px) and (max-width: 1023px) {
-        .simulation-stage { min-height: clamp(520px, 66dvh, 720px); }
-        .simulation-panel { width: 220px; padding: 0.85rem; }
+        .simulation-stage { min-height: clamp(580px, 72dvh, 760px); }
+        .simulation-hud-left,
+        .simulation-hud-right { width: 220px; }
+        .simulation-panel { width: 220px; padding: 0.8rem; }
         .simulation-panel-heading { gap: 7px; }
         .simulation-status { gap: 4px; padding-inline: 6px; font-size: 0.56rem; }
-        .simulation-legend { max-width: 220px; }
+        .simulation-legend,
+        .simulation-inspector,
         .simulation-telemetry,
         .simulation-severity { max-width: 220px; }
       }
@@ -2062,6 +3073,7 @@ onBeforeUnmount(() => {
           flex: none;
           flex-direction: column;
           gap: 0.6rem;
+          height: auto;
           min-height: 0;
           padding-top: clamp(260px, 44vh, 390px);
           padding-top: clamp(260px, 44dvh, 390px);
@@ -2083,7 +3095,6 @@ onBeforeUnmount(() => {
         }
 
         .simulation-touch-hint {
-          display: block;
           position: absolute;
           top: calc(clamp(260px, 44vh, 390px) - 2.65rem);
           top: calc(clamp(260px, 44dvh, 390px) - 2.65rem);
@@ -2102,20 +3113,31 @@ onBeforeUnmount(() => {
           transform: translateX(-50%);
           pointer-events: none;
         }
+        .desktop-camera-hint { display: none; }
+        .mobile-camera-hint { display: inline; }
 
-        .simulation-stage > .simulation-panel {
+        .simulation-hud-left,
+        .simulation-hud-right {
+          display: contents;
+        }
+
+        .simulation-stage .simulation-panel {
+
           position: relative;
           inset: auto;
           z-index: 1;
           width: 100%;
+          max-width: 100%;
           margin: 0;
         }
 
         .simulation-demo-badge {
+          position: absolute;
           top: 0.75rem;
           left: 0.75rem;
           padding: 7px 9px;
           font-size: 0.52rem;
+          transform: none;
         }
 
         .simulation-live-badge {
@@ -2136,19 +3158,82 @@ onBeforeUnmount(() => {
         }
 
         .simulation-camera-tools button { min-width: 42px; min-height: 42px; }
-        .simulation-camera-tools button span { display: inline; }
+        .simulation-camera-tools button span { display: none; }
+        .simulation-stage:fullscreen {
+          display: block;
+          height: 100vh;
+          height: 100dvh;
+          min-height: 100vh;
+          min-height: 100dvh;
+          max-height: 100dvh;
+          padding: 0;
+          overflow: hidden;
+          border: 0;
+          border-radius: 0;
+          background: #9fc6d7;
+          box-shadow: none;
+        }
+        .simulation-stage:fullscreen > canvas {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          border: 0;
+          border-radius: 0;
+        }
+
+        .simulation-stage:fullscreen .simulation-panel {
+          position: absolute;
+
+          inset: 1rem 1rem auto auto;
+          width: min(340px, calc(100vw - 2rem));
+          max-height: 64dvh;
+          overflow: auto;
+          padding-top: 0.85rem;
+        }
+        .simulation-stage:fullscreen > .simulation-legend {
+          display: none;
+        }
+        .simulation-stage:fullscreen > .simulation-severity {
+          display: none;
+        }
+        .simulation-stage:fullscreen > .simulation-camera-tools {
+          position: absolute;
+          top: auto;
+          right: auto;
+          bottom: 0.65rem;
+          left: auto;
+          transform: none;
+          width: calc(50vw - 1rem);
+          flex-wrap: wrap;
+          justify-content: center;
+        }
+        .simulation-stage:fullscreen > .simulation-touch-hint {
+          display: none;
+        }
+        .simulation-stage:fullscreen > .simulation-camera-tools {
+          left: 0.5rem;
+        }
         .simulation-panel { border-radius: 14px; }
         .simulation-panel-heading { flex-wrap: wrap; }
         .simulation-panel-icon { width: 34px; height: 34px; }
         .simulation-status { margin-left: auto; }
         .simulation-control-hint { font-size: 0.73rem; }
         .simulation-controls { order: 1; }
-        .simulation-legend { order: 2; }
-        .simulation-severity { order: 3; }
-        .simulation-telemetry { order: 4; }
-        .simulation-tooltip { display: none; }
+        .simulation-inspector { order: 2; }
+        .simulation-legend { order: 3; }
+        .simulation-severity { order: 4; }
+        .simulation-telemetry { order: 5; }
         .simulation-controls button { min-height: 46px; font-size: 0.84rem; }
         .simulation-telemetry { margin-bottom: 0.25rem !important; }
+        .simulation-insights { padding: 0.9rem; }
+        .simulation-insights-heading { align-items: flex-start; flex-direction: column; }
+        .simulation-insights-grid { grid-template-columns: minmax(0, 1fr); }
+        .simulation-insight-card { padding: 0.85rem; }
+        .simulation-source-badge { white-space: normal; }
+        .simulation-affected-row { grid-template-columns: minmax(0, 1fr); }
+        .simulation-affected-location,
+        .simulation-affected-row > small { text-align: left; padding-left: 1rem; }
       }
 
       @media (max-width: 420px) {
@@ -2161,7 +3246,7 @@ onBeforeUnmount(() => {
         .simulation-demo-badge { max-width: calc(100% - 8.5rem); font-size: 0.47rem; }
         .simulation-camera-tools { gap: 2px; }
         .simulation-camera-tools button { min-width: 40px; min-height: 42px; padding-inline: 7px; }
-        .simulation-controls .grid.grid-cols-2 { gap: 0.55rem; }
+        .simulation-action-row { gap: 0.55rem; }
       }
 
       @media (prefers-reduced-motion: reduce) {
