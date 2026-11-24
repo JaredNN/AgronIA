@@ -1,20 +1,6 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
 import { Activity, Bug, Droplets, Flame, Layers, Leaf, ScanSearch, Thermometer } from 'lucide-vue-next'
 import MultispectralPlantScanner from '../components/diagnosis/MultispectralPlantScanner.vue'
-import { checkAgroVisionHealth, resolveDiagnosisBaseUrl } from '../services/plantDiagnosis'
-
-const baseUrl = resolveDiagnosisBaseUrl(import.meta.env.VITE_PLANT_DIAGNOSIS_API_URL)
-const backendOnline = ref(false)
-const onnxReady = ref(false)
-
-onMounted(async () => {
-  const health = await checkAgroVisionHealth(baseUrl)
-  if (health) {
-    backendOnline.value = true
-    onnxReady.value = Boolean(health.onnx_ready)
-  }
-})
 </script>
 
 <template>
@@ -23,14 +9,6 @@ onMounted(async () => {
       <div class="diagnosis-hero-copy">
         <div class="diagnosis-hero-meta">
           <p class="diagnosis-eyebrow"><span></span> AGRONOMÍA DE PRECISIÓN · 01</p>
-          <span class="diagnosis-engine-status">
-            <i class="is-hybrid"></i>
-            {{
-              onnxReady
-                ? 'AgroVision ONNX + Servidor IA Activo'
-                : 'AgroVision ONNX + PlantLens (Web AI)'
-            }}
-          </span>
         </div>
 
         <h1>Diagnóstico <span>multiespectral</span></h1>
@@ -187,29 +165,12 @@ onMounted(async () => {
   box-shadow: 0 0 12px rgba(182, 214, 129, 0.6);
 }
 
-.diagnosis-engine-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45rem;
-  padding: 0.35rem 0.65rem;
-  border: 1px solid rgba(196, 218, 147, 0.15);
-  border-radius: 999px;
-  color: #b8c2ad;
-  background: rgba(3, 9, 6, 0.32);
-  font-size: 0.67rem;
-  font-weight: 650;
-}
-.diagnosis-engine-status i,
 .diagnosis-visual-tag.tag-bottom > span {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: #77b8d3;
   box-shadow: 0 0 9px rgba(119, 184, 211, 0.55);
-}
-.diagnosis-engine-status i.is-hybrid {
-  background: #88cc7e;
-  box-shadow: 0 0 9px rgba(136, 204, 126, 0.55);
 }
 
 .diagnosis-hero h1 {
