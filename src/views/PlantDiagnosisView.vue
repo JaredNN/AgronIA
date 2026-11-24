@@ -1,10 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue'
 import { Bug, Droplets, Flame, Layers, Leaf, ScanSearch, Thermometer } from 'lucide-vue-next'
 import MultispectralPlantScanner from '../components/diagnosis/MultispectralPlantScanner.vue'
-
-const endpoint = import.meta.env.VITE_PLANT_DIAGNOSIS_API_URL?.trim() ?? ''
-const hasEndpoint = computed(() => endpoint.length > 0)
 </script>
 
 <template>
@@ -23,19 +19,6 @@ const hasEndpoint = computed(() => endpoint.length > 0)
           <strong>Térmico</strong>, y simular escenarios de estrés hídrico, sobrehidratación y
           presencia o ausencia de plagas.
         </p>
-      </div>
-      <div
-        class="flex items-center gap-2 self-start rounded-full border border-white/10 bg-white/5 px-3.5 py-2 text-xs text-stone-300 sm:self-auto"
-      >
-        <span
-          class="h-2 w-2 rounded-full"
-          :class="hasEndpoint ? 'bg-emerald-400' : 'bg-sky-400'"
-        ></span>
-        {{
-          hasEndpoint
-            ? 'Motor Híbrido Activo (Tiempo Real + API Python)'
-            : 'Motor IA en Navegador Activo (30 FPS)'
-        }}
       </div>
     </header>
 
