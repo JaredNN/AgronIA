@@ -328,13 +328,32 @@ const saveMapElements = async () => {
   let fieldGeometrySaved = false
 
   try {
-    if (selectedFieldId.value) {
-      await updateFieldGeometry(
-        selectedFieldId.value,
+    if (!selectedFieldId.value) {
+      const fieldId = await saveMapWorkspace(
+        fieldName.value.trim() || `Mapa ${new Date().toLocaleDateString('es-MX')}`,
         JSON.parse(JSON.stringify(geojsonData.value)),
       )
-      fieldGeometrySaved = true
+      fieldName.value = ''
+      loadedFieldId.value = fieldId
+      selectedFieldId.value = fieldId
+      mapWorkspaceDirty.value = false
+      saveStatus.value = 'Campo, dimensiones y elementos guardados en Supabase.'
+      try {
+        await refreshFields()
+        await loadWorkspaceElements(fieldId)
+      } catch (error) {
+        errorMessage.value = error instanceof Error
+          ? `El campo se guardó, pero no se pudo actualizar la lista: ${error.message}`
+          : 'El campo se guardó, pero no se pudo actualizar la lista.'
+      }
+      return
     }
+
+    await updateFieldGeometry(
+      selectedFieldId.value,
+      JSON.parse(JSON.stringify(geojsonData.value)),
+    )
+    fieldGeometrySaved = true
 
     for (const [index, feature] of features.value.entries()) {
       if (errorMessage.value || !feature.geometry) break
