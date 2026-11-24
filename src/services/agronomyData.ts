@@ -179,12 +179,17 @@ export const deleteField = async (id: string): Promise<void> => {
 const isJsonRecord = (value: unknown): value is Record<string, Json | undefined> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-export const saveMapWorkspace = async (name: string, geojson: Json): Promise<string> => {
+export const saveMapWorkspace = async (
+  name: string,
+  geojson: Json,
+  userId: string,
+): Promise<string> => {
   const fieldName = name.trim()
   const mapFeatures = isJsonRecord(geojson) ? geojson.features : undefined
   if (fieldName.length < 1 || fieldName.length > 120) {
     throw new Error('El nombre del mapa debe tener entre 1 y 120 caracteres.')
   }
+  if (!userId) throw new Error('Inicia sesión para guardar el mapa.')
   if (
     !isJsonRecord(geojson)
     || geojson.type !== 'FeatureCollection'
@@ -198,7 +203,7 @@ export const saveMapWorkspace = async (name: string, geojson: Json): Promise<str
   const client = requireSupabase()
   const { data: field, error: fieldError } = await client
     .from('fields')
-    .insert({ name: fieldName, geojson_data: geojson })
+    .insert({ user_id: userId, name: fieldName, geojson_data: geojson })
     .select('id')
     .single()
   if (fieldError) throw new Error('No se pudo guardar el campo: ' + fieldError.message)
@@ -210,6 +215,7 @@ export const saveMapWorkspace = async (name: string, geojson: Json): Promise<str
     const featureName = properties.name
     return [{
       field_id: field.id,
+      user_id: userId,
       element_type: typeof feature.geometry.type === 'string' ? feature.geometry.type : 'Geometry',
       name: typeof featureName === 'string' && featureName.trim()
         ? featureName.trim()

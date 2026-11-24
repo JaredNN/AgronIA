@@ -261,12 +261,16 @@ watch(selectedFieldId, (fieldId, previousFieldId) => {
 
 const saveMap = async () => {
   if (!geojsonData.value || features.value.length === 0 || !fieldName.value.trim() || isSaving.value) return
+  if (!store.user?.id) {
+    saveError.value = 'Inicia sesión para guardar este mapa.'
+    return
+  }
   isSaving.value = true
   exportStatus.value = ''
   saveError.value = ''
   try {
     const geojson = JSON.parse(JSON.stringify(geojsonData.value))
-    const id = await saveMapWorkspace(fieldName.value.trim(), geojson)
+    const id = await saveMapWorkspace(fieldName.value.trim(), geojson, store.user.id)
     fieldName.value = ''
     selectedFieldId.value = id
     loadedFieldId.value = id
@@ -332,6 +336,7 @@ const saveMapElements = async () => {
       const fieldId = await saveMapWorkspace(
         fieldName.value.trim() || `Mapa ${new Date().toLocaleDateString('es-MX')}`,
         JSON.parse(JSON.stringify(geojsonData.value)),
+        store.user.id,
       )
       fieldName.value = ''
       loadedFieldId.value = fieldId
