@@ -483,7 +483,7 @@ const pestGaugeOptions = computed(() => ({
 </script>
 
 <template>
-  <div class="dashboard-page space-y-6">
+  <div class="dashboard-page space-y-4">
     <header class="dashboard-heading">
       <div>
         <span class="dashboard-eyebrow">INTELIGENCIA AGRÍCOLA</span>
@@ -603,7 +603,7 @@ const pestGaugeOptions = computed(() => ({
     </section>
 
     <!-- Tarjetas de parámetros clave -->
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+    <div v-if="selectedField" class="grid grid-cols-2 lg:grid-cols-4 gap-3">
       <!-- Humedad del Suelo -->
       <div class="dashboard-metric dashboard-metric-blue">
         <div class="dashboard-metric-heading">
@@ -666,7 +666,7 @@ const pestGaugeOptions = computed(() => ({
     </div>
 
     <!-- Aviso sobre el origen de los datos -->
-    <div class="dashboard-source">
+    <div v-if="selectedField" class="dashboard-source">
       <span class="dashboard-source-icon"><Info :size="17" /></span>
       <div>
         <strong>Datos registrados del campo</strong>
@@ -676,7 +676,7 @@ const pestGaugeOptions = computed(() => ({
     </div>
 
     <!-- Gauges NDVI + Plagas -->
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <div v-if="selectedField" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <Card class="dashboard-chart-card">
         <template #header>
           <div class="dashboard-chart-heading">
@@ -684,7 +684,7 @@ const pestGaugeOptions = computed(() => ({
             <span class="dashboard-chart-value">{{ simNDVI === null ? '—' : simNDVI.toFixed(2) }}</span>
           </div>
         </template>
-        <div class="h-64 w-full">
+        <div class="dashboard-gauge-chart" :class="{ 'is-empty': simNDVI === null }">
           <v-chart v-if="simNDVI !== null" class="chart" :option="ndviGaugeOptions" autoresize />
           <p v-else class="grid h-full place-items-center text-sm text-gray-400">Sin dato NDVI registrado.</p>
         </div>
@@ -696,7 +696,7 @@ const pestGaugeOptions = computed(() => ({
             <span class="dashboard-chart-value">{{ simPestIndex === null ? '—' : `${simPestIndex.toFixed(1)}%` }}</span>
           </div>
         </template>
-        <div class="h-64 w-full">
+        <div class="dashboard-gauge-chart" :class="{ 'is-empty': simPestIndex === null }">
           <v-chart v-if="simPestIndex !== null" class="chart" :option="pestGaugeOptions" autoresize />
           <p v-else class="grid h-full place-items-center text-sm text-gray-400">Sin dato de plagas registrado.</p>
         </div>
@@ -704,7 +704,7 @@ const pestGaugeOptions = computed(() => ({
     </div>
 
     <!-- Gráficas históricas -->
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <div v-if="selectedField" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <Card class="dashboard-chart-card lg:col-span-2">
         <template #header>
           <div class="dashboard-chart-heading">
@@ -712,7 +712,7 @@ const pestGaugeOptions = computed(() => ({
             <span class="dashboard-chart-caption">Hasta 100 registros</span>
           </div>
         </template>
-        <div class="h-80 w-full">
+        <div class="dashboard-history-chart" :class="{ 'is-empty': !hasClimateData }">
           <v-chart v-if="hasClimateData" class="chart" :option="climateChartOptions" autoresize />
           <p v-else class="dashboard-chart-empty">Sin datos de humedad o temperatura para este periodo.</p>
         </div>
@@ -725,7 +725,7 @@ const pestGaugeOptions = computed(() => ({
             <span class="dashboard-chart-value">{{ simSustainability === null ? '—' : simSustainability.toFixed(2) }}</span>
           </div>
         </template>
-        <div class="h-80 w-full">
+        <div class="dashboard-history-chart" :class="{ 'is-empty': !hasSustainabilityData }">
           <v-chart v-if="hasSustainabilityData" class="chart" :option="sustainabilityChartOptions" autoresize />
           <p v-else class="dashboard-chart-empty">Sin registros de sustentabilidad para este periodo.</p>
         </div>
@@ -737,7 +737,7 @@ const pestGaugeOptions = computed(() => ({
             <div><span>MONITOREO FITOSANITARIO</span><h3>Historial del índice de plagas</h3></div>
           </div>
         </template>
-        <div class="h-80 w-full">
+        <div class="dashboard-history-chart" :class="{ 'is-empty': !hasPestData }">
           <v-chart v-if="hasPestData" class="chart" :option="comparisonChartOptions" autoresize />
           <p v-else class="dashboard-chart-empty">Sin registros del índice de plagas para este periodo.</p>
         </div>
@@ -795,7 +795,7 @@ const pestGaugeOptions = computed(() => ({
   align-items: center;
   justify-content: space-between;
   gap: 1.5rem;
-  padding: 19px 21px;
+  padding: 16px 18px;
   border: 1px solid rgba(196, 218, 147, 0.14);
   border-radius: 18px;
   background:
@@ -831,7 +831,7 @@ const pestGaugeOptions = computed(() => ({
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
-  gap: 0.75rem;
+  gap: 0.6rem;
 }
 
 .dashboard-select {
@@ -923,7 +923,7 @@ const pestGaugeOptions = computed(() => ({
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  padding: 1rem 1.2rem;
+  padding: 0.85rem 1.05rem;
 }
 
 .dashboard-field-summary h2,
@@ -967,8 +967,8 @@ const pestGaugeOptions = computed(() => ({
 
 .dashboard-map-link:hover { color: #e6d28b; }
 
-.dashboard-observation-card { padding: 1.15rem 1.25rem; }
-.dashboard-observation-heading { margin-bottom: 1rem; }
+.dashboard-observation-card { padding: 0.95rem 1.1rem; }
+.dashboard-observation-heading { margin-bottom: 0.75rem; }
 
 .dashboard-form-grid {
   display: grid;
@@ -1064,7 +1064,7 @@ const pestGaugeOptions = computed(() => ({
 
 .dashboard-history-table th,
 .dashboard-history-table td {
-  padding: 0.75rem 0.65rem;
+  padding: 0.55rem 0.55rem;
   border-bottom: 1px solid rgba(196, 218, 147, 0.09);
   white-space: nowrap;
 }
@@ -1115,7 +1115,7 @@ const pestGaugeOptions = computed(() => ({
 .dashboard-metric {
   position: relative;
   min-width: 0;
-  padding: 1.15rem;
+  padding: 0.95rem;
   overflow: hidden;
   border: 1px solid rgba(196, 218, 147, 0.13);
   border-radius: 15px;
@@ -1169,7 +1169,7 @@ const pestGaugeOptions = computed(() => ({
 }
 
 .dashboard-metric-value {
-  margin: 0.75rem 0 0.55rem;
+  margin: 0.6rem 0 0.45rem;
   color: #f0f1e9;
   font-size: clamp(1.7rem, 3vw, 2.2rem);
   font-weight: 800;
@@ -1208,8 +1208,8 @@ const pestGaugeOptions = computed(() => ({
 .dashboard-source {
   display: flex;
   align-items: flex-start;
-  gap: 0.8rem;
-  padding: 1rem 1.1rem;
+  gap: 0.7rem;
+  padding: 0.8rem 0.95rem;
   border: 1px solid rgba(117, 184, 236, 0.17);
   border-radius: 13px;
   background: linear-gradient(110deg, rgba(48, 91, 113, 0.15), rgba(30, 42, 37, 0.34));
@@ -1246,11 +1246,11 @@ const pestGaugeOptions = computed(() => ({
 }
 
 :deep(.dashboard-chart-card .app-card-header) {
-  padding: 1.1rem 1.3rem;
+  padding: 0.9rem 1.1rem;
   border-color: rgba(196, 218, 147, 0.1);
 }
 
-:deep(.dashboard-chart-card .app-card-body) { padding: 1rem 1.15rem 1.2rem; }
+:deep(.dashboard-chart-card .app-card-body) { padding: 0.75rem 0.95rem 0.85rem; }
 
 .dashboard-chart-heading {
   display: flex;
@@ -1263,6 +1263,16 @@ const pestGaugeOptions = computed(() => ({
 .dashboard-chart-heading h3 { margin-top: 0.3rem; color: #e8eddf; font-size: 0.88rem; font-weight: 680; }
 .dashboard-chart-value { color: #e6d28b; font-size: 1rem; font-weight: 800; font-variant-numeric: tabular-nums; }
 .dashboard-chart-caption { color: #8f9986; font-size: 0.68rem; }
+
+.dashboard-gauge-chart,
+.dashboard-history-chart {
+  width: 100%;
+}
+
+.dashboard-gauge-chart { height: 13rem; }
+.dashboard-history-chart { height: 16rem; }
+.dashboard-gauge-chart.is-empty,
+.dashboard-history-chart.is-empty { height: 5.5rem; }
 
 .chart {
   display: block;
@@ -1284,6 +1294,7 @@ const pestGaugeOptions = computed(() => ({
   .dashboard-heading { align-items: flex-start; flex-direction: column; gap: 1rem; padding: 17px; }
   .dashboard-heading-actions { width: 100%; justify-content: flex-start; }
   .dashboard-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dashboard-history-chart { height: 14rem; }
 }
 
 @media (max-width: 480px) {
@@ -1299,8 +1310,10 @@ const pestGaugeOptions = computed(() => ({
   .dashboard-metric-icon { width: 30px; height: 30px; flex-basis: 30px; }
   .dashboard-metric-label { font-size: 0.66rem; }
   .dashboard-source { padding: 0.85rem; }
-  :deep(.dashboard-chart-card .app-card-header) { padding: 0.95rem 1rem; }
-  :deep(.dashboard-chart-card .app-card-body) { padding: 0.65rem 0.7rem 0.9rem; }
+  .dashboard-gauge-chart { height: 11rem; }
+  .dashboard-history-chart { height: 13rem; }
+  :deep(.dashboard-chart-card .app-card-header) { padding: 0.8rem 0.9rem; }
+  :deep(.dashboard-chart-card .app-card-body) { padding: 0.55rem 0.65rem 0.7rem; }
 }
 
 @media (prefers-reduced-motion: reduce) {
