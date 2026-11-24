@@ -9,8 +9,9 @@ import VChart from 'vue-echarts'
 import Card from '../components/ui/Card.vue'
 import { ref, computed, onMounted, onBeforeUnmount, shallowRef, watch } from 'vue'
 import { RouterLink } from 'vue-router'
-import { ArrowRight, Droplets, Bug, Thermometer, TrendingUp, AlertTriangle, CheckCircle, Info, RefreshCw } from 'lucide-vue-next'
-import { listFieldMetrics, listFields, type FieldMetricRecord, type FieldRecord } from '../services/agronomyData'
+import { ArrowRight, Droplets, Bug, Thermometer, TrendingUp, AlertTriangle, CheckCircle, Info, RefreshCw, Save } from 'lucide-vue-next'
+import { listFieldMetrics, listFields, saveFieldMetric, type FieldMetricRecord, type FieldRecord } from '../services/agronomyData'
+import { projectFieldGeometry } from '../services/fieldGeometry'
 
 use([CanvasRenderer, LineChart, GaugeChart, TitleComponent, TooltipComponent, LegendComponent, GridComponent])
 
@@ -25,7 +26,32 @@ const dataError = ref('')
 const isLoadingFields = ref(true)
 const isLoadingMetrics = ref(false)
 const lastUpdated = ref<Date | null>(null)
+const localDateTimeValue = (date = new Date()) => {
+  const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+  return localDate.toISOString().slice(0, 16)
+}
+const observationForm = ref({
+  recordDate: localDateTimeValue(),
+  growthStage: '',
+  soilHumidity: '',
+  temperature: '',
+  ndvi: '',
+  pestIndex: '',
+  notes: '',
+})
+const isSavingObservation = ref(false)
+const observationError = ref('')
+const observationSuccess = ref('')
 let metricsRequestId = 0
+const selectedField = computed(() => fields.value.find(field => field.id === selectedFieldId.value) ?? null)
+const selectedFieldGeometry = computed(() =>
+  projectFieldGeometry(selectedField.value?.geojson_data ?? null),
+)
+const fieldDimensionsLabel = computed(() => {
+  const geometry = selectedFieldGeometry.value
+  if (!geometry) return 'Sin geometría disponible'
+  return `${geometry.widthMeters.toFixed(1)} × ${geometry.depthMeters.toFixed(1)} m · ${geometry.areaHectares.toFixed(2)} ha`
+})
 const periodMetrics = computed(() => {
   if (selectedPeriod.value === 'all') return metrics.value
   const cutoff = Date.now() - Number(selectedPeriod.value) * 24 * 60 * 60 * 1000
@@ -52,6 +78,30 @@ const rawMetricValue = (metric: FieldMetricRecord | undefined, key: string) => {
     if (Number.isFinite(parsedValue)) return parsedValue
   }
   return null
+}
+const rawMetricText = (metric: FieldMetricRecord, key: string) => {
+  const rawData = metric.raw_data
+  if (!rawData || typeof rawData !== 'object' || Array.isArray(rawData)) return null
+  const value = rawData[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+const metricSourceLabel = (metric: FieldMetricRecord) => {
+  switch (rawMetricText(metric, 'source')) {
+    case 'manual_observation': return 'Observación manual'
+    case 'simulation': return 'Simulación'
+    case 'drone_telemetry': return 'Telemetría'
+    default: return 'Importado / otro'
+  }
+}
+const observationHistory = computed(() => periodMetrics.value.slice(0, 100))
+const parseObservationNumber = (value: string | number, label: string, min: number, max: number) => {
+  const normalizedValue = typeof value === 'string' ? value.trim() : String(value)
+  if (!normalizedValue) return { value: null as number | null, error: null as string | null }
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+    return { value: null, error: `${label} debe estar entre ${min} y ${max}.` }
+  }
+  return { value: parsed, error: null }
 }
 const simHumidity = computed(() => latestMetricWith(metric => metric.soil_humidity)?.soil_humidity ?? null)
 const simPestIndex = computed(() => rawMetricValue(
@@ -101,7 +151,7 @@ const loadMetrics = async () => {
   }
 }
 
-const loadFields = async () => {
+const loadFields = async (): Promise<boolean> => {
   isLoadingFields.value = true
   try {
     const availableFields = await listFields()
@@ -110,19 +160,91 @@ const loadFields = async () => {
       selectedFieldId.value = availableFields[0]?.id ?? ''
     }
     dataError.value = ''
+    return true
   } catch (error) {
     dataError.value = error instanceof Error ? error.message : 'No se pudieron cargar los datos del campo.'
+    return false
   } finally {
     isLoadingFields.value = false
   }
 }
 
 const refreshDashboard = async () => {
-  if (fields.value.length === 0) {
-    await loadFields()
+  const previousFieldId = selectedFieldId.value
+  if (!await loadFields()) return
+  if (previousFieldId === selectedFieldId.value) await loadMetrics()
+}
+
+const saveObservation = async () => {
+  if (!selectedFieldId.value || isSavingObservation.value) return
+  observationError.value = ''
+  observationSuccess.value = ''
+
+  const observationDate = new Date(observationForm.value.recordDate)
+  if (!Number.isFinite(observationDate.getTime())) {
+    observationError.value = 'Selecciona una fecha y hora válidas.'
     return
   }
-  await loadMetrics()
+
+  const values = {
+    soilHumidity: parseObservationNumber(observationForm.value.soilHumidity, 'La humedad', 0, 100),
+    temperature: parseObservationNumber(observationForm.value.temperature, 'La temperatura', -50, 80),
+    ndvi: parseObservationNumber(observationForm.value.ndvi, 'El NDVI', -1, 1),
+    pestIndex: parseObservationNumber(observationForm.value.pestIndex, 'El índice de plagas', 0, 100),
+  }
+  const invalidValue = Object.values(values).find(value => value.error)
+  if (invalidValue?.error) {
+    observationError.value = invalidValue.error
+    return
+  }
+
+  const growthStage = observationForm.value.growthStage.trim()
+  const notes = observationForm.value.notes.trim()
+  const { soilHumidity, temperature, ndvi, pestIndex } = {
+    soilHumidity: values.soilHumidity.value,
+    temperature: values.temperature.value,
+    ndvi: values.ndvi.value,
+    pestIndex: values.pestIndex.value,
+  }
+  if (
+    soilHumidity === null && temperature === null && ndvi === null && pestIndex === null
+    && !growthStage && !notes
+  ) {
+    observationError.value = 'Agrega al menos una medición, una etapa del cultivo o una nota.'
+    return
+  }
+
+  isSavingObservation.value = true
+  try {
+    await saveFieldMetric({
+      field_id: selectedFieldId.value,
+      record_date: observationDate.toISOString(),
+      soil_humidity: soilHumidity,
+      temperature,
+      raw_data: {
+        source: 'manual_observation',
+        growth_stage: growthStage || null,
+        notes: notes || null,
+        ndvi_avg: ndvi,
+        pest_index: pestIndex,
+      },
+    })
+    observationSuccess.value = 'Observación guardada en el historial de este campo.'
+    observationForm.value = {
+      recordDate: localDateTimeValue(),
+      growthStage: '',
+      soilHumidity: '',
+      temperature: '',
+      ndvi: '',
+      pestIndex: '',
+      notes: '',
+    }
+    await loadMetrics()
+  } catch (error) {
+    observationError.value = error instanceof Error ? error.message : 'No se pudo guardar la observación.'
+  } finally {
+    isSavingObservation.value = false
+  }
 }
 
 watch(selectedFieldId, () => {
@@ -411,8 +533,74 @@ const pestGaugeOptions = computed(() => ({
         No hay mediciones en este periodo. Prueba con un rango más amplio.
     </p>
     <p v-else-if="!metrics.length" class="dashboard-notice">
-      Este campo aún no tiene mediciones. Los valores aparecerán cuando guardes datos o conectes telemetría.
+      Este campo aún no tiene mediciones. Registra una observación aquí o guarda datos desde Simulación o Datos.
     </p>
+
+    <section v-if="selectedField" class="dashboard-field-summary">
+      <div>
+        <span class="dashboard-eyebrow">CAMPO EN SEGUIMIENTO</span>
+        <h2>{{ selectedField.name }}</h2>
+        <p>Este campo se seleccionó desde los polígonos guardados en Mapas.</p>
+      </div>
+      <div class="dashboard-field-geometry">
+        <span>Dimensiones del terreno</span>
+        <strong>{{ fieldDimensionsLabel }}</strong>
+      </div>
+      <RouterLink to="/mapas" class="dashboard-map-link">Ver mapas <ArrowRight :size="15" /></RouterLink>
+    </section>
+
+    <section v-if="selectedField" class="dashboard-observation-card">
+      <div class="dashboard-observation-heading">
+        <div>
+          <span class="dashboard-eyebrow">REGISTRO DE AVANCE</span>
+          <h2>Nueva observación</h2>
+          <p>Guarda mediciones reales y la etapa del cultivo para comparar su evolución con el tiempo.</p>
+        </div>
+      </div>
+      <form class="dashboard-observation-form" @submit.prevent="saveObservation">
+        <div class="dashboard-form-grid">
+          <label class="dashboard-form-field">
+            <span>Fecha y hora</span>
+            <input v-model="observationForm.recordDate" type="datetime-local" required>
+          </label>
+          <label class="dashboard-form-field">
+            <span>Etapa del cultivo</span>
+            <input v-model="observationForm.growthStage" type="text" maxlength="80" placeholder="Ej. desarrollo vegetativo">
+          </label>
+          <label class="dashboard-form-field">
+            <span>Humedad del suelo (%)</span>
+            <input v-model="observationForm.soilHumidity" type="number" min="0" max="100" step="any" placeholder="0–100">
+          </label>
+          <label class="dashboard-form-field">
+            <span>Temperatura (°C)</span>
+            <input v-model="observationForm.temperature" type="number" min="-50" max="80" step="any" placeholder="°C">
+          </label>
+          <label class="dashboard-form-field">
+            <span>NDVI</span>
+            <input v-model="observationForm.ndvi" type="number" min="-1" max="1" step="any" placeholder="-1 a 1">
+          </label>
+          <label class="dashboard-form-field">
+            <span>Índice de plagas (%)</span>
+            <input v-model="observationForm.pestIndex" type="number" min="0" max="100" step="any" placeholder="0–100">
+          </label>
+          <label class="dashboard-form-field dashboard-form-field-wide">
+            <span>Notas</span>
+            <textarea v-model="observationForm.notes" rows="2" maxlength="1000" placeholder="Describe cambios, observaciones o acciones realizadas"></textarea>
+          </label>
+        </div>
+        <div class="dashboard-observation-footer">
+          <div>
+            <p class="dashboard-form-hint">Captura solo los datos que hayas observado; los campos vacíos no se guardan como cero.</p>
+            <p v-if="observationError" role="alert" class="dashboard-form-message is-error">{{ observationError }}</p>
+            <p v-else-if="observationSuccess" role="status" class="dashboard-form-message is-success">{{ observationSuccess }}</p>
+          </div>
+          <button type="submit" class="dashboard-save-button" :disabled="isSavingObservation">
+            <Save :size="16" />
+            {{ isSavingObservation ? 'Guardando…' : 'Guardar observación' }}
+          </button>
+        </div>
+      </form>
+    </section>
 
     <!-- Tarjetas de parámetros clave -->
     <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -461,7 +649,7 @@ const pestGaugeOptions = computed(() => ({
         <div class="dashboard-metric-value">
           {{ simTemperature === null ? '—' : simTemperature.toFixed(1) }}<span v-if="simTemperature !== null">°C</span>
         </div>
-        <div class="dashboard-metric-note">Promedio del campo</div>
+        <div class="dashboard-metric-note">Último registro del periodo</div>
       </div>
 
       <!-- NDVI -->
@@ -482,7 +670,7 @@ const pestGaugeOptions = computed(() => ({
       <span class="dashboard-source-icon"><Info :size="17" /></span>
       <div>
         <strong>Datos registrados del campo</strong>
-        <p>Los indicadores y gráficos provienen de las mediciones guardadas. Si una métrica no está en tus registros, se muestra como “—”; NDVI y plagas se leen de los campos <code>ndvi_avg</code> y <code>pest_index</code> de <code>raw_data</code>.</p>
+        <p>Los indicadores y gráficos usan las mediciones guardadas. Las observaciones manuales, importaciones, telemetría y simulaciones se distinguen en el historial; NDVI y plagas se leen de <code>raw_data</code>.</p>
         <p v-if="hasSimulationMetrics" class="mt-1 text-amber-300">Este historial incluye registros del simulador 3D; no son mediciones de sensores ni deben usarse como observaciones reales.</p>
       </div>
     </div>
@@ -555,6 +743,44 @@ const pestGaugeOptions = computed(() => ({
         </div>
       </Card>
     </div>
+
+    <Card v-if="selectedField" class="dashboard-chart-card">
+      <template #header>
+        <div class="dashboard-chart-heading">
+          <div><span>BITÁCORA DEL CAMPO</span><h3>Historial de observaciones y mediciones</h3></div>
+          <span class="dashboard-chart-caption">{{ observationHistory.length }} registros en este periodo</span>
+        </div>
+      </template>
+      <div v-if="observationHistory.length" class="dashboard-history-wrap">
+        <table class="dashboard-history-table">
+          <thead>
+            <tr>
+              <th>Fecha</th>
+              <th>Origen</th>
+              <th>Etapa</th>
+              <th>Humedad</th>
+              <th>Temp.</th>
+              <th>NDVI</th>
+              <th>Plagas</th>
+              <th>Notas</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="metric in observationHistory" :key="metric.id">
+              <td>{{ new Date(metric.record_date).toLocaleString('es-MX') }}</td>
+              <td><span class="dashboard-history-source">{{ metricSourceLabel(metric) }}</span></td>
+              <td>{{ rawMetricText(metric, 'growth_stage') || '—' }}</td>
+              <td>{{ metric.soil_humidity === null ? '—' : `${metric.soil_humidity.toFixed(1)}%` }}</td>
+              <td>{{ metric.temperature === null ? '—' : `${metric.temperature.toFixed(1)} °C` }}</td>
+              <td>{{ rawMetricValue(metric, 'ndvi_avg')?.toFixed(2) ?? '—' }}</td>
+              <td>{{ rawMetricValue(metric, 'pest_index') === null ? '—' : `${rawMetricValue(metric, 'pest_index')?.toFixed(1)}%` }}</td>
+              <td class="dashboard-history-notes">{{ rawMetricText(metric, 'notes') || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p v-else class="dashboard-chart-empty">No hay observaciones para este periodo. Usa el formulario de arriba para iniciar el seguimiento.</p>
+    </Card>
   </div>
 </template>
 
@@ -684,6 +910,176 @@ const pestGaugeOptions = computed(() => ({
   color: #fecaca;
   background: rgba(127, 29, 29, 0.18);
 }
+
+.dashboard-field-summary,
+.dashboard-observation-card {
+  border: 1px solid rgba(196, 218, 147, 0.13);
+  border-radius: 15px;
+  background: linear-gradient(145deg, rgba(26, 34, 25, 0.96), rgba(17, 23, 18, 0.96));
+}
+
+.dashboard-field-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.2rem;
+}
+
+.dashboard-field-summary h2,
+.dashboard-observation-heading h2 {
+  margin-top: 0.25rem;
+  color: #edf1e8;
+  font-size: 0.95rem;
+  font-weight: 720;
+}
+
+.dashboard-field-summary p,
+.dashboard-observation-heading p {
+  margin-top: 0.25rem;
+  color: #909b87;
+  font-size: 0.7rem;
+  line-height: 1.5;
+}
+
+.dashboard-field-geometry {
+  display: grid;
+  gap: 0.2rem;
+  color: #929b88;
+  font-size: 0.68rem;
+}
+
+.dashboard-field-geometry strong {
+  color: #e6d28b;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-map-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: #bce7c8;
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.dashboard-map-link:hover { color: #e6d28b; }
+
+.dashboard-observation-card { padding: 1.15rem 1.25rem; }
+.dashboard-observation-heading { margin-bottom: 1rem; }
+
+.dashboard-form-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.85rem;
+}
+
+.dashboard-form-field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.38rem;
+  color: #aab19f;
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+
+.dashboard-form-field-wide { grid-column: span 2; }
+
+.dashboard-form-field input,
+.dashboard-form-field textarea {
+  width: 100%;
+  min-height: 40px;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid rgba(196, 218, 147, 0.17);
+  border-radius: 9px;
+  color: #e8eddf;
+  background: rgba(8, 14, 10, 0.72);
+  font: inherit;
+  font-weight: 400;
+}
+
+.dashboard-form-field textarea {
+  min-height: 76px;
+  resize: vertical;
+}
+
+.dashboard-form-field input::placeholder,
+.dashboard-form-field textarea::placeholder { color: #697365; }
+
+.dashboard-form-field input:focus-visible,
+.dashboard-form-field textarea:focus-visible {
+  outline: 2px solid rgba(211, 189, 103, 0.65);
+  outline-offset: 2px;
+}
+
+.dashboard-observation-footer {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.dashboard-form-hint,
+.dashboard-form-message { color: #89947f; font-size: 0.68rem; line-height: 1.5; }
+.dashboard-form-message { margin-top: 0.3rem; }
+.dashboard-form-message.is-error { color: #fecaca; }
+.dashboard-form-message.is-success { color: #a7e6b9; }
+
+.dashboard-save-button {
+  display: inline-flex;
+  min-height: 40px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0 0.9rem;
+  border: 1px solid rgba(114, 213, 159, 0.25);
+  border-radius: 10px;
+  color: #d7f0dc;
+  background: rgba(33, 99, 61, 0.28);
+  font-size: 0.72rem;
+  font-weight: 700;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.dashboard-save-button:hover:not(:disabled) {
+  border-color: rgba(114, 213, 159, 0.5);
+  background: rgba(33, 99, 61, 0.46);
+}
+.dashboard-save-button:disabled { cursor: wait; opacity: 0.65; }
+.dashboard-save-button:focus-visible { outline: 2px solid #72d59f; outline-offset: 2px; }
+
+.dashboard-history-wrap { overflow-x: auto; }
+.dashboard-history-table {
+  width: 100%;
+  border-collapse: collapse;
+  color: #c5cdbb;
+  font-size: 0.69rem;
+  text-align: left;
+}
+
+.dashboard-history-table th,
+.dashboard-history-table td {
+  padding: 0.75rem 0.65rem;
+  border-bottom: 1px solid rgba(196, 218, 147, 0.09);
+  white-space: nowrap;
+}
+
+.dashboard-history-table th {
+  color: #929b88;
+  font-size: 0.62rem;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.dashboard-history-table tr:last-child td { border-bottom: 0; }
+.dashboard-history-source { color: #bce7c8; }
+.dashboard-history-notes { min-width: 160px; max-width: 280px; white-space: normal !important; }
+
 .dashboard-chart-empty {
   display: grid;
   height: 100%;
@@ -887,11 +1283,17 @@ const pestGaugeOptions = computed(() => ({
 @media (max-width: 760px) {
   .dashboard-heading { align-items: flex-start; flex-direction: column; gap: 1rem; padding: 17px; }
   .dashboard-heading-actions { width: 100%; justify-content: flex-start; }
+  .dashboard-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 480px) {
   .dashboard-heading-actions { align-items: flex-start; flex-direction: column; }
   .dashboard-select, .dashboard-refresh-button, .dashboard-simulation-link { width: 100%; }
+  .dashboard-field-summary { align-items: flex-start; flex-direction: column; }
+  .dashboard-form-grid { grid-template-columns: minmax(0, 1fr); }
+  .dashboard-form-field-wide { grid-column: auto; }
+  .dashboard-observation-footer { align-items: stretch; flex-direction: column; }
+  .dashboard-save-button { width: 100%; }
   .dashboard-metric { padding: 0.9rem; }
   .dashboard-metric-heading { gap: 0.48rem; }
   .dashboard-metric-icon { width: 30px; height: 30px; flex-basis: 30px; }
