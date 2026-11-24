@@ -176,14 +176,70 @@ export const deleteField = async (id: string): Promise<void> => {
   if (!data) throw new Error('El campo no existe o no tienes permiso para eliminarlo.')
 }
 
+const isJsonRecord = (value: unknown): value is Record<string, Json | undefined> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
 export const saveMapWorkspace = async (name: string, geojson: Json): Promise<string> => {
-  const { data, error } = await requireSupabase().rpc('save_map_workspace', {
-    p_name: name,
-    p_geojson: geojson,
+  const fieldName = name.trim()
+  const mapFeatures = isJsonRecord(geojson) ? geojson.features : undefined
+  if (fieldName.length < 1 || fieldName.length > 120) {
+    throw new Error('El nombre del mapa debe tener entre 1 y 120 caracteres.')
+  }
+  if (
+    !isJsonRecord(geojson)
+    || geojson.type !== 'FeatureCollection'
+    || !Array.isArray(mapFeatures)
+    || mapFeatures.length < 1
+    || mapFeatures.length > 500
+  ) {
+    throw new Error('El mapa debe contener entre 1 y 500 elementos GeoJSON.')
+  }
+
+  const client = requireSupabase()
+  const { data: field, error: fieldError } = await client
+    .from('fields')
+    .insert({ name: fieldName, geojson_data: geojson })
+    .select('id')
+    .single()
+  if (fieldError) throw new Error('No se pudo guardar el campo: ' + fieldError.message)
+
+  const features: Json[] = mapFeatures
+  const elements = features.flatMap((feature, index) => {
+    if (!isJsonRecord(feature) || !isJsonRecord(feature.geometry)) return []
+    const properties = isJsonRecord(feature.properties) ? feature.properties : {}
+    const featureName = properties.name
+    return [{
+      field_id: field.id,
+      element_type: typeof feature.geometry.type === 'string' ? feature.geometry.type : 'Geometry',
+      name: typeof featureName === 'string' && featureName.trim()
+        ? featureName.trim()
+        : 'Elemento ' + (index + 1),
+      geometry_data: feature.geometry,
+      properties,
+    }]
   })
-  if (error) throw new Error(`No se pudo guardar el mapa: ${error.message}`)
-  if (typeof data !== 'string') throw new Error('Supabase no devolvió el identificador del campo guardado.')
-  return data
+
+  if (elements.length > 0) {
+    const { error: elementsError } = await client.from('map_elements').insert(elements)
+    if (elementsError) {
+      const { data: deletedField, error: cleanupError } = await client
+        .from('fields')
+        .delete()
+        .eq('id', field.id)
+        .select('id')
+        .maybeSingle()
+      if (cleanupError || !deletedField) {
+        throw new Error(
+          'No se pudieron guardar los elementos del mapa: ' + elementsError.message + '. '
+          + 'Tampoco se pudo eliminar el campo incompleto: '
+          + (cleanupError?.message ?? 'no se encontró o faltan permisos.'),
+        )
+      }
+      throw new Error('No se pudieron guardar los elementos del mapa: ' + elementsError.message)
+    }
+  }
+
+  return field.id
 }
 
 export const updateFieldGeometry = async (fieldId: string, geojson: Json): Promise<void> => {
