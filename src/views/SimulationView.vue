@@ -1,12 +1,18 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount, shallowRef } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import { BarChart3, Cpu, Download, EyeOff, FastForward, FileJson, LocateFixed, Maximize2, Minimize2, Move, Pause, Play, RotateCw, Route, Wind } from 'lucide-vue-next'
+import { BarChart3, Cpu, Download, EyeOff, FastForward, FileJson, LocateFixed, MapPinned, Maximize2, Minimize2, Move, Pause, Play, RotateCw, Route, Wind } from 'lucide-vue-next'
 import DroneConnectionPanel from '../components/simulation/DroneConnectionPanel.vue'
 import { useParcelSimulationStore } from '../stores/parcelSimulation'
 import { calculateSimulationEconomics, extractStressTimeline } from '../services/simulationEconomics'
+import {
+  CROP_PRICING_LIST,
+  calculateParcelPriceEstimate,
+  resolveCropPricingBenchmark,
+  type CropPricingKey,
+} from '../services/cropPricingBenchmarks'
 import {
   detectHardwareGpuModel,
   graphicsQuality,
@@ -16,8 +22,10 @@ import {
 import {
   createAlert,
   createSimulation,
+  listCrops,
   listFields,
   saveFieldMetric,
+  type CropRecord,
   type FieldRecord,
   type Json,
 } from '../services/agronomyData'
@@ -59,9 +67,12 @@ const router = useRouter()
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const containerRef = ref<HTMLDivElement | null>(null)
 const fields = shallowRef<FieldRecord[]>([])
+const crops = shallowRef<CropRecord[]>([])
 const selectedFieldGeometry = shallowRef<ProjectedField | null>(null)
 const activeParcelMetadata = shallowRef<ParcelGeometryMetadata | null>(null)
 const selectedFieldId = ref('')
+const selectedPricingCropKey = ref<CropPricingKey>('maiz')
+const affectedPlantsSnapshot = shallowRef<SimulatedPlantNode[]>([])
 const savingSnapshot = ref(false)
 const exportingToDashboard = ref(false)
 const simulationTick = ref(0)
@@ -215,6 +226,56 @@ const fieldDimensionsLabel = computed(() => {
   if (!field) return ''
   return `${field.widthMeters.toFixed(1)} m × ${field.depthMeters.toFixed(1)} m · ${field.areaHectares.toFixed(2)} ha · ${field.vertexCount} vértices`
 })
+
+const syncPricingCropWithSelectedField = () => {
+  const activeField = fields.value.find(item => item.id === selectedFieldId.value)
+  const linkedCrop = activeField?.crop_id
+    ? crops.value.find(crop => crop.id === activeField.crop_id)
+    : null
+  if (linkedCrop?.name) {
+    selectedPricingCropKey.value = resolveCropPricingBenchmark(linkedCrop.name, 'maiz').key
+  }
+}
+
+const parcelPriceEstimate = computed(() => {
+  const areaSquareMeters = selectedFieldGeometry.value?.areaSquareMeters ?? 10_000
+  const total = Math.max(1, telemetry.value.plantCount)
+  const recoverable =
+    telemetry.value.mildCount + telemetry.value.moderateCount + telemetry.value.criticalCount
+  const affected = recoverable + telemetry.value.irreversibleCount
+  const severityFactor =
+    recoverable > 0
+      ? (telemetry.value.mildCount * 1.0 +
+          telemetry.value.moderateCount * 1.45 +
+          telemetry.value.criticalCount * 2.15) /
+        recoverable
+      : 1.0
+
+  return calculateParcelPriceEstimate({
+    areaSquareMeters,
+    affectedRatio: affected / total,
+    recoverableRatio: recoverable / total,
+    severityFactor,
+    batterySavingsPercent: hasAnalyzedCrop.value ? (currentFlightPlan.value?.batterySavingsPercent ?? 0) : 0,
+    cropKeyOrName: selectedPricingCropKey.value,
+  })
+})
+
+const formatMxn = (value: number): string => {
+  const decimals = value > 0 && value < 100 ? 2 : 0
+  return new Intl.NumberFormat('es-MX', {
+    style: 'currency',
+    currency: 'MXN',
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  }).format(value)
+}
+
+const formatMxnPerM2 = (value: number): string =>
+  value < 0.1 ? `$${value.toFixed(3)}/m²` : `$${value.toFixed(2)}/m²`
+
+const formatAreaM2 = (value: number): string =>
+  new Intl.NumberFormat('es-MX', { maximumFractionDigits: 0 }).format(Math.round(value))
 
 const cropPrecautions = computed<string[]>(() => {
   if (!hasAnalyzedCrop.value) return []
@@ -825,6 +886,7 @@ const rebuildParcelScene = (regenerateCenters = true) => {
 
 const applySelectedField = () => {
   parcelSimStore.selectField(selectedFieldId.value)
+  syncPricingCropWithSelectedField()
   cameraFollowEnabled.value = true
   liveDronePath = []
   fallbackGpsOrigin = null
@@ -997,6 +1059,9 @@ const updateTelemetry = () => {
     criticalCount,
     irreversibleCount,
   }
+  affectedPlantsSnapshot.value = allPlants
+    .filter(p => p.state !== 'saludable')
+    .sort((a, b) => (b.waterStressPercent + b.pestStressPercent) - (a.waterStressPercent + a.pestStressPercent))
 }
 
 const createSoilTexture = () => {
@@ -1409,7 +1474,11 @@ const saveScenarioSnapshot = async (saveAlerts = false) => {
     )
 
     const stressTimeline = reportPayload ? extractStressTimeline(reportPayload) : []
-    const economics = reportPayload ? calculateSimulationEconomics(reportPayload) : null
+    const economics = reportPayload
+      ? calculateSimulationEconomics(reportPayload, {
+          cropValuePerHectareMxn: parcelPriceEstimate.value.benchmark.harvestValuePerHaMxn,
+        })
+      : null
 
     const savedRow = await createSimulation({
       field_id: fieldId,
@@ -1763,7 +1832,9 @@ const exportToDashboard = async () => {
     }
 
     const stressTimeline = extractStressTimeline(report)
-    const economics = calculateSimulationEconomics(report)
+    const economics = calculateSimulationEconomics(report, {
+      cropValuePerHectareMxn: parcelPriceEstimate.value.benchmark.harvestValuePerHaMxn,
+    })
     const fieldId = selectedFieldId.value || report.parcel.fieldId || null
     const title = `${report.parcel.fieldName} · Ciclo #${report.tick}`
 
@@ -2261,7 +2332,12 @@ const onWindowResize = () => {
 onMounted(async () => {
   document.addEventListener('fullscreenchange', onFullscreenChange)
   try {
-    fields.value = await listFields()
+    const [loadedFields, loadedCrops] = await Promise.all([
+      listFields(),
+      listCrops().catch(() => [] as CropRecord[]),
+    ])
+    fields.value = loadedFields
+    crops.value = loadedCrops
     parcelSimStore.setFields(fields.value)
 
     const requestedFieldId = typeof route.query.fieldId === 'string' ? route.query.fieldId : ''
@@ -2275,6 +2351,7 @@ onMounted(async () => {
     if (selectedFieldId.value) {
       parcelSimStore.selectField(selectedFieldId.value)
     }
+    syncPricingCropWithSelectedField()
 
     const { geojson } = activeFieldGeojsonAndName()
     selectedFieldGeometry.value = projectFieldGeometry(geojson)
@@ -2833,6 +2910,231 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </div>
+
+    <section class="simulation-insights" aria-labelledby="simulation-insights-title">
+      <header class="simulation-insights-heading">
+        <div>
+          <span class="simulation-eyebrow">RESULTADOS DEL ESCENARIO · REFERENCIA REAL POR M²</span>
+          <h2 id="simulation-insights-title">Estimación de precios y seguimiento por tamaño de parcela</h2>
+          <p>
+            Superficie medida en {{ activeParcelMetadata?.fieldName ?? 'Parcela Demostrativa AgronIA' }}:
+            <strong>{{ formatAreaM2(parcelPriceEstimate.areaSquareMeters) }} m²</strong>
+            ({{ parcelPriceEstimate.areaHectares.toFixed(2) }} ha). Cálculos paramétricos con datos reales de referencia por m².
+          </p>
+        </div>
+        <div class="simulation-insights-actions">
+          <select
+            v-model="selectedPricingCropKey"
+            class="simulation-field-select"
+            aria-label="Cultivo de referencia para precios por metro cuadrado"
+            title="Selecciona el cultivo para ajustar el precio real por m²"
+          >
+            <option v-for="cropOpt in CROP_PRICING_LIST" :key="cropOpt.key" :value="cropOpt.key">
+              {{ cropOpt.label }}
+            </option>
+          </select>
+          <span class="simulation-source-badge">
+            SIMULACIÓN · {{ affectedPlantsSnapshot.length }} plantas con afectación
+          </span>
+          <RouterLink
+            v-if="selectedFieldId"
+            class="simulation-map-link"
+            :to="{ name: 'maps', query: { fieldId: selectedFieldId } }"
+          >
+            <MapPinned :size="15" />
+            Ver campo en satélite
+          </RouterLink>
+        </div>
+      </header>
+
+      <div class="simulation-insights-grid">
+        <article class="simulation-insight-card">
+          <div class="simulation-insight-title">
+            <div>
+              <h3>Tratamiento, prevención y ahorro</h3>
+              <p>
+                Total: {{ formatAreaM2(parcelPriceEstimate.areaSquareMeters) }} m² ({{ parcelPriceEstimate.areaHectares.toFixed(2) }} ha)
+                · Afectada: {{ formatAreaM2(parcelPriceEstimate.affectedAreaSquareMeters) }} m²
+              </p>
+            </div>
+            <span class="simulation-cost-icon">$</span>
+          </div>
+          <div class="simulation-cost-row">
+            <span>
+              <strong>Tratamiento correctivo focalizado</strong>
+              <small v-if="parcelPriceEstimate.affectedAreaSquareMeters > 0">
+                Riego auxilio {{ formatMxn(parcelPriceEstimate.correctiveIrrigationPartMxn) }} ·
+                Insumos {{ formatMxn(parcelPriceEstimate.correctiveInputsPartMxn) }} ·
+                Dron {{ formatMxn(parcelPriceEstimate.correctiveDronePartMxn) }}
+              </small>
+              <small v-else>Sin plantas afectadas en este escenario (0 m² a tratar).</small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.correctiveTreatmentMxn) }}</b>
+          </div>
+          <div class="simulation-cost-row">
+            <span>
+              <strong>Prevención recomendada (ciclo)</strong>
+              <small>
+                Centinelas IA y telemetría a {{ formatMxnPerM2(parcelPriceEstimate.benchmark.preventiveMonitoringPerM2) }}
+                sobre toda la parcela
+              </small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.preventiveMonitoringMxn) }}</b>
+          </div>
+          <div class="simulation-cost-row">
+            <span>
+              <strong>Pérdida potencial evitada (bruta)</strong>
+              <small>Merma estimada sobre {{ formatAreaM2(parcelPriceEstimate.affectedAreaSquareMeters) }} m² afectados sin atención oportuna</small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.potentialYieldLossAvoidedMxn) }}</b>
+          </div>
+          <div class="simulation-savings">
+            <span>
+              <strong>Ahorro neto preventivo estimado</strong>
+              <small>
+                Descontando monitoreo ({{ formatMxn(parcelPriceEstimate.preventiveMonitoringMxn) }})
+                <template v-if="hasAnalyzedCrop && parcelPriceEstimate.droneRouteSavingsMxn > 0">
+                  · Ahorro extra ruta dron TSP: {{ formatMxn(parcelPriceEstimate.droneRouteSavingsMxn) }}
+                </template>
+              </small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.netPreventiveSavingsMxn) }}</b>
+          </div>
+          <p class="simulation-chart-disclaimer">
+            Los montos se recalculan automáticamente al cambiar de parcela, activar «Analizar cultivo», usar Centinelas o aplicar Riego/Fumigación.
+          </p>
+        </article>
+
+        <article class="simulation-insight-card">
+          <div class="simulation-insight-title">
+            <div>
+              <h3>Costos reales por tamaño de parcela (MXN/m²)</h3>
+              <p>
+                {{ parcelPriceEstimate.benchmark.label }} · Base {{ formatMxnPerM2(parcelPriceEstimate.costPerSquareMeterMxn) }}
+              </p>
+            </div>
+            <span class="simulation-cost-icon">m²</span>
+          </div>
+          <div class="simulation-cost-row">
+            <span>
+              <strong>Producción total del ciclo</strong>
+              <small>
+                {{ formatMxnPerM2(parcelPriceEstimate.benchmark.productionTotalPerM2) }} ·
+                {{ formatMxn(parcelPriceEstimate.benchmark.productionTotalPerHaMxn) }}/ha
+              </small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.cycleProductionTotalMxn) }}</b>
+          </div>
+          <div class="simulation-cost-row">
+            <span>
+              <strong>Riego (agua, bombeo y auxilios)</strong>
+              <small>Tarifa ref. {{ formatMxnPerM2(parcelPriceEstimate.benchmark.irrigationPerM2) }}</small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.cycleIrrigationMxn) }}</b>
+          </div>
+          <div class="simulation-cost-row">
+            <span>
+              <strong>Fertilización y nutrición</strong>
+              <small>Tarifa ref. {{ formatMxnPerM2(parcelPriceEstimate.benchmark.fertilizationPerM2) }}</small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.cycleFertilizationMxn) }}</b>
+          </div>
+          <div class="simulation-cost-row">
+            <span>
+              <strong>Control fitosanitario (insumos)</strong>
+              <small>Tarifa ref. {{ formatMxnPerM2(parcelPriceEstimate.benchmark.pestControlPerM2) }}</small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.cyclePestControlMxn) }}</b>
+          </div>
+          <div class="simulation-cost-row">
+            <span>
+              <strong>Servicio dron agrícola (1 / 3 pasadas)</strong>
+              <small>Maquila {{ formatMxnPerM2(parcelPriceEstimate.benchmark.droneSprayPassPerM2) }} por pasada (sin agroquímico)</small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.droneSinglePassMxn) }} / {{ formatMxn(parcelPriceEstimate.droneThreePassesMxn) }}</b>
+          </div>
+          <div class="simulation-cost-row">
+            <span>
+              <strong>Valor bruto esperado de cosecha</strong>
+              <small>
+                {{ formatMxnPerM2(parcelPriceEstimate.benchmark.harvestValuePerM2) }} ·
+                {{ formatMxn(parcelPriceEstimate.benchmark.harvestValuePerHaMxn) }}/ha
+              </small>
+            </span>
+            <b>{{ formatMxn(parcelPriceEstimate.expectedHarvestValueMxn) }}</b>
+          </div>
+          <p class="simulation-chart-disclaimer">
+            Fuente: {{ parcelPriceEstimate.benchmark.sourceLabel }}. Cifras orientativas sujetas a región, ciclo agrícola y cotización local de insumos.
+          </p>
+        </article>
+
+        <article class="simulation-insight-card simulation-route-card">
+          <div class="simulation-insight-title">
+            <div>
+              <h3>Ruta optimizada del dron (TSP 2-opt)</h3>
+              <p>Cobertura calculada sobre la geometría real</p>
+            </div>
+            <span class="simulation-route-icon">↗</span>
+          </div>
+          <template v-if="hasAnalyzedCrop && currentFlightPlan">
+            <div class="simulation-route-metrics">
+              <div>
+                <b>{{ currentFlightPlan.totalDistanceMeters.toFixed(0) }} m</b>
+                <small>distancia óptima (vs {{ currentFlightPlan.baselineFullSweepDistanceMeters.toFixed(0) }} m)</small>
+              </div>
+              <div>
+                <b>{{ Math.round(currentFlightPlan.estimatedFlightTimeSeconds) }} s</b>
+                <small>tiempo estimado de vuelo</small>
+              </div>
+              <div>
+                <b>-{{ currentFlightPlan.batterySavingsPercent }}%</b>
+                <small>ahorro de batería y aplicación</small>
+              </div>
+              <div>
+                <b>{{ currentFlightPlan.targetedPlantCount }} / {{ currentFlightPlan.skippedHealthyPlantCount }}</b>
+                <small>objetivos / sanas omitidas</small>
+              </div>
+            </div>
+            <p class="simulation-chart-disclaimer">
+              Ahorro estimado por vuelo selectivo en esta parcela: {{ formatMxn(parcelPriceEstimate.droneRouteSavingsMxn) }} MXN por aplicación completa respecto al barrido tradicional.
+            </p>
+          </template>
+          <p v-else class="simulation-empty-route">
+            Pulsa «Analizar cultivo» para recorrer el campo, calcular la ruta TSP 2-opt y estimar el ahorro en vuelo.
+          </p>
+        </article>
+
+        <article class="simulation-insight-card simulation-affected-card">
+          <div class="simulation-insight-title">
+            <div>
+              <h3>Plantas afectadas</h3>
+              <p>Puntos detectados dentro del polígono real</p>
+            </div>
+            <span class="simulation-affected-count">{{ affectedPlantsSnapshot.length }}</span>
+          </div>
+          <div v-if="affectedPlantsSnapshot.length" class="simulation-affected-list">
+            <div v-for="plant in affectedPlantsSnapshot" :key="plant.id" class="simulation-affected-row">
+              <span>
+                <i :class="plant.irreversible ? 'is-dead' : ''"></i>
+                <strong>{{ plant.id }}</strong>
+                <small>
+                  {{ STRESS_STATE_LABELS[plant.state] }} · hídrico {{ plant.waterStressPercent.toFixed(0) }}% · plaga {{ plant.pestStressPercent.toFixed(0) }}%
+                </small>
+              </span>
+              <span class="simulation-affected-location">
+                {{ plant.lat.toFixed(5) }}, {{ plant.lng.toFixed(5) }}
+              </span>
+            </div>
+          </div>
+          <p v-else class="simulation-empty-route">
+            No hay plantas afectadas registradas actualmente.
+          </p>
+          <p class="simulation-chart-disclaimer">
+            Coordenadas proyectadas dentro de la parcela; verifica las plantas en campo o usa el botón «Regar» / «Fumigar».
+          </p>
+        </article>
+      </div>
+    </section>
 
     <DroneConnectionPanel @telemetry="handleDroneTelemetry" />
   </div>
@@ -3447,6 +3749,202 @@ onBeforeUnmount(() => {
       .simulation-color-key .key-healthy { background: #15803d; }
       .simulation-color-key .key-stressed { background: #84cc16; }
 
+      .simulation-insights {
+        display: grid;
+        gap: 1rem;
+        padding: 1.15rem;
+        border: 1px solid rgba(196, 218, 147, 0.13);
+        border-radius: 16px;
+        background: rgba(25, 30, 22, 0.86);
+      }
+
+      .simulation-insights-heading,
+      .simulation-insight-title {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+
+      .simulation-insights-actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 0.6rem;
+        flex-wrap: wrap;
+      }
+
+      .simulation-map-link {
+        display: inline-flex;
+        min-height: 36px;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        padding: 0 11px;
+        border: 1px solid rgba(142, 180, 91, 0.3);
+        border-radius: 9px;
+        color: #dcedc1;
+        background: rgba(55, 151, 93, 0.11);
+        font-size: 0.7rem;
+        font-weight: 750;
+        text-decoration: none;
+        white-space: nowrap;
+      }
+      .simulation-map-link:hover { border-color: rgba(142, 180, 91, 0.58); background: rgba(55, 151, 93, 0.19); }
+      .simulation-map-link:focus-visible { outline: 2px solid #c1e19a; outline-offset: 2px; }
+      .simulation-map-link svg { color: #a9d287; }
+
+      .simulation-insights-heading h2 {
+        margin-top: 0.25rem;
+        color: #f0f2e9;
+        font-size: 1.25rem;
+        font-weight: 750;
+        letter-spacing: -0.035em;
+      }
+
+      .simulation-insights-heading p,
+      .simulation-insight-title p {
+        margin-top: 0.3rem;
+        color: #9aa38f;
+        font-size: 0.74rem;
+      }
+
+      .simulation-source-badge {
+        display: inline-flex;
+        flex: 0 0 auto;
+        align-items: center;
+        gap: 0.45rem;
+        padding: 0.45rem 0.75rem;
+        border: 1px solid rgba(211, 189, 103, 0.22);
+        border-radius: 999px;
+        color: #e7d48e;
+        background: rgba(211, 189, 103, 0.08);
+        font-size: 0.65rem;
+        font-weight: 750;
+      }
+
+      .simulation-insights-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.85rem;
+      }
+
+      .simulation-insight-card {
+        min-width: 0;
+        padding: 1rem;
+        border: 1px solid rgba(196, 218, 147, 0.12);
+        border-radius: 13px;
+        background: linear-gradient(145deg, rgba(33, 39, 29, 0.92), rgba(17, 23, 18, 0.88));
+      }
+
+      .simulation-insight-title { align-items: center; margin-bottom: 0.8rem; }
+      .simulation-insight-title h3 { color: #f0f2e9; font-size: 0.9rem; font-weight: 750; }
+      .simulation-chart-disclaimer { margin-top: 0.8rem; color: #929d86; font-size: 0.65rem; line-height: 1.55; }
+
+      .simulation-cost-icon,
+      .simulation-route-icon,
+      .simulation-affected-count {
+        display: grid;
+        flex: 0 0 auto;
+        width: 2.1rem;
+        height: 2.1rem;
+        place-items: center;
+        border: 1px solid rgba(211, 189, 103, 0.2);
+        border-radius: 10px;
+        color: #e8d286;
+        background: rgba(211, 189, 103, 0.08);
+        font-size: 0.9rem;
+        font-weight: 800;
+      }
+
+      .simulation-cost-row,
+      .simulation-savings {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.8rem;
+        padding: 0.65rem 0;
+        border-top: 1px solid rgba(255, 255, 255, 0.075);
+      }
+
+      .simulation-cost-row span,
+      .simulation-savings span,
+      .simulation-affected-row > span {
+        display: grid;
+        gap: 0.18rem;
+        min-width: 0;
+      }
+
+      .simulation-cost-row strong,
+      .simulation-savings strong { color: #e7eadf; font-size: 0.74rem; }
+      .simulation-cost-row small,
+      .simulation-savings small { color: #929d86; font-size: 0.63rem; }
+      .simulation-cost-row b { color: #f0f2e9; font-size: 0.88rem; white-space: nowrap; }
+      .simulation-savings {
+        margin-top: 0.3rem;
+        padding: 0.8rem;
+        border: 1px solid rgba(143, 191, 111, 0.22);
+        border-radius: 10px;
+        background: rgba(143, 191, 111, 0.08);
+      }
+      .simulation-savings strong,
+      .simulation-savings b { color: #bce29a; }
+      .simulation-savings b { font-size: 1rem; white-space: nowrap; }
+
+      .simulation-route-metrics {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.5rem;
+      }
+
+      .simulation-route-metrics > div {
+        display: grid;
+        gap: 0.22rem;
+        padding: 0.7rem 0.6rem;
+        border: 1px solid rgba(196, 218, 147, 0.11);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.025);
+      }
+
+      .simulation-route-metrics b { color: #c7e9ef; font-size: 0.95rem; }
+      .simulation-route-metrics small { color: #929d86; font-size: 0.62rem; }
+      .simulation-empty-route {
+        padding: 0.85rem;
+        border: 1px dashed rgba(196, 218, 147, 0.16);
+        border-radius: 10px;
+        color: #a5ad9b;
+        font-size: 0.73rem;
+        line-height: 1.5;
+      }
+
+      .simulation-affected-list { display: grid; max-height: 17rem; overflow: auto; }
+      .simulation-affected-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 0.65rem;
+        padding: 0.55rem 0;
+        border-top: 1px solid rgba(255, 255, 255, 0.075);
+      }
+
+      .simulation-affected-row > span { grid-template-columns: 8px 1fr; align-items: center; }
+      .simulation-affected-row > span > i {
+        display: block;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #eab308;
+      }
+      .simulation-affected-row > span > i.is-dead { background: #ef7373; }
+      .simulation-affected-row strong { color: #e7eadf; font-size: 0.7rem; }
+      .simulation-affected-row > span small { grid-column: 2; color: #929d86; font-size: 0.61rem; }
+      .simulation-affected-location {
+        color: #9bc9fb;
+        font-size: 0.61rem;
+        text-align: right;
+        justify-self: end;
+      }
+
       @keyframes simulation-enter {
         from { opacity: 0; transform: translateY(10px); }
         to { opacity: 1; transform: translateY(0); }
@@ -3665,6 +4163,10 @@ onBeforeUnmount(() => {
         .simulation-telemetry { order: 5; }
         .simulation-controls button { min-height: 46px; font-size: 0.84rem; }
         .simulation-telemetry { margin-bottom: 0.25rem !important; }
+        .simulation-insights { padding: 0.9rem; }
+        .simulation-insights-heading { align-items: flex-start; flex-direction: column; }
+        .simulation-insights-actions { justify-content: flex-start; }
+        .simulation-insights-grid { grid-template-columns: minmax(0, 1fr); }
       }
 
       @media (max-width: 420px) {

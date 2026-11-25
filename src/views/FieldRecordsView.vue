@@ -26,6 +26,7 @@ import {
 
 const store = useMainStore()
 const isAdmin = computed(() => store.user?.profile?.role === 'administrador' && store.user?.profile?.active)
+const canCreateCrop = computed(() => Boolean(isAdmin.value))
 const fields = shallowRef<FieldRecord[]>([])
 const crops = ref<CropRecord[]>([])
 const selectedFieldId = ref('')
@@ -36,6 +37,8 @@ const devices = ref<any[]>([])
 const alerts = ref<any[]>([])
 const loading = ref(true)
 const saving = ref(false)
+const creatingQuickCrop = ref(false)
+const quickCropName = ref('')
 const errorMessage = ref('')
 const successMessage = ref('')
 
@@ -155,17 +158,87 @@ const saveCrop = () => runSave(async () => {
   }
 }, 'Cultivo añadido al catálogo.')
 
+const findCropByName = (name: string) => {
+  const target = name.trim().toLocaleLowerCase()
+  return crops.value.find(crop => crop.name.trim().toLocaleLowerCase() === target) ?? null
+}
+
+const resolveOrCreateCropId = async (rawName: string): Promise<string> => {
+  const trimmed = rawName.trim()
+  if (!trimmed) {
+    throw new Error('Escribe el nombre del cultivo que deseas añadir.')
+  }
+  if (trimmed.length > 120) {
+    throw new Error('El nombre del cultivo no puede superar los 120 caracteres.')
+  }
+
+  const existing = findCropByName(trimmed)
+  if (existing) {
+    return existing.id
+  }
+
+  if (!canCreateCrop.value) {
+    throw new Error('No cuentas con permisos de administrador para añadir nuevos cultivos al catálogo.')
+  }
+
+  const created = await createCrop({
+    name: trimmed,
+    scientific_name: null,
+    optimal_min_humidity: null,
+    optimal_max_humidity: null,
+    optimal_min_temp: null,
+    optimal_max_temp: null,
+    growth_cycle_days: null,
+  })
+  crops.value = await listCrops()
+  return created.id
+}
+
+const quickAddCropForField = async () => {
+  if (saving.value || creatingQuickCrop.value || !quickCropName.value.trim()) return
+  creatingQuickCrop.value = true
+  errorMessage.value = ''
+  successMessage.value = ''
+  try {
+    const existing = findCropByName(quickCropName.value)
+    const cropId = await resolveOrCreateCropId(quickCropName.value)
+    fieldCropForm.value.crop_id = cropId
+    const addedName = quickCropName.value.trim()
+    quickCropName.value = ''
+    successMessage.value = existing
+      ? `El cultivo "${existing.name}" ya existía y fue seleccionado.`
+      : `Cultivo "${addedName}" añadido al catálogo y seleccionado.`
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : 'No se pudo añadir el cultivo.'
+  } finally {
+    creatingQuickCrop.value = false
+  }
+}
+
 const saveFieldCrop = () => {
-  if (!selectedFieldId.value || !fieldCropForm.value.crop_id) return
-  return runSave(() => createFieldCrop({
-    field_id: selectedFieldId.value,
-    crop_id: fieldCropForm.value.crop_id,
-    planting_date: fieldCropForm.value.planting_date || null,
-    estimated_harvest_date: fieldCropForm.value.estimated_harvest_date || null,
-    actual_harvest_date: fieldCropForm.value.actual_harvest_date || null,
-    yield_tons: optionalNumber(fieldCropForm.value.yield_tons),
-    status: fieldCropForm.value.status,
-  }), 'Cultivo asociado al campo.')
+  if (!selectedFieldId.value) return
+  const typingNewCrop =
+    fieldCropForm.value.crop_id === '__new__' ||
+    (!fieldCropForm.value.crop_id && Boolean(quickCropName.value.trim()))
+  if (!fieldCropForm.value.crop_id && !typingNewCrop) return
+
+  return runSave(async () => {
+    let cropId = fieldCropForm.value.crop_id
+    if (typingNewCrop) {
+      cropId = await resolveOrCreateCropId(quickCropName.value)
+      fieldCropForm.value.crop_id = cropId
+      quickCropName.value = ''
+    }
+    await createFieldCrop({
+      field_id: selectedFieldId.value,
+      crop_id: cropId,
+      planting_date: fieldCropForm.value.planting_date || null,
+      estimated_harvest_date: fieldCropForm.value.estimated_harvest_date || null,
+      actual_harvest_date: fieldCropForm.value.actual_harvest_date || null,
+      yield_tons: optionalNumber(fieldCropForm.value.yield_tons),
+      status: fieldCropForm.value.status,
+    })
+  }, 'Cultivo asociado al campo.')
 }
 
 const saveTreatmentRecord = () => {
@@ -270,16 +343,47 @@ const readAlert = (alert: { id: string }) => runSave(
         <Card>
           <template #header><h2 class="font-semibold text-gray-900">Cultivos del campo</h2></template>
           <form class="grid grid-cols-1 gap-3 sm:grid-cols-2" @submit.prevent="saveFieldCrop">
-            <select v-model="fieldCropForm.crop_id" required class="field-input sm:col-span-2">
+            <select
+              v-model="fieldCropForm.crop_id"
+              :required="!(canCreateCrop && quickCropName.trim())"
+              class="field-input sm:col-span-2"
+            >
               <option value="">Selecciona un cultivo</option>
               <option v-for="crop in crops" :key="crop.id" :value="crop.id">{{ crop.name }}</option>
+              <option v-if="canCreateCrop" value="__new__">+ Escribir nuevo cultivo…</option>
             </select>
+            <div v-if="canCreateCrop" class="flex flex-wrap gap-2 sm:col-span-2">
+              <input
+                v-model="quickCropName"
+                maxlength="120"
+                placeholder="O escribe un nuevo cultivo para añadirlo al catálogo…"
+                aria-label="Escribir nuevo cultivo"
+                class="field-input min-w-44 flex-1"
+              >
+              <Button
+                type="button"
+                variant="outline"
+                :disabled="saving || creatingQuickCrop || !quickCropName.trim()"
+                @click="quickAddCropForField"
+              >
+                {{ creatingQuickCrop ? 'Añadiendo…' : 'Añadir y seleccionar' }}
+              </Button>
+            </div>
+            <p v-else-if="!crops.length" class="text-xs text-gray-500 sm:col-span-2">
+              No hay cultivos disponibles. Solo usuarios con permisos de administrador pueden dar de alta cultivos nuevos.
+            </p>
             <label class="grid gap-1 text-xs text-gray-500">Fecha de siembra<input v-model="fieldCropForm.planting_date" type="date" class="field-input"></label>
             <label class="grid gap-1 text-xs text-gray-500">Cosecha estimada<input v-model="fieldCropForm.estimated_harvest_date" type="date" class="field-input"></label>
             <label class="grid gap-1 text-xs text-gray-500">Cosecha real<input v-model="fieldCropForm.actual_harvest_date" type="date" class="field-input"></label>
             <input v-model="fieldCropForm.yield_tons" type="number" min="0" step="any" placeholder="Rendimiento (toneladas)" class="field-input">
             <input v-model="fieldCropForm.status" required placeholder="Estado (planted, harvested…)" class="field-input">
-            <Button type="submit" variant="primary" :disabled="saving || !crops.length">Asociar cultivo</Button>
+            <Button
+              type="submit"
+              variant="primary"
+              :disabled="saving || (!fieldCropForm.crop_id && !(canCreateCrop && quickCropName.trim())) || (fieldCropForm.crop_id === '__new__' && !quickCropName.trim())"
+            >
+              Asociar cultivo
+            </Button>
           </form>
           <ul class="mt-4 divide-y divide-gray-100">
             <li v-for="item in fieldCrops" :key="item.id" class="py-2 text-sm text-gray-700">

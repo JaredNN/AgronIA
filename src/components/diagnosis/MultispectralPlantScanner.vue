@@ -129,6 +129,7 @@ const dragCurrentNorm = ref<{ x: number; y: number } | null>(null)
 const liveAnalysis = ref<MultispectralFrameAnalysis | null>(null)
 const browserEngineStatus = ref<BrowserEngineStatus>(browserAgroVisionEngine.status)
 const isAnalyzing = ref(false)
+const isReanalyzing = ref(false)
 let unsubscribeEngineStatus: (() => void) | null = null
 const hasAnalyzedImage = ref(true)
 const statusMessage = ref('')
@@ -662,6 +663,21 @@ function renderSinglePass(now: number, forceUpdate = false) {
     : undefined
 
   const hasAiBoxes = detectedPlants.value.length > 0 || customCropBox.value !== null
+  const suppressPlantMask = agrovisionResult.value?.detection_mode === 'NO_PLANT'
+
+  let activePlantRegions: Array<{ x: number; y: number; width: number; height: number }> | undefined
+  if (!suppressPlantMask) {
+    if (customCropBox.value) {
+      activePlantRegions = [customCropBox.value]
+    } else if (detectedPlants.value.length > 0) {
+      const chosen = selectedPlantId.value
+        ? detectedPlants.value.find(p => p.id === selectedPlantId.value)
+        : null
+      activePlantRegions = chosen
+        ? [{ x: chosen.x, y: chosen.y, width: chosen.width, height: chosen.height }]
+        : detectedPlants.value.map(p => ({ x: p.x, y: p.y, width: p.width, height: p.height }))
+    }
+  }
 
   const analysis = processMultispectralFrame(activeSource, canvas, {
     spectrumMode: spectrumMode.value,
@@ -671,12 +687,14 @@ function renderSinglePass(now: number, forceUpdate = false) {
     sensitivity: sensitivity.value,
     isolatePlantBackground: isolatePlantBackground.value,
     showContours: showContours.value,
-    showBoxOverlay: showContours.value && !hasAiBoxes,
+    showBoxOverlay: !suppressPlantMask && showContours.value && !hasAiBoxes,
     showHotspots: showHotspots.value,
     ambientTempC: ambientTempC.value,
     pointerNorm: pointerNorm.value,
     timeSec: now * 0.001,
-    plantLabelHud: hudLabel
+    plantLabelHud: hudLabel,
+    plantRegions: activePlantRegions,
+    suppressPlantMask
   })
 
   if ((showContours.value && (detectedPlants.value.length > 0 || customCropBox.value)) || isDraggingBox.value) {
@@ -781,6 +799,11 @@ function getRawSourceCanvasForAI(): HTMLCanvasElement | null {
 
 function applyAgroVisionResult(res: AgroVisionAnalysis) {
   agrovisionResult.value = res
+  if (res.detection_mode === 'NO_PLANT') {
+    detectedPlants.value = []
+    selectedPlantId.value = null
+    return
+  }
   detectedPlants.value = res.detected_plants || []
   if (!customCropBox.value) {
     selectedPlantId.value = res.selected_plant_id || (detectedPlants.value[0]?.id ?? null)
@@ -792,10 +815,17 @@ async function runAgroVisionAnalysis(opts?: {
   selectedPlantId?: number | null
   cropBox?: { x: number; y: number; width: number; height: number } | null
   forceLens?: boolean
+  forceRefresh?: boolean
   silent?: boolean
   realTimeTick?: boolean
 }) {
   if (agrovisionInFlight && opts?.silent) return
+  if (agrovisionInFlight && opts?.forceRefresh) {
+    const waitStart = performance.now()
+    while (agrovisionInFlight && performance.now() - waitStart < 1500) {
+      await new Promise(resolve => window.setTimeout(resolve, 40))
+    }
+  }
   agrovisionInFlight = true
   try {
     // 1. Si hay un backend completo en línea (localhost/GPU con YOLO-World + OpenCLIP + ONNX), usarlo primero
@@ -834,6 +864,7 @@ async function runAgroVisionAnalysis(opts?: {
         cropBox: opts?.cropBox !== undefined ? opts.cropBox : customCropBox.value,
         detectPlants: true,
         forceLens: opts?.forceLens ?? false,
+        forceRefresh: opts?.forceRefresh ?? false,
         realTimeTick: opts?.realTimeTick ?? false,
         ndviMean: liveAnalysis.value?.ndvi.mean,
         tempMeanC: liveAnalysis.value?.thermal.meanTempC,
@@ -847,6 +878,46 @@ async function runAgroVisionAnalysis(opts?: {
   }
 }
 
+async function reanalyzeLiveCameraPlants() {
+  if (!cameraActive.value || isReanalyzing.value) return
+  const resumeRt = realTimeMode.value && !isCameraFrozen.value
+  stopRealTimeLoop()
+  isReanalyzing.value = true
+  errorMessage.value = ''
+
+  try {
+    browserAgroVisionEngine.resetRealtimeCache()
+    detectedPlants.value = []
+    selectedPlantId.value = null
+    customCropBox.value = null
+    renderSinglePass(performance.now(), true)
+
+    const freshFile = await getRawSourceFileForAI()
+    await runAgroVisionAnalysis({
+      fileOverride: freshFile,
+      selectedPlantId: null,
+      cropBox: null,
+      forceRefresh: true,
+      realTimeTick: false
+    })
+
+    if (agrovisionResult.value?.detection_mode === 'NO_PLANT') {
+      statusMessage.value =
+        'Reanálisis completado: no se detectaron plantas (objeto no vegetal o fondo en el área de la cámara).'
+    } else if (agrovisionResult.value) {
+      statusMessage.value = `Reanálisis completado (${detectedPlants.value.length} planta(s) en cuadro): ${agrovisionResult.value.crop} · ${agrovisionResult.value.health_status}.`
+    }
+  } catch (error) {
+    errorMessage.value =
+      error instanceof Error ? error.message : 'No se pudo completar el reanálisis en vivo.'
+  } finally {
+    isReanalyzing.value = false
+    if (resumeRt && cameraActive.value && !isCameraFrozen.value && realTimeMode.value) {
+      startRealTimeLoop()
+    }
+  }
+}
+
 async function analyzeImage() {
   if (!canAnalyze.value) return
   errorMessage.value = ''
@@ -857,7 +928,7 @@ async function analyzeImage() {
     hasAnalyzedImage.value = true
 
     const imageToSend = await getRawSourceFileForAI()
-    await runAgroVisionAnalysis({ fileOverride: imageToSend })
+    await runAgroVisionAnalysis({ fileOverride: imageToSend, forceRefresh: true })
 
     if (agrovisionResult.value) {
       statusMessage.value = agrovisionResult.value.in_trained_dataset
@@ -872,6 +943,14 @@ async function analyzeImage() {
   } finally {
     isAnalyzing.value = false
   }
+}
+
+async function analyzeAndRefreshData() {
+  if (cameraActive.value && !isCameraFrozen.value) {
+    await reanalyzeLiveCameraPlants()
+    return
+  }
+  await analyzeImage()
 }
 
 function selectPresetFromTable(presetId: SimulationPresetId) {
@@ -1089,16 +1168,17 @@ onBeforeUnmount(() => {
             @change="onFileChange"
           />
 
-          <!-- ANALIZAR IMAGEN BUTTON -->
+          <!-- ANALIZAR Y ACTUALIZAR DATOS (en parte superior) -->
           <button
             type="button"
-            :disabled="!canAnalyze"
+            :disabled="isAnalyzing || isReanalyzing || (!canAnalyze && !(cameraActive && !isCameraFrozen))"
             class="inline-flex items-center gap-2 rounded-xl bg-emerald-300 px-4 py-2 text-xs font-extrabold text-emerald-950 shadow-lg transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:opacity-50"
-            @click="analyzeImage"
+            title="Reanaliza las plantas visibles y actualiza el diagnóstico y métricas multiespectrales"
+            @click="analyzeAndRefreshData"
           >
-            <LoaderCircle v-if="isAnalyzing" class="h-4 w-4 animate-spin" />
-            <ScanSearch v-else class="h-4 w-4" />
-            {{ isAnalyzing ? 'Analizando…' : 'Analizar imagen' }}
+            <LoaderCircle v-if="isAnalyzing || isReanalyzing" class="h-4 w-4 animate-spin" />
+            <ShieldCheck v-else class="h-4 w-4" />
+            {{ isAnalyzing || isReanalyzing ? 'Analizando…' : 'Analizar y actualizar datos' }}
           </button>
 
           <!-- CAPTURAR / CONGELAR (Cuando la cámara está abierta) -->
@@ -1369,6 +1449,16 @@ onBeforeUnmount(() => {
               >
                 Focos / Isotermas
               </button>
+              <button
+                type="button"
+                :disabled="isAnalyzing || isReanalyzing || (!canAnalyze && !(cameraActive && !isCameraFrozen))"
+                class="inline-flex items-center gap-1 rounded-lg border border-sky-300/45 bg-sky-500/20 px-2.5 py-1 font-bold text-sky-100 transition hover:bg-sky-500/30 disabled:opacity-50"
+                title="Actualiza detecciones y datos espectrales sobre las plantas visibles"
+                @click="analyzeAndRefreshData"
+              >
+                <RefreshCw class="h-3 w-3 text-sky-300" :class="{ 'animate-spin': isAnalyzing || isReanalyzing }" />
+                Actualizar datos
+              </button>
             </div>
           </div>
 
@@ -1401,23 +1491,27 @@ onBeforeUnmount(() => {
                 <span
                   class="h-2 w-2 rounded-full"
                   :class="
-                    isCameraFrozen
-                      ? 'bg-amber-400'
-                      : realTimeMode && cameraActive
-                        ? 'animate-pulse bg-emerald-400'
-                        : liveAnalysis?.plantDetected
-                          ? 'bg-emerald-400'
-                          : 'bg-amber-400'
+                    agrovisionResult?.detection_mode === 'NO_PLANT'
+                      ? 'bg-stone-400'
+                      : isCameraFrozen
+                        ? 'bg-amber-400'
+                        : realTimeMode && cameraActive
+                          ? 'animate-pulse bg-emerald-400'
+                          : liveAnalysis?.plantDetected
+                            ? 'bg-emerald-400'
+                            : 'bg-amber-400'
                   "
                 ></span>
                 {{
-                  isCameraFrozen
-                    ? 'Imagen capturada (congelada)'
-                    : realTimeMode && cameraActive
-                      ? 'Tiempo Real activo'
-                      : liveAnalysis?.plantDetected
-                        ? `Área de planta detectada · ${liveAnalysis.plantCoveragePercent}% del cuadro`
-                        : 'Detectando área de planta…'
+                  agrovisionResult?.detection_mode === 'NO_PLANT'
+                    ? 'Objeto no vegetal en cuadro'
+                    : isCameraFrozen
+                      ? 'Imagen capturada (congelada)'
+                      : realTimeMode && cameraActive
+                        ? 'Tiempo Real activo'
+                        : liveAnalysis?.plantDetected
+                          ? `Área de planta detectada · ${liveAnalysis.plantCoveragePercent}% del cuadro`
+                          : 'Detectando área de planta…'
                 }}
               </span>
               <span
@@ -1433,6 +1527,19 @@ onBeforeUnmount(() => {
                 {{ currentPresetConfig.shortLabel }}
               </span>
             </div>
+
+            <!-- Floating live reanalysis button in real-time camera mode -->
+            <button
+              v-if="cameraActive && !isCameraFrozen && realTimeMode"
+              type="button"
+              :disabled="isReanalyzing"
+              class="absolute right-3 top-3 inline-flex items-center gap-1.5 rounded-full border border-sky-300/60 bg-black/80 px-3 py-1.5 text-[11px] font-bold text-sky-100 shadow-lg backdrop-blur-md transition hover:bg-sky-500/30 disabled:opacity-50"
+              title="Reinicia la detección de cajas y vuelve a analizar las plantas visibles"
+              @click="reanalyzeLiveCameraPlants"
+            >
+              <RefreshCw class="h-3.5 w-3.5 text-sky-300" :class="{ 'animate-spin': isReanalyzing }" />
+              {{ isReanalyzing ? 'Reanalizando…' : 'Volver a analizar plantas' }}
+            </button>
 
             <!-- Interactive Spot-Meter Overlay at bottom-left -->
             <div
@@ -1513,15 +1620,6 @@ onBeforeUnmount(() => {
                 @click="fileInput?.click()"
               >
                 {{ sourceMode === 'image' ? 'Subir otra foto' : 'Subir foto' }}
-              </button>
-              <button
-                type="button"
-                :disabled="!canAnalyze"
-                class="inline-flex items-center gap-1.5 rounded-lg bg-emerald-300 px-3.5 py-1.5 text-xs font-bold text-emerald-950 transition hover:bg-emerald-200 disabled:opacity-50"
-                @click="analyzeImage"
-              >
-                <ScanSearch class="h-3.5 w-3.5" />
-                Analizar imagen
               </button>
             </div>
           </div>
@@ -1604,17 +1702,6 @@ onBeforeUnmount(() => {
         <!-- Bottom Action Bar -->
         <div class="mt-4 flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-3">
           <div class="flex flex-wrap gap-2">
-            <button
-              type="button"
-              :disabled="!canAnalyze"
-              class="inline-flex items-center gap-1.5 rounded-xl bg-emerald-300 px-4 py-2 text-xs font-bold text-emerald-950 transition hover:bg-emerald-200 disabled:opacity-50"
-              @click="analyzeImage"
-            >
-              <LoaderCircle v-if="isAnalyzing" class="h-4 w-4 animate-spin" />
-              <ShieldCheck v-else class="h-4 w-4" />
-              {{ isAnalyzing ? 'Analizando imagen…' : 'Analizar imagen y actualizar datos' }}
-            </button>
-
             <button
               v-if="props.showFieldScoutingAction"
               type="button"
@@ -1765,12 +1852,31 @@ onBeforeUnmount(() => {
             </div>
 
             <div
+              v-else-if="agrovisionResult.detection_mode === 'NO_PLANT'"
+              class="flex items-center justify-between gap-3 rounded-xl border border-stone-400/30 bg-black/25 p-3 text-xs text-stone-300"
+            >
+              <span>
+                Se detectó un objeto no vegetal o escena sin plantas. Enfoca una planta o cultivo para identificar su
+                especie y salud.
+              </span>
+              <button
+                v-if="cameraActive && !isCameraFrozen"
+                type="button"
+                :disabled="isReanalyzing"
+                class="shrink-0 rounded-lg border border-sky-400/40 bg-sky-500/20 px-2.5 py-1.5 text-[11px] font-bold text-sky-100 transition hover:bg-sky-500/30 disabled:opacity-50"
+                @click="reanalyzeLiveCameraPlants"
+              >
+                Volver a analizar
+              </button>
+            </div>
+
+            <div
               v-else
               class="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-black/25 p-3 text-xs text-stone-300"
             >
               <span>
-                Cultivo clasificado directamente por el modelo fitosanitario entrenado (15 clases). Puedes consultar
-                PlantLens AI para obtener su ficha botánica y cuidados generales.
+                Cultivo clasificado directamente por el modelo fitosanitario entrenado (60 clases en 18 cultivos). Puedes
+                consultar PlantLens AI para obtener su ficha botánica y cuidados generales.
               </span>
               <button
                 type="button"
@@ -1810,7 +1916,7 @@ onBeforeUnmount(() => {
                 </span>
                 <h3 class="text-base font-semibold text-white">
                   {{
-                    agrovisionResult && selectedPlantId
+                    agrovisionResult && agrovisionResult.detection_mode !== 'NO_PLANT' && selectedPlantId
                       ? `Diagnóstico de Planta #${selectedPlantId}`
                       : 'Diagnóstico Fitosanitario IA (ONNX + PlantLens)'
                   }}
@@ -1826,9 +1932,35 @@ onBeforeUnmount(() => {
           </div>
 
           <div v-if="liveAnalysis && hasAnalyzedImage" class="mt-4 space-y-3">
+            <!-- Aviso explícito cuando el objeto NO es una planta -->
+            <div
+              v-if="agrovisionResult?.detection_mode === 'NO_PLANT'"
+              class="flex items-start justify-between gap-2.5 rounded-xl border border-stone-400/40 bg-stone-500/10 p-3 text-xs text-stone-200"
+            >
+              <div class="flex items-start gap-2.5">
+                <AlertCircle class="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+                <div>
+                  <strong class="block text-amber-200">Objeto no vegetal discriminado</strong>
+                  <span>
+                    La cámara captó un objeto o escena sin tejido vegetal real. Se omitió el diagnóstico patológico
+                    para evitar falsos positivos.
+                  </span>
+                </div>
+              </div>
+              <button
+                v-if="cameraActive && !isCameraFrozen"
+                type="button"
+                :disabled="isReanalyzing"
+                class="shrink-0 rounded-lg border border-sky-400/40 bg-sky-500/20 px-2.5 py-1 text-[11px] font-bold text-sky-100 hover:bg-sky-500/30 disabled:opacity-50"
+                @click="reanalyzeLiveCameraPlants"
+              >
+                Volver a analizar
+              </button>
+            </div>
+
             <!-- Aviso explícito cuando la planta NO está en el dataset entrenado -->
             <div
-              v-if="agrovisionResult?.detection_mode === 'OUT_OF_DATASET'"
+              v-else-if="agrovisionResult?.detection_mode === 'OUT_OF_DATASET'"
               class="flex items-start gap-2.5 rounded-xl border border-amber-300/40 bg-amber-400/10 p-3 text-xs text-amber-100"
             >
               <AlertCircle class="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
@@ -1845,11 +1977,13 @@ onBeforeUnmount(() => {
               v-if="agrovisionResult"
               class="rounded-xl border p-3.5"
               :class="
-                agrovisionResult.health_status.includes('SALUDABLE')
-                  ? 'border-emerald-400/40 bg-emerald-500/10'
-                  : agrovisionResult.detection_mode === 'OUT_OF_DATASET'
-                    ? 'border-sky-400/40 bg-sky-500/10'
-                    : 'border-red-400/40 bg-red-500/10'
+                agrovisionResult.detection_mode === 'NO_PLANT'
+                  ? 'border-stone-400/40 bg-stone-500/10'
+                  : agrovisionResult.health_status.includes('SALUDABLE')
+                    ? 'border-emerald-400/40 bg-emerald-500/10'
+                    : agrovisionResult.detection_mode === 'OUT_OF_DATASET'
+                      ? 'border-sky-400/40 bg-sky-500/10'
+                      : 'border-red-400/40 bg-red-500/10'
               "
             >
               <div class="flex flex-wrap items-center justify-between gap-2">

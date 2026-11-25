@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useMainStore } from '../stores'
+import { createCrop } from '../services/agronomyData'
 import { supabase } from '../services/supabase'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
@@ -36,6 +37,8 @@ const crops = ref<Crop[]>([])
 const profiles = ref<ProfileOption[]>([])
 const loading = ref(false)
 const saving = ref(false)
+const addingCrop = ref(false)
+const newCropName = ref('')
 const busyFieldId = ref('')
 const showNewField = ref(false)
 const errorMessage = ref('')
@@ -105,7 +108,61 @@ const loadData = async () => {
 
 onMounted(loadData)
 
+const findCropByName = (name: string) => {
+  const target = name.trim().toLocaleLowerCase()
+  return crops.value.find(crop => crop.name.trim().toLocaleLowerCase() === target) ?? null
+}
+
+const resolveOrCreateCropId = async (rawName: string): Promise<string> => {
+  const trimmed = rawName.trim()
+  if (!trimmed) throw new Error('Escribe el nombre del cultivo que deseas añadir.')
+  if (trimmed.length > 120) throw new Error('El nombre del cultivo no puede superar los 120 caracteres.')
+
+  const existing = findCropByName(trimmed)
+  if (existing) return existing.id
+
+  if (!isAdmin.value) {
+    throw new Error('No cuentas con permisos de administrador para añadir nuevos cultivos al catálogo.')
+  }
+
+  const created = await createCrop({
+    name: trimmed,
+    scientific_name: null,
+    optimal_min_humidity: null,
+    optimal_max_humidity: null,
+    optimal_min_temp: null,
+    optimal_max_temp: null,
+    growth_cycle_days: null,
+  })
+  crops.value = [...crops.value, { id: created.id, name: created.name, scientific_name: created.scientific_name }].sort((a, b) =>
+    a.name.localeCompare(b.name),
+  )
+  return created.id
+}
+
+const quickAddCropForParcel = async () => {
+  if (saving.value || addingCrop.value || !newCropName.value.trim()) return
+  addingCrop.value = true
+  errorMessage.value = ''
+  statusMessage.value = ''
+  try {
+    const existing = findCropByName(newCropName.value)
+    const cropId = await resolveOrCreateCropId(newCropName.value)
+    newField.value.cropId = cropId
+    const added = newCropName.value.trim()
+    newCropName.value = ''
+    statusMessage.value = existing
+      ? `El cultivo "${existing.name}" ya existía y fue seleccionado.`
+      : `Cultivo "${added}" añadido al catálogo y seleccionado.`
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : 'No se pudo añadir el cultivo.'
+  } finally {
+    addingCrop.value = false
+  }
+}
+
 const resetForm = () => {
+  newCropName.value = ''
   newField.value = {
     name: '',
     description: '',
@@ -126,18 +183,23 @@ const addField = async () => {
   errorMessage.value = ''
   statusMessage.value = ''
   try {
+    let resolvedCropId = newField.value.cropId
+    if (resolvedCropId === '__new__' || (!resolvedCropId && isAdmin.value && newCropName.value.trim())) {
+      resolvedCropId = await resolveOrCreateCropId(newCropName.value)
+    }
+
     const { data: field, error } = await supabase.from('fields').insert({
       user_id: newField.value.ownerId,
       name: newField.value.name.trim(),
       description: newField.value.description.trim() || null,
-      crop_id: newField.value.cropId || null,
+      crop_id: resolvedCropId || null,
     }).select('id').single()
     if (error) throw new Error(`No se pudo guardar la parcela: ${error.message}`)
 
-    if (newField.value.cropId) {
+    if (resolvedCropId) {
       const { error: cropError } = await supabase.from('field_crops').insert({
         field_id: field.id,
-        crop_id: newField.value.cropId,
+        crop_id: resolvedCropId,
         planting_date: newField.value.plantingDate,
       })
       if (cropError) {
@@ -234,16 +296,40 @@ const removeField = async (field: Field) => {
             Descripción
             <textarea v-model="newField.description" rows="2" class="parcel-input" placeholder="Ubicación u otros detalles" />
           </label>
-          <label class="grid gap-1 text-sm font-medium">
-            Cultivo
-            <select v-model="newField.cropId" class="parcel-input">
-              <option value="">Sin cultivo</option>
-              <option v-for="crop in crops" :key="crop.id" :value="crop.id">
-                {{ crop.name }}{{ crop.scientific_name ? ` (${crop.scientific_name})` : '' }}
-              </option>
-            </select>
-          </label>
-          <label v-if="newField.cropId" class="grid gap-1 text-sm font-medium">
+          <div class="grid gap-2">
+            <label class="grid gap-1 text-sm font-medium">
+              Cultivo
+              <select v-model="newField.cropId" class="parcel-input">
+                <option value="">Sin cultivo</option>
+                <option v-for="crop in crops" :key="crop.id" :value="crop.id">
+                  {{ crop.name }}{{ crop.scientific_name ? ` (${crop.scientific_name})` : '' }}
+                </option>
+                <option v-if="isAdmin" value="__new__">+ Escribir nuevo cultivo…</option>
+              </select>
+            </label>
+            <div v-if="isAdmin" class="flex flex-wrap gap-2">
+              <input
+                v-model="newCropName"
+                maxlength="120"
+                class="parcel-input min-w-40 flex-1"
+                placeholder="O escribe un nuevo cultivo…"
+                aria-label="Escribir nuevo cultivo para la parcela"
+              >
+              <Button
+                variant="outline"
+                size="sm"
+                type="button"
+                :disabled="saving || addingCrop || !newCropName.trim()"
+                @click="quickAddCropForParcel"
+              >
+                {{ addingCrop ? 'Añadiendo…' : 'Añadir' }}
+              </Button>
+            </div>
+          </div>
+          <label
+            v-if="(newField.cropId && newField.cropId !== '__new__') || (isAdmin && newCropName.trim())"
+            class="grid gap-1 text-sm font-medium"
+          >
             Fecha de siembra
             <input v-model="newField.plantingDate" type="date" required class="parcel-input">
           </label>

@@ -14,6 +14,14 @@ import type {
   AgroVisionTopPrediction,
   DetectedPlantBox
 } from './plantDiagnosis'
+import {
+  computeVegetationRatioFromRgba,
+  evaluatePlantPresence,
+  GENERIC_PLANT_ANCHOR_PROMPT,
+  NON_PLANT_DETECTOR_LABELS,
+  NON_PLANT_PROMPTS,
+  translateNonPlantLabelEs
+} from './agroVisionDecision'
 
 export interface BrowserEngineStatus {
   stage: 'idle' | 'loading' | 'ready' | 'error'
@@ -34,7 +42,257 @@ const AGRONOMY_DB: Record<
     recomendacion: string
   }
 > = {
-  Pepper__bell___Bacterial_spot: {
+  Apple___Apple_scab: {
+    cultivo: 'Manzano (Malus domestica)',
+    enfermedad_es: 'Sarna / Roña del Manzano',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Venturia inaequalis)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Aplicar fungicidas preventivos (captan, miclobutanil) desde brotación, podar para airear la copa y retirar hojarasca caída.'
+  },
+  Apple___Black_rot: {
+    cultivo: 'Manzano (Malus domestica)',
+    enfermedad_es: 'Podredumbre Negra del Manzano',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Botryosphaeria obtusa)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Eliminar frutos momificados y ramas con cancros; aplicar fungicida preventivo durante floración y desarrollo del fruto.'
+  },
+  Apple___Cedar_apple_rust: {
+    cultivo: 'Manzano (Malus domestica)',
+    enfermedad_es: 'Roya del Manzano (Cedar-Apple Rust)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Gymnosporangium juniperi-virginianae)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Aplicar fungicidas triazoles o estrobilurinas al abrir las yemas florales y eliminar hospederos cercanos de enebro/cedro si es viable.'
+  },
+  Apple___healthy: {
+    cultivo: 'Manzano (Malus domestica)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Follaje sano y vigoroso. Mantener poda de formación, riego equilibrado y vigilancia preventiva.'
+  },
+  Bean___angular_leaf_spot: {
+    cultivo: 'Frijol / Judía (Phaseolus vulgaris)',
+    enfermedad_es: 'Mancha Angular de la Hoja',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Pseudocercospora griseola)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Usar semilla certificada, rotar cultivos fuera de leguminosas y aplicar fungicidas a base de azoxistrobina o cobre.'
+  },
+  Bean___bean_rust: {
+    cultivo: 'Frijol / Judía (Phaseolus vulgaris)',
+    enfermedad_es: 'Roya del Frijol',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Uromyces appendiculatus)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Aplicar fungicidas específicos (azufre mojable, tebuconazol) ante las primeras pústulas y evitar riego por aspersión nocturno.'
+  },
+  Bean___healthy: {
+    cultivo: 'Frijol / Judía (Phaseolus vulgaris)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Follaje libre de lesiones y pústulas. Mantener drenaje adecuado y monitoreo semanal.'
+  },
+  Blueberry___healthy: {
+    cultivo: 'Arándano (Vaccinium corymbosum)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Mantener pH ácido del sustrato (4.5-5.5), acolchado orgánico y fertirriego uniforme.'
+  },
+  'Cherry_(including_sour)___Powdery_mildew': {
+    cultivo: 'Cerezo (Prunus avium / Prunus cerasus)',
+    enfermedad_es: 'Oídio / Cenicilla del Cerezo',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Podosphaera clandestina)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Aplicar azufre micronizado o fungicidas antioidio, evitar exceso de vigor nitrogenado y mejorar ventilación en la copa.'
+  },
+  'Cherry_(including_sour)___healthy': {
+    cultivo: 'Cerezo (Prunus avium / Prunus cerasus)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Estado fitosanitario óptimo. Continuar programa de riego controlado y poda sanitaria anual.'
+  },
+  'Corn_(maize)___Cercospora_leaf_spot_Gray_leaf_spot': {
+    cultivo: 'Maíz (Zea mays)',
+    enfermedad_es: 'Mancha Gris de la Hoja (Cercosporiosis)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Cercospora zeae-maydis)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Rotar con cultivos no gramíneos, incorporar residuos de cosecha y aplicar fungicidas estrobilurinas/triazoles si supera el umbral.'
+  },
+  'Corn_(maize)___Common_rust_': {
+    cultivo: 'Maíz (Zea mays)',
+    enfermedad_es: 'Roya Común del Maíz',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Puccinia sorghi)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Monitorear pústulas en hojas bandera; aplicar fungicida foliar en híbridos susceptibles si hay alta presión ambiental.'
+  },
+  'Corn_(maize)___Northern_Leaf_Blight': {
+    cultivo: 'Maíz (Zea mays)',
+    enfermedad_es: 'Tizón Foliar del Norte del Maíz',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Exserohilum turcicum)',
+    severidad: 'ALTA',
+    recomendacion: 'Utilizar híbridos tolerantes, rotar parcelas y realizar aplicación oportuna de fungicida antes de floración.'
+  },
+  'Corn_(maize)___healthy': {
+    cultivo: 'Maíz (Zea mays)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Dosel sano y activo fotosintéticamente. Mantener fertilización nitrogenada balanceada y riego en floración.'
+  },
+  Grape___Black_rot: {
+    cultivo: 'Vid / Uva (Vitis vinifera)',
+    enfermedad_es: 'Podredumbre Negra de la Vid (Black Rot)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Guignardia bidwellii)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Retirar racimos momificados del ciclo previo, deshojar la zona de racimos y aplicar fungicida protector tras lluvias.'
+  },
+  'Grape___Esca_(Black_Measles)': {
+    cultivo: 'Vid / Uva (Vitis vinifera)',
+    enfermedad_es: 'Yesca / Esca de la Vid (Black Measles)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Complejo fúngico vascular (Phaeomoniella chlamydospora / Phaeoacremonium)',
+    severidad: 'CRÍTICA',
+    recomendacion:
+      'Proteger heridas de poda con pasta cicatrizante antifúngica, desinfectar tijeras por cepa y marcar plantas afectadas para renovación.'
+  },
+  'Grape___Leaf_blight_(Isariopsis_Leaf_Spot)': {
+    cultivo: 'Vid / Uva (Vitis vinifera)',
+    enfermedad_es: 'Tizón / Mancha Foliar por Isariopsis',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Pseudocercospora vitis)',
+    severidad: 'MEDIA',
+    recomendacion:
+      'Realizar poda en verde para airear el follaje y aplicar fungicidas cúpricos o ditiocarbamatos según fenología.'
+  },
+  Grape___healthy: {
+    cultivo: 'Vid / Uva (Vitis vinifera)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Vegetación sana. Continuar manejo de copa, riego deficitario controlado y monitoreo preventivo.'
+  },
+  Mango___Anthracnose: {
+    cultivo: 'Mango (Mangifera indica)',
+    enfermedad_es: 'Antracnosis del Mango',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Colletotrichum gloeosporioides)',
+    severidad: 'ALTA',
+    recomendacion: 'Podar ramas infectadas, recolectar tejido caído y aplicar fungicidas cúpricos o azoxistrobina desde floración.'
+  },
+  Mango___Bacterial_Canker: {
+    cultivo: 'Mango (Mangifera indica)',
+    enfermedad_es: 'Cancro Bacteriano del Mango',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Bacteria (Xanthomonas citri pv. mangiferaeindicae)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Desinfectar herramientas de poda, colocar cortavientos para evitar heridas y asperjar oxicloruro o hidróxido de cobre.'
+  },
+  Mango___Cutting_Weevil: {
+    cultivo: 'Mango (Mangifera indica)',
+    enfermedad_es: 'Daño por Picudo Cortador de Brotes',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Insecto coleóptero (Sternochetus / Deporaus marginatus)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Recolectar y destruir brotes cortados en suelo, usar trampas de monitoreo y aplicar control integrado en brotación tierna.'
+  },
+  Mango___Die_Back: {
+    cultivo: 'Mango (Mangifera indica)',
+    enfermedad_es: 'Muerte Regresiva del Mango (Die Back)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Lasiodiplodia theobromae)',
+    severidad: 'CRÍTICA',
+    recomendacion: 'Podar 10 cm por debajo del tejido necrótico sano, sellar cortes con pasta bordelesa y mejorar nutrición y riego.'
+  },
+  Mango___Gall_Midge: {
+    cultivo: 'Mango (Mangifera indica)',
+    enfermedad_es: 'Agalla Foliar por Mosquito del Mango',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Insecto díptero (Procontarinia matteiana)',
+    severidad: 'MEDIA',
+    recomendacion:
+      'Podar hojas severamente agalladas en brotes nuevos, labrar ligeramente bajo la copa y aplicar control biológico o selectivo.'
+  },
+  Mango___Healthy: {
+    cultivo: 'Mango (Mangifera indica)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Hojas sanas con coloración uniforme. Mantener poda de aireación tras cosecha y fertirriego balanceado.'
+  },
+  Mango___Powdery_Mildew: {
+    cultivo: 'Mango (Mangifera indica)',
+    enfermedad_es: 'Oídio / Cenicilla Polvorienta del Mango',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Oidium mangiferae)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Aplicar azufre mojable o fungicidas sistémicos al inicio de la panícula floral para evitar caída de flores y frutos pequeños.'
+  },
+  Mango___Sooty_Mould: {
+    cultivo: 'Mango (Mangifera indica)',
+    enfermedad_es: 'Fumagina (Hollín Foliar) del Mango',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo epífito sobre melaza de insectos (Capnodium spp.)',
+    severidad: 'MEDIA',
+    recomendacion:
+      'Controlar primero insectos chupadores productores de melaza (cochinillas, saltahojas, áfidos) y lavar copa con jabón potásico.'
+  },
+  'Orange___Haunglongbing_(Citrus_greening)': {
+    cultivo: 'Cítricos / Naranjo (Citrus sinensis)',
+    enfermedad_es: 'Huanglongbing (HLB / Enverdecimiento de los Cítricos)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Bacteria floemática (Candidatus Liberibacter asiaticus - vector: Diaphorina citri)',
+    severidad: 'CRÍTICA',
+    recomendacion:
+      'Cuarentena y notificación fitosanitaria inmediata; controlar al psílido vector (Diaphorina citri) y erradicar árboles confirmados.'
+  },
+  Peach___Bacterial_spot: {
+    cultivo: 'Duraznero / Melocotonero (Prunus persica)',
+    enfermedad_es: 'Mancha Bacteriana del Duraznero',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Bacteria (Xanthomonas arboricola pv. pruni)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Aplicar bactericidas cúpricos al caer la hoja y en brotación; evitar fertilización nitrogenada excesiva y suelos encharcados.'
+  },
+  Peach___healthy: {
+    cultivo: 'Duraznero / Melocotonero (Prunus persica)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Follaje sano. Mantener poda anual de iluminación y control preventivo de humedad.'
+  },
+  'Pepper,_bell___Bacterial_spot': {
     cultivo: 'Pimiento Morrón (Capsicum annuum)',
     enfermedad_es: 'Mancha Bacteriana',
     estado_salud: 'ENFERMA',
@@ -43,7 +301,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Aplicar bactericidas cúpricos preventivos, evitar riego por aspersión y retirar follaje basal infectado.'
   },
-  Pepper__bell___healthy: {
+  'Pepper,_bell___healthy': {
     cultivo: 'Pimiento Morrón (Capsicum annuum)',
     enfermedad_es: 'Planta Saludable',
     estado_salud: 'SALUDABLE',
@@ -77,7 +335,145 @@ const AGRONOMY_DB: Record<
     severidad: 'NINGUNA',
     recomendacion: 'Estado óptimo. Continuar vigilancia climática ante periodos de alta humedad.'
   },
-  Tomato_Bacterial_spot: {
+  Raspberry___healthy: {
+    cultivo: 'Frambueso (Rubus idaeus)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Cañas y hojas sanas. Mantener raleo de cañas viejas, buen drenaje y riego por goteo.'
+  },
+  Rice___bacterial_leaf_blight: {
+    cultivo: 'Arroz (Oryza sativa)',
+    enfermedad_es: 'Tizón Bacteriano de la Hoja del Arroz',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Bacteria (Xanthomonas oryzae pv. oryzae)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Evitar exceso de nitrógeno, mejorar drenaje entre melgas, usar variedades resistentes y aplicar bactericidas cúpricos si procede.'
+  },
+  Rice___brown_spot: {
+    cultivo: 'Arroz (Oryza sativa)',
+    enfermedad_es: 'Mancha Parda / Helmintosporiosis del Arroz',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Bipolaris oryzae)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Corregir deficiencias de potasio y silicio en el suelo, tratar semilla y aplicar fungicida foliar en fase vegetativa.'
+  },
+  Rice___healthy: {
+    cultivo: 'Arroz (Oryza sativa)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Lámina foliar sana y uniforme. Mantener manejo de lámina de agua y fertilización fraccionada.'
+  },
+  Rice___leaf_blast: {
+    cultivo: 'Arroz (Oryza sativa)',
+    enfermedad_es: 'Quemazón / Piricularia del Arroz (Leaf Blast)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Magnaporthe oryzae / Pyricularia oryzae)',
+    severidad: 'CRÍTICA',
+    recomendacion:
+      'Acción urgente: evitar estrés hídrico, reducir dosis tardía de nitrógeno y aplicar fungicida específico (triciclazol / azoxistrobina).'
+  },
+  Rice___leaf_scald: {
+    cultivo: 'Arroz (Oryza sativa)',
+    enfermedad_es: 'Escaldado de la Hoja del Arroz',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Microdochium albescens / Monographella albescens)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Evitar densidades excesivas de siembra y exceso de nitrógeno; aplicar fungicida foliar en etapas tempranas si avanza hacia la panícula.'
+  },
+  Rice___narrow_brown_spot: {
+    cultivo: 'Arroz (Oryza sativa)',
+    enfermedad_es: 'Mancha Estrecha Parda del Arroz (Cercosporiosis)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Sphaerulina oryzina / Cercospora janseana)',
+    severidad: 'MEDIA',
+    recomendacion:
+      'Mantener nutrición potásica adecuada, cosechar a tiempo y aplicar fungicida triazol/estrobilurina si aparece antes de espigado.'
+  },
+  Soybean___healthy: {
+    cultivo: 'Soya / Soja (Glycine max)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Cultivo sano. Continuar vigilancia de roya asiática y chinches durante llenado de vainas.'
+  },
+  Squash___Powdery_mildew: {
+    cultivo: 'Calabaza / Zapallo (Cucurbita spp.)',
+    enfermedad_es: 'Oídio / Cenicilla de las Cucurbitáceas',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Podosphaera xanthii / Erysiphe cichoracearum)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Aplicar azufre mojable, bicarbonato potásico o fungicida específico rotando modos de acción y retirar hojas basales senescentes.'
+  },
+  Strawberry___Leaf_scorch: {
+    cultivo: 'Fresa / Frutilla (Fragaria × ananassa)',
+    enfermedad_es: 'Quemadura / Viruela Foliar de la Fresa',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Diplocarpon earlianum)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Retirar hojas secas tras cosecha, usar acolchado plástico con riego por goteo y aplicar fungicida preventivo autorizado.'
+  },
+  Strawberry___healthy: {
+    cultivo: 'Fresa / Frutilla (Fragaria × ananassa)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Follaje turgente y sano. Mantener buena aireación en camas de cultivo y riego localizado.'
+  },
+  Sugarcane___Healthy: {
+    cultivo: 'Caña de Azúcar (Saccharum officinarum)',
+    enfermedad_es: 'Planta Saludable',
+    estado_salud: 'SALUDABLE',
+    agente_causal: 'Ninguno',
+    severidad: 'NINGUNA',
+    recomendacion: 'Macollo sano y vigoroso. Mantener programa de fertilización, control de malezas y drenaje en surcos.'
+  },
+  Sugarcane___Mosaic: {
+    cultivo: 'Caña de Azúcar (Saccharum officinarum)',
+    enfermedad_es: 'Mosaico de la Caña de Azúcar (SCMV)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Virus (Sugarcane mosaic virus - vector: Áfidos / esquejes infectados)',
+    severidad: 'ALTA',
+    recomendacion: 'Usar semilla sana certificada (tratamiento termoterápico), erradicar cepas enfermas y controlar pulgones vectores.'
+  },
+  Sugarcane___RedRot: {
+    cultivo: 'Caña de Azúcar (Saccharum officinarum)',
+    enfermedad_es: 'Pudrición Roja de la Caña (Red Rot)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Colletotrichum falcatum)',
+    severidad: 'CRÍTICA',
+    recomendacion:
+      'Arrancar y destruir cepas enfermas, evitar drenaje deficiente, desinfectar machetes y replantar con variedades resistentes.'
+  },
+  Sugarcane___Rust: {
+    cultivo: 'Caña de Azúcar (Saccharum officinarum)',
+    enfermedad_es: 'Roya de la Caña de Azúcar',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Hongo (Puccinia melanocephala / Puccinia kuehnii)',
+    severidad: 'MEDIA-ALTA',
+    recomendacion:
+      'Evaluar severidad en hojas jóvenes y aplicar fungicidas estrobilurinas o triazoles en bloques susceptibles bajo alta humedad.'
+  },
+  Sugarcane___Yellow: {
+    cultivo: 'Caña de Azúcar (Saccharum officinarum)',
+    enfermedad_es: 'Síndrome de la Hoja Amarilla (YLS)',
+    estado_salud: 'ENFERMA',
+    agente_causal: 'Virus (Sugarcane yellow leaf virus - vector: Melanaphis sacchari)',
+    severidad: 'ALTA',
+    recomendacion:
+      'Renovar semilleros mediante cultivo de meristemos/esquejes sanos, monitorear áfido amarillo y evitar estrés hídrico.'
+  },
+  Tomato___Bacterial_spot: {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Mancha Bacteriana del Tomate',
     estado_salud: 'ENFERMA',
@@ -86,7 +482,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Desinfectar herramientas de poda, usar hidróxido de cobre y evitar labores cuando el follaje esté húmedo.'
   },
-  Tomato_Early_blight: {
+  Tomato___Early_blight: {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Tizón Temprano (Alternariosis)',
     estado_salud: 'ENFERMA',
@@ -95,7 +491,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Podar hojas bajeras senescentes, mejorar ventilación del dosel y aplicar fungicida específico.'
   },
-  Tomato_Late_blight: {
+  Tomato___Late_blight: {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Tizón Tardío del Tomate',
     estado_salud: 'ENFERMA',
@@ -104,7 +500,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Alerta fitosanitaria urgente: aplicar fungicida sistémico, eliminar plantas severamente afectadas y controlar drenaje.'
   },
-  Tomato_Leaf_Mold: {
+  Tomato___Leaf_Mold: {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Moho de la Hoja (Cladosporiosis)',
     estado_salud: 'ENFERMA',
@@ -113,7 +509,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Reducir humedad relativa bajo invernadero (<85%), aumentar aireación y aplicar fungicida preventivo.'
   },
-  Tomato_Septoria_leaf_spot: {
+  Tomato___Septoria_leaf_spot: {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Mancha Foliar por Septoria',
     estado_salud: 'ENFERMA',
@@ -122,7 +518,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Eliminar residuos vegetales infectados, usar acolchado (mulch) para evitar salpicaduras y aplicar fungicida.'
   },
-  Tomato_Spider_mites_Two_spotted_spider_mite: {
+  'Tomato___Spider_mites_Two-spotted_spider_mite': {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Araña Roja / Ácaro de Dos Manchas',
     estado_salud: 'ENFERMA',
@@ -131,7 +527,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Aplicar acaricidas selectivos (abamectina) o control biológico (Phytoseiulus persimilis); evitar estrés hídrico.'
   },
-  Tomato__Target_Spot: {
+  Tomato___Target_Spot: {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Mancha Anillada (Target Spot)',
     estado_salud: 'ENFERMA',
@@ -140,7 +536,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Mejorar flujo de aire entre hileras y aplicar fungicidas estrobilurinas o triazoles.'
   },
-  Tomato__Tomato_YellowLeaf__Curl_Virus: {
+  Tomato___Tomato_Yellow_Leaf_Curl_Virus: {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Virus del Rizado Amarillo del Tomate (TYLCV)',
     estado_salud: 'ENFERMA',
@@ -149,7 +545,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Controlar el vector (mosca blanca) con trampas cromáticas y mallas antiáfidos; erradicar plantas virosas.'
   },
-  Tomato__Tomato_mosaic_virus: {
+  Tomato___Tomato_mosaic_virus: {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Virus del Mosaico del Tomate (ToMV)',
     estado_salud: 'ENFERMA',
@@ -158,7 +554,7 @@ const AGRONOMY_DB: Record<
     recomendacion:
       'Desinfección estricta de manos y herramientas con solución jabonosa/hipoclorito; retirar plantas sintomáticas.'
   },
-  Tomato_healthy: {
+  Tomato___healthy: {
     cultivo: 'Tomate (Solanum lycopersicum)',
     enfermedad_es: 'Planta Saludable',
     estado_salud: 'SALUDABLE',
@@ -217,6 +613,162 @@ const BOTANICAL_CATALOG: BotanicalEntry[] = [
     water: 'Riego regular y constante sin encharcar raíces.',
     soil_temp: 'Sustrato fértil y drenado, clima cálido (20-29°C) protegido de heladas.',
     care: 'Pleno sol, temperatura cálida (20-28°C), riego frecuente sin encharcar y suelo rico en materia orgánica.'
+  },
+  {
+    id: 'trained_apple',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of an apple tree leaf (Malus domestica)',
+    name_es: 'Manzano',
+    scientific_name: 'Malus domestica',
+    wiki_query: 'Malus_domestica',
+    light: 'Pleno sol directo (6-8 horas diarias).',
+    water: 'Riego profundo y regular evitando encharcamiento radicular.',
+    soil_temp: 'Suelo franco bien drenado (pH 6.0-7.0); requiere frío invernal.',
+    care: 'Pleno sol, poda invernal de aireación y riego regular sin saturar raíces.'
+  },
+  {
+    id: 'trained_bean',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a common bean plant leaf (Phaseolus vulgaris)',
+    name_es: 'Frijol / Judía',
+    scientific_name: 'Phaseolus vulgaris',
+    wiki_query: 'Phaseolus_vulgaris',
+    light: 'Pleno sol directo (6+ horas diarias).',
+    water: 'Riego moderado en la base, crítico durante floración y llenado de vaina.',
+    soil_temp: 'Suelo suelto bien drenado; temperatura óptima 18-28°C.',
+    care: 'Pleno sol, riego en base sin mojar follaje y rotación de cultivos.'
+  },
+  {
+    id: 'trained_blueberry',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a blueberry bush leaf (Vaccinium corymbosum)',
+    name_es: 'Arándano',
+    scientific_name: 'Vaccinium corymbosum',
+    wiki_query: 'Vaccinium_corymbosum',
+    light: 'Pleno sol o semisombra muy luminosa.',
+    water: 'Riego frecuente con agua de baja salinidad manteniendo humedad constante.',
+    soil_temp: 'Sustrato ácido (pH 4.5-5.5) rico en turba y corteza de pino.',
+    care: 'Sustrato ácido, riego frecuente sin cal y acolchado orgánico.'
+  },
+  {
+    id: 'trained_cherry',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a cherry tree leaf (Prunus avium or Prunus cerasus)',
+    name_es: 'Cerezo',
+    scientific_name: 'Prunus avium / Prunus cerasus',
+    wiki_query: 'Prunus_avium',
+    light: 'Pleno sol directo.',
+    water: 'Riego moderado evitando encharcar el cuello de raíz.',
+    soil_temp: 'Suelo profundo y bien drenado; clima templado con horas frío.',
+    care: 'Pleno sol, poda sanitaria y buen drenaje.'
+  },
+  {
+    id: 'trained_grape',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a grapevine leaf (Vitis vinifera)',
+    name_es: 'Vid / Uva',
+    scientific_name: 'Vitis vinifera',
+    wiki_query: 'Vitis_vinifera',
+    light: 'Pleno sol directo todo el día.',
+    water: 'Riego profundo espaciado; tolera moderada sequía una vez establecida.',
+    soil_temp: 'Suelo franco-pedregoso bien drenado; poda anual de fructificación.',
+    care: 'Pleno sol, conducción en espaldera, buena aireación de racimos y riego moderado.'
+  },
+  {
+    id: 'trained_mango',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a mango tree leaf (Mangifera indica)',
+    name_es: 'Mango',
+    scientific_name: 'Mangifera indica',
+    wiki_query: 'Mangifera_indica',
+    light: 'Pleno sol tropical/subtropical.',
+    water: 'Riego profundo regular en crecimiento y reducido antes de floración.',
+    soil_temp: 'Suelo profundo bien drenado (pH 5.5-7.5); sensible a heladas.',
+    care: 'Pleno sol cálido, poda postcosecha de copa y control preventivo de humedad.'
+  },
+  {
+    id: 'trained_peach',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a peach tree leaf (Prunus persica)',
+    name_es: 'Duraznero / Melocotonero',
+    scientific_name: 'Prunus persica',
+    wiki_query: 'Prunus_persica',
+    light: 'Pleno sol directo (6-8 horas).',
+    water: 'Riego regular durante cuajado y engorde del fruto sin encharcar.',
+    soil_temp: 'Suelo franco-arenoso bien drenado (pH 6.0-6.8).',
+    care: 'Pleno sol, poda anual abierta y drenaje excelente.'
+  },
+  {
+    id: 'trained_raspberry',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a raspberry plant leaf (Rubus idaeus)',
+    name_es: 'Frambueso',
+    scientific_name: 'Rubus idaeus',
+    wiki_query: 'Rubus_idaeus',
+    light: 'Pleno sol o semisombra ligera en climas cálidos.',
+    water: 'Riego por goteo regular manteniendo humedad uniforme sin saturar.',
+    soil_temp: 'Suelo rico en materia orgánica (pH 5.8-6.5) y entutorado.',
+    care: 'Riego localizado, raleo anual de cañas fructíferas viejas y buen acolchado.'
+  },
+  {
+    id: 'trained_rice',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a rice plant leaf (Oryza sativa)',
+    name_es: 'Arroz',
+    scientific_name: 'Oryza sativa',
+    wiki_query: 'Oryza_sativa',
+    light: 'Pleno sol directo.',
+    water: 'Alta demanda hídrica con lámina de agua controlada o humedad continua.',
+    soil_temp: 'Suelo arcilloso/franco retentivo; clima cálido (22-32°C).',
+    care: 'Pleno sol, manejo controlado de agua y fertilización fraccionada con N-K-Si.'
+  },
+  {
+    id: 'trained_soybean',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a soybean plant trifoliate leaf (Glycine max)',
+    name_es: 'Soya / Soja',
+    scientific_name: 'Glycine max',
+    wiki_query: 'Glycine_max',
+    light: 'Pleno sol directo.',
+    water: 'Riego moderado, crítico en floración y llenado de vainas.',
+    soil_temp: 'Suelo franco bien drenado (pH 6.0-6.8) inoculado con Bradyrhizobium.',
+    care: 'Pleno sol, rotación de cultivos y vigilancia fitosanitaria en llenado de grano.'
+  },
+  {
+    id: 'trained_squash',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a squash or pumpkin plant leaf (Cucurbita)',
+    name_es: 'Calabaza / Zapallo',
+    scientific_name: 'Cucurbita pepo / Cucurbita maxima',
+    wiki_query: 'Cucurbita',
+    light: 'Pleno sol directo.',
+    water: 'Riego abundante en la base evitando mojar el follaje por la tarde.',
+    soil_temp: 'Suelo fértil rico en compost, clima cálido (20-30°C).',
+    care: 'Pleno sol, riego basal y prevención de oídio en hojas maduras.'
+  },
+  {
+    id: 'trained_strawberry',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a strawberry plant leaf (Fragaria ananassa)',
+    name_es: 'Fresa / Frutilla',
+    scientific_name: 'Fragaria × ananassa',
+    wiki_query: 'Fragaria',
+    light: 'Pleno sol (mínimo 6 horas) para buena floración y dulzor.',
+    water: 'Riego frecuente por goteo sin mojar frutos ni corona.',
+    soil_temp: 'Sustrato suelto ácido-neutro (pH 5.5-6.5) con acolchado.',
+    care: 'Riego por goteo, acolchado limpio y retiro periódico de hojas secas.'
+  },
+  {
+    id: 'trained_sugarcane',
+    in_dataset: true,
+    prompt_en: 'a close-up photo of a sugarcane plant leaf (Saccharum officinarum)',
+    name_es: 'Caña de Azúcar',
+    scientific_name: 'Saccharum officinarum',
+    wiki_query: 'Saccharum_officinarum',
+    light: 'Pleno sol tropical/subtropical intenso.',
+    water: 'Riego abundante en fase de macollamiento y elongación, con buen drenaje.',
+    soil_temp: 'Suelo profundo y fértil; clima cálido (24-34°C).',
+    care: 'Pleno sol, semilla certificada libre de virus/hongos y drenaje en surcos.'
   },
   {
     id: 'columnar_cactus',
@@ -436,10 +988,10 @@ const BOTANICAL_CATALOG: BotanicalEntry[] = [
   },
   {
     id: 'citrus_lemon',
-    in_dataset: false,
+    in_dataset: true,
     prompt_en: 'a citrus lemon, lime or orange tree leaf (Citrus) oval glossy dark green',
-    name_es: 'Cítrico: Limonero / Naranjo',
-    scientific_name: 'Citrus limon / Citrus sinensis',
+    name_es: 'Cítrico: Naranjo / Limonero',
+    scientific_name: 'Citrus sinensis / Citrus limon',
     wiki_query: 'Citrus',
     light: 'Pleno sol directo (6 a 8 horas diarias).',
     water: 'Riegos profundos 2-3 veces por semana en verano; evitar sequía en floración.',
@@ -448,7 +1000,7 @@ const BOTANICAL_CATALOG: BotanicalEntry[] = [
   },
   {
     id: 'corn_maize',
-    in_dataset: false,
+    in_dataset: true,
     prompt_en: 'a corn or maize plant leaf (Zea mays) long lance-shaped green leaf',
     name_es: 'Maíz / Elote',
     scientific_name: 'Zea mays',
@@ -507,10 +1059,14 @@ const VISUAL_HEALTH_PROMPTS = [
   }
 ]
 
-const EMPTY_BACKGROUND_PROMPTS = [
-  'an empty room wall, ceiling, furniture or human face with zero plants',
-  'a dark plain empty background with no vegetation'
-]
+const NON_PLANT_LABELS = NON_PLANT_PROMPTS
+
+interface DetectionResultMeta {
+  boxes: DetectedPlantBox[]
+  hasAiPlantBox: boolean
+  hasNonPlantBox: boolean
+  nonPlantLabel: string | null
+}
 
 type ZeroShotPipeline = (
   image: string | RawImage,
@@ -548,9 +1104,22 @@ class BrowserAgroVisionEngine {
   private detCanvas: HTMLCanvasElement | null = null
   private cropCanvas: HTMLCanvasElement | null = null
   private cachedDetections: DetectedPlantBox[] = []
+  private cachedDetMeta: { hasAiPlantBox: boolean; hasNonPlantBox: boolean; nonPlantLabel: string | null } = {
+    hasAiPlantBox: false,
+    hasNonPlantBox: false,
+    nonPlantLabel: null
+  }
   private lastDetTime = 0
   private lastClipTime = 0
-  private lastClipResult: { scoreByLabel: Map<string, number> } | null = null
+  private lastClipResult: { speciesScores: Map<string, number>; healthScores: Map<string, number> } | null = null
+
+  public resetRealtimeCache(): void {
+    this.cachedDetections = []
+    this.cachedDetMeta = { hasAiPlantBox: false, hasNonPlantBox: false, nonPlantLabel: null }
+    this.lastDetTime = 0
+    this.lastClipTime = 0
+    this.lastClipResult = null
+  }
 
   private wikiCache = new Map<string, string>()
   private pendingWiki = new Set<string>()
@@ -661,7 +1230,8 @@ class BrowserAgroVisionEngine {
         const modelId = 'Xenova/clip-vit-base-patch32'
         this.clipAllLabels = [
           ...BOTANICAL_CATALOG.map(b => b.prompt_en),
-          ...EMPTY_BACKGROUND_PROMPTS,
+          GENERIC_PLANT_ANCHOR_PROMPT,
+          ...NON_PLANT_LABELS,
           ...VISUAL_HEALTH_PROMPTS.map(h => h.prompt_en)
         ]
 
@@ -906,14 +1476,24 @@ class BrowserAgroVisionEngine {
 
   private async detectPlantsInBrowser(
     sourceCanvas: HTMLCanvasElement,
-    realTimeTick = false
-  ): Promise<DetectedPlantBox[]> {
+    realTimeTick = false,
+    forceRefresh = false
+  ): Promise<DetectionResultMeta> {
     const now = performance.now()
-    if (realTimeTick && this.cachedDetections.length > 0 && now - this.lastDetTime < 2400) {
-      return this.cachedDetections
+    if (!forceRefresh && realTimeTick && this.lastDetTime > 0 && now - this.lastDetTime < 2200) {
+      return {
+        boxes: this.cachedDetections,
+        ...this.cachedDetMeta
+      }
     }
     if (!this.detectorPipe) {
-      return this.detectGreenCanopyFallbackBox(sourceCanvas)
+      const fb = this.detectGreenCanopyFallbackBox(sourceCanvas)
+      return {
+        boxes: fb,
+        hasAiPlantBox: false,
+        hasNonPlantBox: false,
+        nonPlantLabel: null
+      }
     }
 
     try {
@@ -929,19 +1509,13 @@ class BrowserAgroVisionEngine {
       }
       this.detCanvas.width = dw
       this.detCanvas.height = dh
-      this.detCanvas.getContext('2d')?.drawImage(sourceCanvas, 0, 0, dw, dh)
+      const detCtx = this.detCanvas.getContext('2d', { willReadFrequently: true })
+      detCtx?.drawImage(sourceCanvas, 0, 0, dw, dh)
 
       const rawImg = RawImage.fromCanvas(this.detCanvas)
-      const detections = await this.detectorPipe(rawImg, { threshold: 0.25, percentage: true })
+      const detections = await this.detectorPipe(rawImg, { threshold: 0.32, percentage: true })
 
-      const plantKeywords = new Set([
-        'potted plant',
-        'vase',
-        'apple',
-        'orange',
-        'broccoli',
-        'carrot'
-      ])
+      const plantKeywords = new Set(['potted plant', 'broccoli'])
 
       const rawBoxes: Array<{
         x: number
@@ -952,35 +1526,69 @@ class BrowserAgroVisionEngine {
         score: number
       }> = []
 
+      let bestNonPlant: { label: string; score: number } | null = null
+
       for (const d of detections) {
+        if (NON_PLANT_DETECTOR_LABELS.has(d.label) && d.score >= 0.35) {
+          if (!bestNonPlant || d.score > bestNonPlant.score) {
+            bestNonPlant = { label: d.label, score: d.score }
+          }
+        }
         if (!plantKeywords.has(d.label)) continue
-        let xmin = Math.max(0.01, Math.min(0.99, d.box.xmin))
-        let ymin = Math.max(0.01, Math.min(0.99, d.box.ymin))
-        let xmax = Math.max(xmin + 0.03, Math.min(0.99, d.box.xmax))
-        let ymax = Math.max(ymin + 0.03, Math.min(0.99, d.box.ymax))
+        const xmin = Math.max(0.01, Math.min(0.99, d.box.xmin))
+        const ymin = Math.max(0.01, Math.min(0.99, d.box.ymin))
+        const xmax = Math.max(xmin + 0.03, Math.min(0.99, d.box.xmax))
+        const ymax = Math.max(ymin + 0.03, Math.min(0.99, d.box.ymax))
         const bw = xmax - xmin
         const bh = ymax - ymin
         if (bw * bh > 0.9 || bw < 0.04 || bh < 0.04) continue
 
-        // Si solo detectó la maceta ('vase'), expandir hacia arriba para abarcar el cactus/planta
-        if (d.label === 'vase') {
-          ymin = Math.max(0.01, ymin - bh * 0.8)
+        // Descartar cajas fantasma sobre paredes planas sin textura ni vegetación real
+        if (detCtx) {
+          const rx = Math.max(0, Math.floor(xmin * dw))
+          const ry = Math.max(0, Math.floor(ymin * dh))
+          const rw = Math.max(4, Math.min(dw - rx, Math.ceil(bw * dw)))
+          const rh = Math.max(4, Math.min(dh - ry, Math.ceil(bh * dh)))
+          const boxData = detCtx.getImageData(rx, ry, rw, rh).data
+          const boxVegRatio = computeVegetationRatioFromRgba(boxData)
+          const pxTotal = rw * rh
+          let sumLum = 0
+          let sumLumSq = 0
+          for (let i = 0; i < pxTotal; i++) {
+            const p = i * 4
+            const lum = 0.299 * boxData[p] + 0.587 * boxData[p + 1] + 0.114 * boxData[p + 2]
+            sumLum += lum
+            sumLumSq += lum * lum
+          }
+          const meanLum = sumLum / Math.max(1, pxTotal)
+          const lumStd = Math.sqrt(Math.max(0, sumLumSq / Math.max(1, pxTotal) - meanLum * meanLum))
+          if (boxVegRatio < 0.012 && lumStd < 14) {
+            continue
+          }
         }
+
         rawBoxes.push({
           x: xmin,
           y: ymin,
-          width: xmax - xmin,
-          height: ymax - ymin,
-          label: d.label === 'vase' ? 'potted plant' : d.label,
+          width: bw,
+          height: bh,
+          label: d.label,
           score: d.score
         })
       }
 
       if (rawBoxes.length === 0) {
-        const fb = this.detectGreenCanopyFallbackBox(sourceCanvas)
+        // Si el detector identificó claramente un objeto no vegetal sin ninguna planta, evitar falso recuadro por color verde
+        const fb = bestNonPlant ? [] : this.detectGreenCanopyFallbackBox(sourceCanvas)
+        const meta = {
+          hasAiPlantBox: false,
+          hasNonPlantBox: bestNonPlant !== null,
+          nonPlantLabel: bestNonPlant?.label ?? null
+        }
         this.cachedDetections = fb
+        this.cachedDetMeta = meta
         this.lastDetTime = performance.now()
-        return fb
+        return { boxes: fb, ...meta }
       }
 
       // Fusionar cajas que pertenecen a la misma maceta/planta
@@ -1029,11 +1637,17 @@ class BrowserAgroVisionEngine {
           height: Number(Math.max(0.08, c.height * 0.66).toFixed(4))
         }
       }))
+      const meta = {
+        hasAiPlantBox: true,
+        hasNonPlantBox: bestNonPlant !== null,
+        nonPlantLabel: bestNonPlant?.label ?? null
+      }
       this.cachedDetections = finalBoxes
+      this.cachedDetMeta = meta
       this.lastDetTime = performance.now()
-      return finalBoxes
+      return { boxes: finalBoxes, ...meta }
     } catch {
-      return this.cachedDetections
+      return { boxes: this.cachedDetections, ...this.cachedDetMeta }
     }
   }
 
@@ -1124,7 +1738,7 @@ class BrowserAgroVisionEngine {
         for (let j = 0; j < dim; j++) normSq += embed.data[j] * embed.data[j]
         const invNorm = 1.0 / Math.max(1e-8, Math.sqrt(normSq))
 
-        const nSpeciesBg = BOTANICAL_CATALOG.length + EMPTY_BACKGROUND_PROMPTS.length
+        const nSpeciesBg = BOTANICAL_CATALOG.length + 1 + NON_PLANT_LABELS.length
         const speciesLogits = new Array<number>(nSpeciesBg)
         for (let i = 0; i < nSpeciesBg; i++) {
           const tv = this.clipTextEmbeds[i]
@@ -1160,7 +1774,11 @@ class BrowserAgroVisionEngine {
     }
 
     if (this.clipPipe) {
-      const allLabels = [...BOTANICAL_CATALOG.map(b => b.prompt_en), ...EMPTY_BACKGROUND_PROMPTS]
+      const allLabels = [
+        ...BOTANICAL_CATALOG.map(b => b.prompt_en),
+        GENERIC_PLANT_ANCHOR_PROMPT,
+        ...NON_PLANT_LABELS
+      ]
       const clipResults = await this.clipPipe(rawCrop, allLabels)
       const speciesScores = new Map<string, number>()
       for (const item of clipResults) speciesScores.set(item.label, item.score)
@@ -1184,6 +1802,7 @@ class BrowserAgroVisionEngine {
       cropBox?: { x: number; y: number; width: number; height: number } | null
       detectPlants?: boolean
       forceLens?: boolean
+      forceRefresh?: boolean
       realTimeTick?: boolean
       ndviMean?: number
       tempMeanC?: number
@@ -1192,9 +1811,12 @@ class BrowserAgroVisionEngine {
     } = {}
   ): Promise<AgroVisionAnalysis> {
     const t0 = performance.now()
+    if (options.forceRefresh) {
+      this.resetRealtimeCache()
+    }
     // Prioridad 1: cargar ONNX inmediatamente (~15-35 ms por inferencia), sin bloquear esperando a YOLOS/CLIP
     await this.ensureOnnxLoaded()
-    if (!options.realTimeTick) {
+    if (!options.realTimeTick || options.forceRefresh) {
       void this.ensureClipLoaded()
       if (options.detectPlants !== false) void this.ensureDetectorLoaded()
     }
@@ -1202,17 +1824,21 @@ class BrowserAgroVisionEngine {
     const w = sourceCanvas.width || 720
     const h = sourceCanvas.height || 540
 
-    const detectedPlants =
+    const detMeta: DetectionResultMeta =
       options.detectPlants !== false
-        ? await this.detectPlantsInBrowser(sourceCanvas, Boolean(options.realTimeTick))
-        : []
+        ? await this.detectPlantsInBrowser(
+            sourceCanvas,
+            Boolean(options.realTimeTick),
+            Boolean(options.forceRefresh)
+          )
+        : { boxes: [], hasAiPlantBox: false, hasNonPlantBox: false, nonPlantLabel: null }
+    let detectedPlants = detMeta.boxes
 
     let activePlantId = options.selectedPlantId ?? (detectedPlants[0]?.id ?? 1)
     let cropX = 0
     let cropY = 0
     let cropW = w
     let cropH = h
-    let detHint: string | null = null
 
     if (options.cropBox) {
       cropX = Math.max(0, Math.floor(options.cropBox.x * w))
@@ -1222,7 +1848,6 @@ class BrowserAgroVisionEngine {
     } else if (detectedPlants.length > 0) {
       const chosen = detectedPlants.find(p => p.id === activePlantId) || detectedPlants[0]
       activePlantId = chosen.id
-      detHint = chosen.label
       const fb = chosen.foliage_box || chosen
       cropX = Math.max(0, Math.floor(fb.x * w))
       cropY = Math.max(0, Math.floor(fb.y * h))
@@ -1235,7 +1860,7 @@ class BrowserAgroVisionEngine {
     }
     this.cropCanvas.width = Math.min(320, Math.max(64, cropW))
     this.cropCanvas.height = Math.min(320, Math.max(64, cropH))
-    const cctx = this.cropCanvas.getContext('2d')!
+    const cctx = this.cropCanvas.getContext('2d', { willReadFrequently: true })!
     cctx.drawImage(
       sourceCanvas,
       cropX,
@@ -1248,40 +1873,38 @@ class BrowserAgroVisionEngine {
       this.cropCanvas.height
     )
 
+    const cropImageData = cctx.getImageData(0, 0, this.cropCanvas.width, this.cropCanvas.height)
+    const vegetationRatio = computeVegetationRatioFromRgba(cropImageData.data)
+
     // 1. Ejecutar clasificador entrenado EfficientNet-B2 ONNX
     const { topK, maxProb, entropy } = await this.runOnnxClassifier(this.cropCanvas)
-    const bestCls = topK[0]?.class_name || 'Tomato_healthy'
+    const bestCls = topK[0]?.class_name || 'Tomato___healthy'
     const bestConf = topK[0]?.confidence || 0.85
     const agroInfo = this.getAgronomicInfo(bestCls)
 
     let detectionMode: 'IN_DATASET' | 'OUT_OF_DATASET' | 'NO_PLANT' = 'IN_DATASET'
     let lensPayload: AgroVisionLensInfo | null = null
+    let nonPlantReasonLabel: string | undefined
 
     const clipAvailable = Boolean(this.clipVisionModel || this.clipPipe)
-    const skipClipThisTick =
-      Boolean(options.realTimeTick) && !options.forceLens && maxProb >= 0.88 && entropy < 0.22
 
-    // 2. Ejecutar PlantLens CLIP Zero-Shot con embeddings de texto cacheados (1 sola pasada de visión)
-    if (clipAvailable && !skipClipThisTick) {
+    // 2. Ejecutar PlantLens CLIP Zero-Shot con caché ligera en tiempo real (sin saltar verificación de objetos no vegetales)
+    if (clipAvailable) {
       const nowMs = performance.now()
       let clipOut: { speciesScores: Map<string, number>; healthScores: Map<string, number> } | null = null
       if (
         options.realTimeTick &&
+        !options.forceRefresh &&
         !options.forceLens &&
         this.lastClipResult &&
-        nowMs - this.lastClipTime < 1500
+        nowMs - this.lastClipTime < 1100
       ) {
-        clipOut = {
-          speciesScores: this.lastClipResult.scoreByLabel,
-          healthScores: this.lastClipResult.scoreByLabel
-        }
+        clipOut = this.lastClipResult
       } else {
         const rawCrop = RawImage.fromCanvas(this.cropCanvas)
         clipOut = await this.runClipFast(rawCrop)
         if (clipOut) {
-          const merged = new Map<string, number>(clipOut.speciesScores)
-          clipOut.healthScores.forEach((v, k) => merged.set(k, v))
-          this.lastClipResult = { scoreByLabel: merged }
+          this.lastClipResult = clipOut
           this.lastClipTime = performance.now()
         }
       }
@@ -1289,32 +1912,45 @@ class BrowserAgroVisionEngine {
       if (clipOut) {
         const { speciesScores: scoreByLabel, healthScores: healthMap } = clipOut
 
-        const emptyScore = EMPTY_BACKGROUND_PROMPTS.reduce(
-          (acc, lbl) => acc + (scoreByLabel.get(lbl) ?? 0),
-          0
-        )
+        const nonPlantScores = NON_PLANT_LABELS.map(lbl => scoreByLabel.get(lbl) ?? 0)
+        const maxNonPlantScore = Math.max(0, ...nonPlantScores)
+        const totalNonPlantProb = nonPlantScores.reduce((acc, val) => acc + val, 0)
+
         const plantScores = BOTANICAL_CATALOG.map(b => ({
           entry: b,
           score: scoreByLabel.get(b.prompt_en) ?? 0
         }))
-        const totalPlantScore = plantScores.reduce((a, b) => a + b.score, 0)
+        const anchorScore = scoreByLabel.get(GENERIC_PLANT_ANCHOR_PROMPT) ?? 0
+        const maxPlantScore = Math.max(anchorScore, ...plantScores.map(p => p.score))
+        const totalPlantScore = anchorScore + plantScores.reduce((a, b) => a + b.score, 0)
 
-        if (
-          !options.forceLens &&
-          detHint === null &&
-          detectedPlants.length === 0 &&
-          emptyScore > 0.72 &&
-          totalPlantScore < 0.28
-        ) {
+        const presence = evaluatePlantPresence({
+          clipReady: true,
+          forceLens: options.forceLens,
+          maxPlantScore,
+          maxNonPlantScore,
+          totalPlantProb: totalPlantScore,
+          totalNonPlantProb,
+          hasAiPlantBox: detMeta.hasAiPlantBox,
+          hasNonPlantDetectorBox: detMeta.hasNonPlantBox,
+          nonPlantDetectorLabel: detMeta.nonPlantLabel,
+          vegetationRatio,
+          onnxMaxProb: maxProb,
+          onnxEntropy: entropy
+        })
+
+        if (!presence.isPlant) {
           detectionMode = 'NO_PLANT'
+          nonPlantReasonLabel = presence.detectedNonPlantLabel
         } else {
           plantScores.sort((a, b) => b.score - a.score)
+          const catalogTotal = plantScores.reduce((a, b) => a + b.score, 0)
           let bestPlant = plantScores[0].entry
-          let bestPlantScore = plantScores[0].score / Math.max(totalPlantScore, 1e-6)
+          let bestPlantScore = plantScores[0].score / Math.max(catalogTotal, 1e-6)
 
           const inDatasetClipProb = plantScores
             .filter(p => p.entry.in_dataset)
-            .reduce((a, b) => a + b.score / Math.max(totalPlantScore, 1e-6), 0)
+            .reduce((a, b) => a + b.score / Math.max(catalogTotal, 1e-6), 0)
 
           const isUntrained = !bestPlant.in_dataset && inDatasetClipProb < 0.45
           const isLowCertainty = maxProb < 0.80 || entropy > 0.36
@@ -1322,9 +1958,9 @@ class BrowserAgroVisionEngine {
           if (options.forceLens || isUntrained || isLowCertainty) {
             if (bestPlant.in_dataset && !options.forceLens && isLowCertainty) {
               const bestOut = plantScores.find(p => !p.entry.in_dataset)
-              if (bestOut && bestOut.score / Math.max(totalPlantScore, 1e-6) > 0.1) {
+              if (bestOut && bestOut.score / Math.max(catalogTotal, 1e-6) > 0.1) {
                 bestPlant = bestOut.entry
-                bestPlantScore = bestOut.score / Math.max(totalPlantScore, 1e-6)
+                bestPlantScore = bestOut.score / Math.max(catalogTotal, 1e-6)
               }
             }
 
@@ -1359,22 +1995,38 @@ class BrowserAgroVisionEngine {
           }
         }
       }
-    } else if (maxProb < 0.72 || entropy > 0.42) {
-      detectionMode = 'OUT_OF_DATASET'
-      lensPayload = {
-        plant_name: 'Especie Botánica Externa al Dataset',
-        scientific_name: 'Plantae spp.',
-        confidence_pct: Number(((1 - entropy) * 100).toFixed(1)),
-        light: 'Luz natural abundante o semisombra luminosa.',
-        water: 'Riego moderado cuando la capa superficial del sustrato esté seca.',
-        soil_temp: 'Sustrato fértil con buen drenaje; 18-26°C.',
-        care: 'Luz natural acorde a la especie, riego moderado y buen drenaje.',
-        wiki_summary: 'Especie fuera de las 15 clases agrícolas entrenadas (Tomate, Papa y Pimiento).',
-        visual_health_status: 'REQUIERE INSPECCIÓN VISUAL',
-        visual_severity: 'DESCONOCIDA',
-        visual_diagnosis_es: 'Especie fuera del catálogo de enfermedades entrenado',
-        visual_action_es: 'Verificar coloración foliar, humedad de sustrato y ausencia de manchas.',
-        source: 'AgroVision ONNX OOD Detector'
+    } else {
+      const presence = evaluatePlantPresence({
+        clipReady: false,
+        forceLens: options.forceLens,
+        hasAiPlantBox: detMeta.hasAiPlantBox,
+        hasNonPlantDetectorBox: detMeta.hasNonPlantBox,
+        nonPlantDetectorLabel: detMeta.nonPlantLabel,
+        vegetationRatio,
+        onnxMaxProb: maxProb,
+        onnxEntropy: entropy
+      })
+
+      if (!presence.isPlant) {
+        detectionMode = 'NO_PLANT'
+        nonPlantReasonLabel = presence.detectedNonPlantLabel
+      } else if (maxProb < 0.72 || entropy > 0.42) {
+        detectionMode = 'OUT_OF_DATASET'
+        lensPayload = {
+          plant_name: 'Especie Botánica Externa al Dataset',
+          scientific_name: 'Plantae spp.',
+          confidence_pct: Number(((1 - entropy) * 100).toFixed(1)),
+          light: 'Luz natural abundante o semisombra luminosa.',
+          water: 'Riego moderado cuando la capa superficial del sustrato esté seca.',
+          soil_temp: 'Sustrato fértil con buen drenaje; 18-26°C.',
+          care: 'Luz natural acorde a la especie, riego moderado y buen drenaje.',
+          wiki_summary: 'Especie fuera de las 60 clases agrícolas entrenadas (18 cultivos).',
+          visual_health_status: 'REQUIERE INSPECCIÓN VISUAL',
+          visual_severity: 'DESCONOCIDA',
+          visual_diagnosis_es: 'Especie fuera del catálogo de enfermedades entrenado',
+          visual_action_es: 'Verificar coloración foliar, humedad de sustrato y ausencia de manchas.',
+          source: 'AgroVision ONNX OOD Detector'
+        }
       }
     }
 
@@ -1382,25 +2034,30 @@ class BrowserAgroVisionEngine {
     const fpsEquiv = Number((1000 / Math.max(elapsedMs, 1)).toFixed(1))
 
     if (detectionMode === 'NO_PLANT') {
+      detectedPlants = []
+      const labelEs = translateNonPlantLabelEs(nonPlantReasonLabel)
       return {
         detection_mode: 'NO_PLANT',
         in_trained_dataset: false,
-        disease: 'Sin_Planta_Detectada',
+        disease: 'Objeto_No_Vegetal',
         confidence: 0,
-        health_status: 'SIN PLANTA EN CUADRO',
-        crop: 'Ninguna planta detectada',
-        disease_es: 'Enfoque una o varias plantas frente a la cámara',
-        cause: 'No se detectó tejido vegetal claro en la región seleccionada.',
-        recommendation: 'Coloca una planta dentro del cuadro o selecciona un área manualmente.',
+        health_status: 'OBJETO NO VEGETAL',
+        crop: 'No es una planta',
+        disease_es: 'El objeto captado no corresponde a una planta ni tejido vegetal',
+        cause: nonPlantReasonLabel
+          ? `Se discriminó un objeto ajeno al análisis agrícola (${labelEs}) en el área de la cámara.`
+          : 'No se detectó una planta real ni tejido foliar suficiente en el cuadro.',
+        recommendation:
+          'Enfoca directamente una planta, hoja o cultivo y presiona "Volver a analizar plantas" para actualizar el diagnóstico.',
         severity: 'N/A',
         top_k: topK,
-        detected_plants: detectedPlants,
-        selected_plant_id: activePlantId,
+        detected_plants: [],
+        selected_plant_id: 0,
         lens: null,
         inference_time_ms: Number(elapsedMs.toFixed(1)),
         fps_equivalent: fpsEquiv,
         engine_mode: 'browser-onnx+plantlens',
-        ndvi_mean: options.ndviMean ?? 0.5,
+        ndvi_mean: options.ndviMean ?? 0.12,
         temp_mean_c: options.tempMeanC ?? 25,
         cwsi: options.cwsi ?? 0.25,
         plant_coverage_percent: options.plantCoveragePercent ?? 0
@@ -1441,7 +2098,7 @@ class BrowserAgroVisionEngine {
       health_status: agroInfo.estado_salud,
       crop: agroInfo.cultivo,
       disease_es: agroInfo.enfermedad_es,
-      cause: `Agente causal: ${agroInfo.agente_causal}. Clasificado en navegador con EfficientNet-B2 ONNX (99.61% acc).`,
+      cause: `Agente causal: ${agroInfo.agente_causal}. Clasificado en navegador con EfficientNet-B2 ONNX (99.67% acc, 60 clases).`,
       recommendation: agroInfo.recomendacion,
       severity: agroInfo.severidad,
       top_k: topK,

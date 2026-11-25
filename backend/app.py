@@ -367,7 +367,7 @@ def analyze_agrovision(
     """
     Endpoint principal de AgroVision AI + PlantLens para el apartado de Diagnóstico de AgronIA.
     Devuelve:
-    - Diagnóstico fitosanitario del modelo EfficientNet-B2 ONNX (99.61% acc)
+    - Diagnóstico fitosanitario del modelo EfficientNet-B2 ONNX (99.67% acc, 60 clases)
     - Áreas detectadas de múltiples plantas en la escena (YOLO-World)
     - Identificación botánica + salud visual + cuidados (Luz, Riego, Sustrato) para plantas fuera del dataset
     - Métricas multiespectrales (NDVI, Temperatura, CWSI, Cobertura)

@@ -114,6 +114,13 @@ export interface MultispectralFrameAnalysis {
   presetComparison: PresetComparisonItem[]
 }
 
+export interface PlantRegionRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
 export interface ProcessFrameOptions {
   spectrumMode: SpectrumMode
   preset: SimulationPresetId
@@ -130,6 +137,8 @@ export interface ProcessFrameOptions {
   pointerNorm: { x: number; y: number } | null
   timeSec: number
   plantLabelHud?: string
+  plantRegions?: PlantRegionRect[]
+  suppressPlantMask?: boolean
 }
 
 export const SIMULATION_PRESETS: Record<SimulationPresetId, SimulationPresetConfig> = {
@@ -620,36 +629,85 @@ export function drawSyntheticPlantSpecimen(
   })
 }
 
+export interface PlantMaskBuildResult {
+  mask: Uint8Array
+  plantPixelCount: number
+  boxPixelCount: number
+  minX: number
+  minY: number
+  maxX: number
+  maxY: number
+  sumX: number
+  sumY: number
+}
+
 /**
- * Core real-time segmentation + multispectral simulation & rendering pipeline
+ * Construye la máscara binaria de píxeles pertenecientes exclusivamente a la(s) planta(s),
+ * restringiendo la simulación espectral de presets solo al área foliar o a `plantRegions`.
  */
-export function processMultispectralFrame(
-  source: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | null,
-  targetCanvas: HTMLCanvasElement,
-  options: ProcessFrameOptions
-): MultispectralFrameAnalysis {
-  ensureBuffers()
-
-  const sCtx = offscreenSourceCtx!
-  const w = ANALYSIS_WIDTH
-  const h = ANALYSIS_HEIGHT
-
-  if (options.detectionMode === 'synthetic_plant' || !source) {
-    drawSyntheticPlantSpecimen(sCtx, w, h, options.timeSec)
-  } else {
-    sCtx.drawImage(source, 0, 0, w, h)
+export function buildPlantMaskFromRgba(
+  srcData: Uint8ClampedArray,
+  w: number,
+  h: number,
+  options: {
+    sensitivity: number
+    detectionMode: DetectionMode
+    plantRegions?: PlantRegionRect[]
+    suppressPlantMask?: boolean
+  }
+): PlantMaskBuildResult {
+  const total = w * h
+  const emptyResult: PlantMaskBuildResult = {
+    mask: new Uint8Array(total),
+    plantPixelCount: 0,
+    boxPixelCount: 0,
+    minX: w,
+    minY: h,
+    maxX: 0,
+    maxY: 0,
+    sumX: 0,
+    sumY: 0
   }
 
-  const srcImageData = sCtx.getImageData(0, 0, w, h)
-  const srcData = srcImageData.data
+  if (options.suppressPlantMask || w < 3 || h < 3 || srcData.length < total * 4) {
+    return emptyResult
+  }
 
-  // Step 1: Segment the whole plant area
-  const rawMask = new Uint8Array(w * h)
+  const validRegions = (options.plantRegions ?? []).filter(
+    r => r.width > 0.01 && r.height > 0.01
+  )
+  const hasExplicitRegions = validRegions.length > 0
+
+  let regionMask: Uint8Array | null = null
+  let totalRegionArea = 0
+  if (hasExplicitRegions) {
+    regionMask = new Uint8Array(total)
+    for (const reg of validRegions) {
+      const rx1 = clamp(Math.floor(reg.x * w), 0, w - 1)
+      const ry1 = clamp(Math.floor(reg.y * h), 0, h - 1)
+      const rx2 = clamp(Math.ceil((reg.x + reg.width) * w), rx1 + 1, w)
+      const ry2 = clamp(Math.ceil((reg.y + reg.height) * h), ry1 + 1, h)
+      for (let y = ry1; y < ry2; y++) {
+        const row = y * w
+        for (let x = rx1; x < rx2; x++) {
+          if (regionMask[row + x] === 0) {
+            regionMask[row + x] = 1
+            totalRegionArea++
+          }
+        }
+      }
+    }
+  }
+
+  // Step 1: Classify foliar pixels strictly inside allowed plant regions (if provided)
+  const rawMask = new Uint8Array(total)
   const thresholdShift = (0.5 - options.sensitivity) * 0.22
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const idx = y * w + x
+      if (regionMask && regionMask[idx] === 0) continue
+
       const p = idx * 4
       const r = srcData[p] / 255
       const g = srcData[p + 1] / 255
@@ -661,11 +719,9 @@ export function processMultispectralFrame(
       const lum = 0.299 * r + 0.587 * g + 0.114 * b
       const sat = maxC === 0 ? 0 : delta / maxC
 
-      // Excess Green (ExG) & VARI
       const exg = 2 * g - r - b
       const vari = (g - r) / (g + r - b + 0.001)
 
-      // Hue in degrees (0..360)
       let hue = 0
       if (delta > 0.0001) {
         if (maxC === g) {
@@ -678,21 +734,21 @@ export function processMultispectralFrame(
         if (hue < 0) hue += 360
       }
 
-      // Plant color criteria:
-      // 1) Green foliage (hue 55..170)
-      // 2) Chlorotic yellow-green / autumn leaf tissue (hue 28..55 with moderate saturation)
+      // Excluir paredes beige / tonos piel humana (hue < 44 o baja saturación/verdor)
       const isGreenVegetation =
-        (exg > 0.045 + thresholdShift || vari > 0.02 + thresholdShift) &&
+        (exg > 0.05 + thresholdShift || (vari > 0.03 + thresholdShift && g > r + 0.015)) &&
+        g > b + 0.015 &&
         lum > 0.05 &&
-        lum < 0.96 &&
-        sat > 0.08
+        lum < 0.95 &&
+        sat > 0.1
       const isChloroticLeaf =
-        hue >= 26 &&
-        hue <= 65 &&
-        sat > 0.18 &&
+        hue >= 44 &&
+        hue <= 74 &&
+        sat > 0.24 &&
         lum > 0.12 &&
-        lum < 0.90 &&
-        g >= b * 1.15
+        lum < 0.88 &&
+        g >= r * 0.92 &&
+        g >= b * 1.25
 
       if (isGreenVegetation || isChloroticLeaf) {
         rawMask[idx] = 1
@@ -700,13 +756,15 @@ export function processMultispectralFrame(
     }
   }
 
-  // Morphological smoothing + hole filling so the whole plant area is unified
-  const mask = new Uint8Array(w * h)
+  // Morphological smoothing (neighbor >= 3 when explicit region covers small plants, else >= 4)
+  const mask = new Uint8Array(total)
+  const minNeighbors = hasExplicitRegions ? 3 : 4
   let plantPixelCount = 0
 
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const idx = y * w + x
+      if (regionMask && regionMask[idx] === 0) continue
       let neighbors = 0
       for (let dy = -1; dy <= 1; dy++) {
         const row = (y + dy) * w
@@ -714,19 +772,61 @@ export function processMultispectralFrame(
           neighbors += rawMask[row + x + dx]
         }
       }
-      if (neighbors >= 4) {
+      if (neighbors >= minNeighbors) {
         mask[idx] = 1
         plantPixelCount++
       }
     }
   }
 
-  // Fallback / Assisted Center Mode when user selects 'assisted_center' or camera sees non-green target
-  if (
-    options.detectionMode === 'assisted_center' ||
-    (plantPixelCount < w * h * 0.015 && options.sensitivity > 0.65)
-  ) {
-    // Sample central target color and segment connected foreground region
+  // Fallback confinado estrictamente dentro de `plantRegions` si el follaje no es verde (ej. cactus oscuro/suculenta)
+  if (hasExplicitRegions && totalRegionArea > 0 && plantPixelCount < totalRegionArea * 0.06) {
+    for (const reg of validRegions) {
+      const rx1 = clamp(Math.floor(reg.x * w), 1, w - 2)
+      const ry1 = clamp(Math.floor(reg.y * h), 1, h - 2)
+      const rx2 = clamp(Math.ceil((reg.x + reg.width) * w), rx1 + 2, w - 1)
+      const ry2 = clamp(Math.ceil((reg.y + reg.height) * h), ry1 + 2, h - 1)
+      const rcx = (rx1 + rx2 - 1) * 0.5
+      const rcy = (ry1 + ry2 - 1) * 0.5
+      const rhw = Math.max(1, (rx2 - rx1) * 0.44)
+      const rhh = Math.max(1, (ry2 - ry1) * 0.44)
+
+      // Muestrear fondo promedio en las 4 esquinas exteriores de la caja
+      const corners = [
+        (ry1 * w + rx1) * 4,
+        (ry1 * w + (rx2 - 1)) * 4,
+        ((ry2 - 1) * w + rx1) * 4,
+        ((ry2 - 1) * w + (rx2 - 1)) * 4
+      ]
+      let bgR = 0
+      let bgG = 0
+      let bgB = 0
+      for (const cp of corners) {
+        bgR += srcData[cp]
+        bgG += srcData[cp + 1]
+        bgB += srcData[cp + 2]
+      }
+      bgR /= 4
+      bgG /= 4
+      bgB /= 4
+
+      for (let y = ry1; y < ry2; y++) {
+        for (let x = rx1; x < rx2; x++) {
+          const el = ((x - rcx) / rhw) ** 2 + ((y - rcy) / rhh) ** 2
+          if (el > 1.0) continue
+          const idx = y * w + x
+          if (mask[idx] === 1) continue
+          const p = idx * 4
+          const distBg = Math.hypot(srcData[p] - bgR, srcData[p + 1] - bgG, srcData[p + 2] - bgB)
+          if (distBg > 18 || el < 0.42) {
+            mask[idx] = 1
+            plantPixelCount++
+          }
+        }
+      }
+    }
+  } else if (!hasExplicitRegions && options.detectionMode === 'assisted_center') {
+    // Fallback asistido únicamente cuando el usuario elige explícitamente modo 'assisted_center'
     let sumR = 0
     let sumG = 0
     let sumB = 0
@@ -771,7 +871,7 @@ export function processMultispectralFrame(
     }
   }
 
-  // Compute bounding box & center of mass around the dominant connected plant component (avoids window glare noise)
+  // Find connected components and keep only significant plant canopy regions
   let minX = w
   let minY = h
   let maxX = 0
@@ -781,24 +881,33 @@ export function processMultispectralFrame(
   let boxPixelCount = 0
 
   if (plantPixelCount > 0) {
-    const total = w * h
-    if (componentVisited.length < total) {
-      componentVisited = new Uint8Array(total)
+    const compIdMap = new Int32Array(total)
+    if (componentQueue.length < total) {
       componentQueue = new Int32Array(total)
-    } else {
-      componentVisited.fill(0, 0, total)
     }
 
-    let bestArea = 0
+    const comps: Array<{
+      id: number
+      area: number
+      cMinX: number
+      cMaxX: number
+      cMinY: number
+      cMaxY: number
+      cSumX: number
+      cSumY: number
+    }> = []
+    let nextCompId = 1
+
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const startIdx = y * w + x
-        if (mask[startIdx] !== 1 || componentVisited[startIdx] === 1) continue
+        if (mask[startIdx] !== 1 || compIdMap[startIdx] !== 0) continue
 
+        const compId = nextCompId++
         let head = 0
         let tail = 0
         componentQueue[tail++] = startIdx
-        componentVisited[startIdx] = 1
+        compIdMap[startIdx] = compId
 
         let cMinX = x
         let cMaxX = x
@@ -825,35 +934,78 @@ export function processMultispectralFrame(
               const nx = cx + dx
               if (nx < 0 || nx >= w) continue
               const nIdx = ny * w + nx
-              if (mask[nIdx] === 1 && componentVisited[nIdx] === 0) {
-                componentVisited[nIdx] = 1
+              if (mask[nIdx] === 1 && compIdMap[nIdx] === 0) {
+                compIdMap[nIdx] = compId
                 componentQueue[tail++] = nIdx
               }
             }
           }
         }
 
-        if (tail > bestArea) {
-          bestArea = tail
-          minX = cMinX
-          maxX = cMaxX
-          minY = cMinY
-          maxY = cMaxY
-          sumX = cSumX
-          sumY = cSumY
-          boxPixelCount = tail
+        comps.push({
+          id: compId,
+          area: tail,
+          cMinX,
+          cMaxX,
+          cMinY,
+          cMaxY,
+          cSumX,
+          cSumY
+        })
+      }
+    }
+
+    if (comps.length > 0) {
+      comps.sort((a, b) => b.area - a.area)
+      const best = comps[0]
+      const keepIds = new Set<number>([best.id])
+
+      if (hasExplicitRegions) {
+        // Dentro de las regiones seleccionadas, conservar hojas vecinas principales (>= 12 px o >= 15%)
+        for (const c of comps) {
+          if (c.area >= Math.max(12, best.area * 0.15)) {
+            keepIds.add(c.id)
+          }
         }
+      } else {
+        // Sin regiones explícitas, descartar ruido suelto del fondo
+        for (const c of comps) {
+          if (c.area >= Math.max(40, best.area * 0.25)) {
+            keepIds.add(c.id)
+          }
+        }
+      }
+
+      plantPixelCount = 0
+      for (let i = 0; i < total; i++) {
+        if (mask[i] === 1 && keepIds.has(compIdMap[i])) {
+          plantPixelCount++
+        } else {
+          mask[i] = 0
+        }
+      }
+
+      // Calcular caja sobre componentes conservados (o dominante sin regiones)
+      const keptComps = hasExplicitRegions ? comps.filter(c => keepIds.has(c.id)) : [best]
+      for (const c of keptComps) {
+        minX = Math.min(minX, c.cMinX)
+        maxX = Math.max(maxX, c.cMaxX)
+        minY = Math.min(minY, c.cMinY)
+        maxY = Math.max(maxY, c.cMaxY)
+        sumX += c.cSumX
+        sumY += c.cSumY
+        boxPixelCount += c.area
       }
     }
   }
 
-  // Second pass: fill internal necrotic/pest holes inside the plant canopy bounding box
-  if (boxPixelCount > 30) {
+  // Second pass: fill internal necrotic/pest holes strictly inside the plant canopy bounding box (and regionMask)
+  if (boxPixelCount > 24) {
     for (let y = Math.max(2, minY + 1); y < Math.min(h - 2, maxY); y++) {
       for (let x = Math.max(2, minX + 1); x < Math.min(w - 2, maxX); x++) {
         const idx = y * w + x
+        if (regionMask && regionMask[idx] === 0) continue
         if (mask[idx] === 1) continue
-        // Check if surrounded in 4 cardinal directions by plant pixels within short distance
         let left = false
         let right = false
         let up = false
@@ -872,8 +1024,60 @@ export function processMultispectralFrame(
     }
   }
 
-  const plantDetected = boxPixelCount >= Math.floor(w * h * 0.008)
-  const plantCoveragePercent = Number(((plantPixelCount / (w * h)) * 100).toFixed(1))
+  return {
+    mask,
+    plantPixelCount,
+    boxPixelCount,
+    minX,
+    minY,
+    maxX,
+    maxY,
+    sumX,
+    sumY
+  }
+}
+
+/**
+ * Core real-time segmentation + multispectral simulation & rendering pipeline
+ */
+export function processMultispectralFrame(
+  source: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | null,
+  targetCanvas: HTMLCanvasElement,
+  options: ProcessFrameOptions
+): MultispectralFrameAnalysis {
+  ensureBuffers()
+
+  const sCtx = offscreenSourceCtx!
+  const w = ANALYSIS_WIDTH
+  const h = ANALYSIS_HEIGHT
+
+  if (options.detectionMode === 'synthetic_plant' || !source) {
+    drawSyntheticPlantSpecimen(sCtx, w, h, options.timeSec)
+  } else {
+    sCtx.drawImage(source, 0, 0, w, h)
+  }
+
+  const srcImageData = sCtx.getImageData(0, 0, w, h)
+  const srcData = srcImageData.data
+
+  const hasRegions = Boolean(options.plantRegions && options.plantRegions.some(r => r.width > 0.01 && r.height > 0.01))
+  const maskRes = buildPlantMaskFromRgba(srcData, w, h, {
+    sensitivity: options.sensitivity,
+    detectionMode: options.detectionMode,
+    plantRegions: options.plantRegions,
+    suppressPlantMask: options.suppressPlantMask
+  })
+
+  const mask = maskRes.mask
+  const plantPixelCount = maskRes.plantPixelCount
+  const { boxPixelCount, minX, minY, maxX, maxY, sumX, sumY } = maskRes
+
+  const plantDetected =
+    !options.suppressPlantMask &&
+    (hasRegions ? plantPixelCount >= 18 : boxPixelCount >= Math.floor(w * h * 0.008))
+  const plantCoveragePercent = plantDetected
+    ? Number(((plantPixelCount / (w * h)) * 100).toFixed(1))
+    : 0
 
   const outWidth = targetCanvas.width || 640
   const outHeight = targetCanvas.height || 480
