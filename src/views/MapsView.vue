@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, shallowRef } from 'vue'
+import { useRouter } from 'vue-router'
 import { useMainStore } from '../stores'
+import { useParcelSimulationStore } from '../stores/parcelSimulation'
 import { supabase } from '../services/supabase'
 import AgroMap from '../components/map/AgroMap.vue'
 import Card from '../components/ui/Card.vue'
@@ -12,6 +14,7 @@ import {
   CircleHelp,
   Layers3,
   MapPinned,
+  MonitorPlay,
   MousePointer2,
   Pentagon,
   Save,
@@ -21,7 +24,14 @@ import {
   Trash2,
   Upload
 } from 'lucide-vue-next'
-import { listFields, saveMapWorkspace, type FieldRecord } from '../services/agronomyData'
+import {
+  listFields,
+  saveMapWorkspace,
+  updateFieldGeojson,
+  type FieldRecord,
+  type Json
+} from '../services/agronomyData'
+import { enrichGeoJsonWithParcelMetadata, extractParcelMetadata } from '../services/fieldGeometry'
 
 interface MapFeature {
   type: 'Feature'
@@ -51,11 +61,13 @@ interface FieldOption {
 }
 
 const store = useMainStore()
+const router = useRouter()
+const parcelSimStore = useParcelSimulationStore()
 const geojsonData = ref<MapFeatureCollection | null>(null)
 const exportStatus = ref('')
 const saveError = ref('')
 const fieldName = ref('')
-const savedFields = ref<FieldRecord[]>([])
+const savedFields = shallowRef<FieldRecord[]>([])
 const isSaving = ref(false)
 const saveStatus = ref('')
 const errorMessage = ref('')
@@ -73,6 +85,14 @@ const polygonCount = computed(() =>
     feature.geometry?.type === 'Polygon' || feature.geometry?.type === 'MultiPolygon'
   ).length
 )
+const liveParcelMetadata = computed(() => {
+  if (!geojsonData.value || polygonCount.value === 0) return null
+  return extractParcelMetadata(
+    geojsonData.value as unknown as Json,
+    selectedFieldId.value || null,
+    fieldName.value.trim() || 'Parcela en edición'
+  )
+})
 const pointCount = computed(() =>
   features.value.filter(feature =>
     feature.geometry?.type === 'Point' || feature.geometry?.type === 'MultiPoint'
@@ -95,6 +115,17 @@ const handleGeoJsonUpdate = (data: MapFeatureCollection) => {
 
 const refreshFields = async () => {
   savedFields.value = await listFields()
+  parcelSimStore.setFields(savedFields.value)
+}
+
+const openInSimulation = (fieldId?: string) => {
+  const targetId = fieldId || selectedFieldId.value || parcelSimStore.activeFieldId
+  if (targetId) {
+    parcelSimStore.selectField(targetId)
+  } else if (liveParcelMetadata.value) {
+    parcelSimStore.setActiveParcelGeometry(liveParcelMetadata.value)
+  }
+  void router.push('/simulacion')
 }
 
 onMounted(() => {
@@ -109,12 +140,16 @@ const saveMap = async () => {
   exportStatus.value = ''
   saveError.value = ''
   try {
-    const geojson = JSON.parse(JSON.stringify(geojsonData.value))
-    const id = await saveMapWorkspace(fieldName.value.trim(), geojson)
+    const cleanName = fieldName.value.trim()
+    const rawGeojson = JSON.parse(JSON.stringify(geojsonData.value)) as Json
+    const enrichedGeojson = enrichGeoJsonWithParcelMetadata(rawGeojson, cleanName)
+    const id = await saveMapWorkspace(cleanName, enrichedGeojson)
+    selectedFieldId.value = id
     fieldName.value = ''
-    exportStatus.value = `Mapa guardado correctamente (campo ${id.slice(0, 8)}).`
+    exportStatus.value = `Polígono y metadatos guardados (campo ${id.slice(0, 8)}). Listo para simular.`
     try {
       await refreshFields()
+      parcelSimStore.selectField(id)
     } catch (error) {
       saveError.value = error instanceof Error
         ? `El mapa se guardó, pero no se pudo actualizar la lista: ${error.message}`
@@ -285,7 +320,24 @@ const saveMapElements = async () => {
   }
 
   if (!errorMessage.value) {
-    saveStatus.value = 'Elementos del mapa guardados en Supabase.'
+    if (selectedFieldId.value && polygonCount.value > 0 && geojsonData.value) {
+      const targetField = fields.value.find(f => f.id === selectedFieldId.value)
+      const rawGeo = JSON.parse(JSON.stringify(geojsonData.value)) as Json
+      const enriched = enrichGeoJsonWithParcelMetadata(rawGeo, targetField?.name || 'Parcela')
+      try {
+        const updated = await updateFieldGeojson(selectedFieldId.value, enriched)
+        parcelSimStore.upsertField(updated)
+        parcelSimStore.selectField(updated.id)
+        await refreshFields()
+      } catch (syncError) {
+        errorMessage.value = syncError instanceof Error
+          ? `Elementos guardados, pero no se sincronizó la geometría del campo: ${syncError.message}`
+          : 'Elementos guardados, pero no se sincronizó la geometría del campo.'
+      }
+    }
+    if (!errorMessage.value) {
+      saveStatus.value = 'Polígono, vértices y elementos guardados en Supabase.'
+    }
     await loadSavedElements()
   } else {
     geojsonData.value = {
@@ -445,6 +497,25 @@ const exportGeoJson = () => {
               <Check :size="15" class="feature-check" />
             </div>
 
+            <div v-if="liveParcelMetadata" class="mt-3 rounded-xl border border-emerald-400/20 bg-emerald-950/30 p-3 text-xs text-emerald-100 space-y-1.5">
+              <div class="flex items-center justify-between font-bold text-amber-300">
+                <span>Geometría Real Calculada</span>
+                <span>{{ liveParcelMetadata.vertexCount }} vértices</span>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-emerald-200/70">Área exacta:</span>
+                <strong>{{ liveParcelMetadata.areaHectares.toFixed(2) }} ha ({{ liveParcelMetadata.areaSquareMeters.toLocaleString('es-MX') }} m²)</strong>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-emerald-200/70">Perímetro:</span>
+                <strong>{{ liveParcelMetadata.perimeterMeters.toFixed(1) }} m</strong>
+              </div>
+              <div class="flex justify-between">
+                <span class="text-emerald-200/70">Centroide:</span>
+                <span class="font-mono text-[11px]">{{ liveParcelMetadata.centroid.lat.toFixed(5) }}, {{ liveParcelMetadata.centroid.lng.toFixed(5) }}</span>
+              </div>
+            </div>
+
             <div class="map-quick-actions">
               <Button
                 variant="outline"
@@ -474,7 +545,17 @@ const exportGeoJson = () => {
             </div>
           </div>
         </Card>
-        <p v-if="exportStatus" class="export-status" role="status"><Check :size="14" /> {{ exportStatus }}</p>
+        <p v-if="exportStatus" class="export-status" role="status">
+          <Check :size="14" />
+          <span class="flex-1">{{ exportStatus }}</span>
+          <button
+            type="button"
+            class="inline-flex items-center gap-1 rounded-md border border-emerald-400/30 bg-emerald-500/15 px-2 py-1 text-[11px] font-bold text-emerald-200 hover:bg-emerald-500/25"
+            @click="openInSimulation()"
+          >
+            <MonitorPlay :size="12" /> Simular
+          </button>
+        </p>
         <p v-if="saveError" class="export-error" role="alert">{{ saveError }}</p>
 
         <Card v-if="savedFields.length" class="map-guide-card">
@@ -494,7 +575,15 @@ const exportGeoJson = () => {
                 <strong>{{ field.name }}</strong>
                 <small>{{ new Date(field.created_at).toLocaleDateString('es-MX') }}</small>
               </span>
-              <Check :size="15" class="feature-check" />
+              <button
+                type="button"
+                class="inline-flex items-center gap-1 rounded-lg border border-amber-400/25 bg-amber-500/10 px-2.5 py-1 text-[11px] font-semibold text-amber-200 hover:bg-amber-500/20"
+                title="Abrir polígono real en el Simulador 3D"
+                @click="openInSimulation(field.id)"
+              >
+                <MonitorPlay :size="13" />
+                Simular
+              </button>
             </div>
           </div>
         </Card>

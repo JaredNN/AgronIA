@@ -118,8 +118,18 @@ onBeforeUnmount(() => {
 })
 
 const chartRecords = computed(() => [...metrics.value].slice(0, 7).reverse())
+const homeChartTooltip = {
+  confine: true,
+  appendToBody: true,
+  backgroundColor: 'rgba(15, 22, 17, 0.96)',
+  borderColor: 'rgba(196, 218, 147, 0.25)',
+  borderWidth: 1,
+  textStyle: { color: '#e8eddf', fontSize: 12 },
+  extraCssText: 'max-width: 240px; white-space: normal; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.48); z-index: 9999999;',
+}
+
 const humidityChartOptions = computed(() => ({
-  tooltip: { trigger: 'axis' },
+  tooltip: { ...homeChartTooltip, trigger: 'axis' },
   grid: { left: '3%', right: '4%', bottom: '10%', top: '10%', containLabel: true },
   xAxis: { type: 'category', data: chartRecords.value.map(row => new Date(row.record_date).toLocaleDateString('es-MX', { weekday: 'short' })), axisLine: { lineStyle: { color: '#d1fae5' } }, axisLabel: { color: '#6ee7b7' } },
   yAxis: { type: 'value', axisLabel: { color: '#6ee7b7', formatter: '{value}%' }, splitLine: { lineStyle: { color: '#064e3b30' } } },
@@ -135,7 +145,7 @@ const humidityChartOptions = computed(() => ({
 }))
 
 const pestChartOptions = computed(() => ({
-  tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+  tooltip: { ...homeChartTooltip, trigger: 'axis', axisPointer: { type: 'shadow' } },
   grid: { left: '3%', right: '4%', bottom: '10%', top: '10%', containLabel: true },
   xAxis: { type: 'category', data: chartRecords.value.map(row => new Date(row.record_date).toLocaleDateString('es-MX', { month: 'numeric', day: 'numeric' })), axisLabel: { color: '#fcd34d' } },
   yAxis: { type: 'value', axisLabel: { color: '#fcd34d', formatter: '{value}%' }, splitLine: { lineStyle: { color: '#78350f30' } } },

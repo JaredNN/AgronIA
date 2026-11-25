@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount, shallowRef } from 'vue'
+import { useRouter } from 'vue-router'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import { Cpu, Download, LocateFixed, Maximize2, Minimize2, Move, Pause, Play, Wind } from 'lucide-vue-next'
+import { BarChart3, Cpu, Download, FileJson, LocateFixed, Maximize2, Minimize2, Move, Pause, Play, RotateCw, Wind } from 'lucide-vue-next'
 import DroneConnectionPanel from '../components/simulation/DroneConnectionPanel.vue'
+import { useParcelSimulationStore } from '../stores/parcelSimulation'
+import { calculateSimulationEconomics, extractStressTimeline } from '../services/simulationEconomics'
 import {
   detectHardwareGpuModel,
   graphicsQuality,
@@ -16,23 +19,51 @@ import {
   listFields,
   saveFieldMetric,
   type FieldRecord,
+  type Json,
 } from '../services/agronomyData'
-import { projectFieldGeometry, type FieldPoint, type ProjectedField } from '../services/fieldGeometry'
+import {
+  computeHorizontalScanlineSegments,
+  computeTakeoffBaseForField,
+  DEFAULT_DEMO_PARCEL_GEOJSON,
+  extractParcelMetadata,
+  projectFieldGeometry,
+  type FieldPoint,
+  type ProjectedField,
+} from '../services/fieldGeometry'
+import {
+  advanceSimulationTick,
+  applyTreatmentAtLocation,
+  buildSimulationReport,
+  createInitialSimulatedPlants,
+  seedStressCentersInsideField,
+  STRESS_STATE_LABELS,
+} from '../services/simulationEngine'
+import { planOptimizedDroneRoute } from '../services/droneRoutePlanner'
+import type {
+  DroneFlightPlanMetrics,
+  DroneMissionType,
+  DroneRouteWaypoint,
+  ParcelGeometryMetadata,
+  PlantStressHistoryEvent,
+  SimulatedPlantNode,
+  SimulationReport,
+  StressCenter,
+} from '../types/simulation'
 
-interface PlantData {
-  id: string; x: number; z: number; health: number; ndvi: number; temp: number; status: string; stage: number
-}
-
-interface StressCenter {
-  id: string; x: number; z: number; intensity: number; radius: number; type: 'DROUGHT' | 'OVERHYDRATION' | 'PEST'
-}
+const parcelSimStore = useParcelSimulationStore()
+const router = useRouter()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const containerRef = ref<HTMLDivElement | null>(null)
 const fields = shallowRef<FieldRecord[]>([])
 const selectedFieldGeometry = shallowRef<ProjectedField | null>(null)
+const activeParcelMetadata = shallowRef<ParcelGeometryMetadata | null>(null)
 const selectedFieldId = ref('')
 const savingSnapshot = ref(false)
+const exportingToDashboard = ref(false)
+const simulationTick = ref(0)
+const currentFlightPlan = shallowRef<DroneFlightPlanMetrics | null>(null)
+const currentReport = shallowRef<SimulationReport | null>(null)
 const liveDrone = ref<{
   connected: boolean
   hasHeartbeat: boolean
@@ -69,8 +100,8 @@ let mainDirLight: THREE.DirectionalLight | null = null
 let pointerDirty = true
 
 // Datos de interacción (panel fijo de inspección en la columna izquierda)
-const hoveredPlant = ref<PlantData | null>(null)
-const lastInspectedPlant = ref<PlantData | null>(null)
+const hoveredPlant = ref<SimulatedPlantNode | null>(null)
+const lastInspectedPlant = ref<SimulatedPlantNode | null>(null)
 const inspectedPlant = computed(() => hoveredPlant.value ?? lastInspectedPlant.value)
 const hoveredSector = ref<StressCenter | null>(null)
 const actionFeedback = ref('')
@@ -86,19 +117,27 @@ const mouse = shallowRef<THREE.Vector2 | null>(null)
 const animationId = ref<number>(0)
 
 // Data arrays para InstancedMesh
-let allPlants: PlantData[] = []
+let allPlants: SimulatedPlantNode[] = []
 let leafToPlantMap: number[] = []; let tasselToPlantMap: number[] = []; let earToPlantMap: number[] = []
 
-// Instanced Meshes
-let trunkMesh: THREE.InstancedMesh, leafMesh: THREE.InstancedMesh
-let tasselMesh: THREE.InstancedMesh, earMesh: THREE.InstancedMesh, hitboxMesh: THREE.InstancedMesh
+// Instanced Meshes & Grupos por parcela
+let trunkMesh: THREE.InstancedMesh | null = null
+let leafMesh: THREE.InstancedMesh | null = null
+let tasselMesh: THREE.InstancedMesh | null = null
+let earMesh: THREE.InstancedMesh | null = null
+let hitboxMesh: THREE.InstancedMesh | null = null
 let groundMaterial: THREE.MeshLambertMaterial
+let parcelSurfaceMaterial: THREE.MeshLambertMaterial | null = null
 let cropGroup: THREE.Group | null = null
+let parcelSurfaceGroup: THREE.Group | null = null
 let parcelOutlineGroup: THREE.Group | null = null
+let furrowsGroup: THREE.Group | null = null
+let routeVisualGroup: THREE.Group | null = null
 let leafWindUniform: { value: number } | null = null
 let leafWindStrengthUniform: { value: number } | null = null
 let sectorFalloffTexture: THREE.CanvasTexture | null = null
 let simulationTime = 0
+let tickAccumulatorSec = 0
 
 // Dron y Analisis
 let stressCenters: StressCenter[] = []
@@ -114,8 +153,11 @@ let propellers: THREE.Mesh[] = []
 let sectorMarkers: THREE.Mesh[] = []
 let particleSystem: THREE.Points
 let particleGeo: THREE.BufferGeometry
-let activeTargets: StressCenter[] = []
+let activeWaypoints: DroneRouteWaypoint[] = []
+let activeMissionPlan: DroneFlightPlanMetrics | null = null
 let activeTargetIndex = 0
+let missionRecoveredCount = 0
+let missionIrreversibleCount = 0
 
 let dronePath: THREE.Vector3[] = []
 let currentPathIndex = 0
@@ -124,12 +166,10 @@ let feedbackTimeout: ReturnType<typeof setTimeout> | undefined
 // Enjambre de Centinelas
 let centinelaGroup: THREE.Group | null = null
 let centinelaPropellers: THREE.Mesh[] = []
-let centinelaFrameCounter = 0
 
 const DRONE_BASE = new THREE.Vector3(-15, 0.5, 15)
-const FLIGHT_HEIGHT = 8
-const BASE_CROP_WIDTH = 46
-const BASE_CROP_DEPTH = 44
+let FLIGHT_HEIGHT = 8
+let currentFieldFlightSpeed = 0.06
 const PARTICLE_COUNT = 500
 const particlePositions = new Float32Array(PARTICLE_COUNT * 3)
 const particleVelocities = new Float32Array(PARTICLE_COUNT * 3)
@@ -143,24 +183,50 @@ const modes = [
 // Telemetría en tiempo real derivada de la simulación
 const telemetry = ref({
   avgHealth: 0,
+  avgWaterStress: 0,
   avgHumidity: 0,
   avgPestIndex: 0,
   avgNDVI: 0,
   avgTemp: 0,
   plantCount: 0,
-  stressZones: 0
+  stressZones: 0,
+  healthyCount: 0,
+  mildCount: 0,
+  moderateCount: 0,
+  criticalCount: 0,
+  irreversibleCount: 0,
 })
 
 const fieldDimensionsLabel = computed(() => {
   const field = selectedFieldGeometry.value
   if (!field) return ''
-  return `${field.widthMeters.toFixed(1)} m × ${field.depthMeters.toFixed(1)} m · ${field.areaHectares.toFixed(2)} ha`
+  return `${field.widthMeters.toFixed(1)} m × ${field.depthMeters.toFixed(1)} m · ${field.areaHectares.toFixed(2)} ha · ${field.vertexCount} vértices`
 })
+
+const activeFieldGeojsonAndName = (): { geojson: Json; name: string; fieldId: string | null } => {
+  const field = fields.value.find(item => item.id === selectedFieldId.value)
+  if (field?.geojson_data && projectFieldGeometry(field.geojson_data)) {
+    return { geojson: field.geojson_data, name: field.name, fieldId: field.id }
+  }
+  const fallbackStoreMeta = parcelSimStore.activeParcelGeometry
+  if (fallbackStoreMeta && projectFieldGeometry(fallbackStoreMeta.geojson)) {
+    return {
+      geojson: fallbackStoreMeta.geojson,
+      name: fallbackStoreMeta.fieldName,
+      fieldId: fallbackStoreMeta.fieldId,
+    }
+  }
+  return {
+    geojson: DEFAULT_DEMO_PARCEL_GEOJSON,
+    name: 'Parcela Demostrativa AgronIA',
+    fieldId: field?.id ?? null,
+  }
+}
 
 const disposeGroupChildren = (group: THREE.Group) => {
   for (const child of [...group.children]) {
     group.remove(child)
-    if (child instanceof THREE.Mesh || child instanceof THREE.Line) {
+    if (child instanceof THREE.Mesh || child instanceof THREE.Line || child instanceof THREE.LineSegments || child instanceof THREE.InstancedMesh) {
       child.geometry.dispose()
       const materials = Array.isArray(child.material) ? child.material : [child.material]
       materials.forEach(material => material.dispose())
@@ -202,35 +268,189 @@ const frameCameraOnField = () => {
   controls.value.update()
 }
 
-const applySelectedField = () => {
-  const field = fields.value.find(item => item.id === selectedFieldId.value)
-  selectedFieldGeometry.value = field ? projectFieldGeometry(field.geojson_data) : null
-  cameraFollowEnabled.value = true
-  liveDronePath = []
-  fallbackGpsOrigin = null
-  clearLiveDroneTrail()
-  if (!scene.value || !cropGroup || !parcelOutlineGroup) return
-  const outlineGroup = parcelOutlineGroup
+const createParcelPolygonMesh = (projected: ProjectedField): THREE.Mesh[] => {
+  const meshes: THREE.Mesh[] = []
+  const texture = createSoilTexture()
+  texture.anisotropy = renderer.value?.capabilities.getMaxAnisotropy() || 8
+  if (parcelSurfaceMaterial) parcelSurfaceMaterial.dispose()
+  parcelSurfaceMaterial = new THREE.MeshLambertMaterial({
+    color: currentMode.value === 'rgb' ? 0xffffff : currentMode.value === 'ndvi' ? 0x1e40af : 0x450a0a,
+    map: texture,
+    side: THREE.DoubleSide,
+  })
 
-  disposeGroupChildren(outlineGroup)
-  const geometry = selectedFieldGeometry.value
-  if (!geometry) {
-    cropGroup.scale.set(1, 1, 1)
-    DRONE_BASE.set(-15, 0.5, 15)
-    if (droneGroupReady) droneGroup.position.copy(DRONE_BASE)
-    frameCameraOnField()
-    return
+  for (const polygon of projected.polygons) {
+    const [exterior, ...holes] = polygon.rings
+    if (!exterior || exterior.length < 3) continue
+
+    const outerPts = exterior.map(p => new THREE.Vector2(p.x, -p.z))
+    if (THREE.ShapeUtils.isClockWise(outerPts)) {
+      outerPts.reverse()
+    }
+    const shape = new THREE.Shape(outerPts)
+
+    for (const hole of holes) {
+      if (hole.length < 3) continue
+      const holePts = hole.map(p => new THREE.Vector2(p.x, -p.z))
+      if (!THREE.ShapeUtils.isClockWise(holePts)) {
+        holePts.reverse()
+      }
+      shape.holes.push(new THREE.Path(holePts))
+    }
+
+    const shapeGeo = new THREE.ShapeGeometry(shape, 1)
+    const uvAttr = shapeGeo.attributes.uv
+    const posAttr = shapeGeo.attributes.position
+    for (let i = 0; i < posAttr.count; i++) {
+      uvAttr.setXY(i, posAttr.getX(i) / 14, -posAttr.getY(i) / 14)
+    }
+    uvAttr.needsUpdate = true
+    shapeGeo.rotateX(-Math.PI / 2)
+
+    const mesh = new THREE.Mesh(shapeGeo, parcelSurfaceMaterial)
+    mesh.position.y = 0.02
+    mesh.receiveShadow = true
+    meshes.push(mesh)
   }
 
-  DRONE_BASE.set(-geometry.widthMeters * 0.3, 0.5, geometry.depthMeters * 0.3)
-  if (droneGroupReady) droneGroup.position.copy(DRONE_BASE)
-  cropGroup.scale.set(
-    geometry.widthMeters / BASE_CROP_WIDTH,
-    1,
-    geometry.depthMeters / BASE_CROP_DEPTH,
-  )
+  return meshes
+}
 
-  for (const polygon of geometry.polygons) {
+const renderOptimizedRoute3D = (plan: DroneFlightPlanMetrics) => {
+  if (!routeVisualGroup) return
+  disposeGroupChildren(routeVisualGroup)
+
+  const targetWaypoints = plan.waypoints.filter(wp => wp.type === 'target')
+  if (targetWaypoints.length === 0) return
+
+  const routeColor =
+    plan.missionType === 'FUMIGATE'
+      ? 0x34d399
+      : plan.missionType === 'WATER'
+        ? 0x38bdf8
+        : 0xfacc15
+
+  const pathPoints = plan.waypoints.map(wp =>
+    new THREE.Vector3(
+      wp.x,
+      wp.type === 'target' ? wp.altitudeMeters + 0.35 : 0.7,
+      wp.z
+    )
+  )
+  const routeLine = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(pathPoints),
+    new THREE.LineBasicMaterial({ color: routeColor, transparent: true, opacity: 0.92 })
+  )
+  routeLine.renderOrder = 4
+  routeVisualGroup.add(routeLine)
+
+  const markerScale = Math.max(0.7, Math.min(2.6, Math.max(selectedFieldGeometry.value?.widthMeters ?? 40, selectedFieldGeometry.value?.depthMeters ?? 40) / 55))
+  const pinMat = new THREE.LineBasicMaterial({ color: routeColor, transparent: true, opacity: 0.55 })
+
+  targetWaypoints.forEach(wp => {
+    const severityColor =
+      wp.severityState === 'estrés_crítico' || wp.severityState === 'pérdida_irreversible'
+        ? 0xef4444
+        : wp.severityState === 'estrés_moderado'
+          ? 0xf97316
+          : 0xeab308
+
+    const ringGeo = new THREE.RingGeometry(0.65 * markerScale, 1.05 * markerScale, 20)
+    ringGeo.rotateX(-Math.PI / 2)
+    const ring = new THREE.Mesh(
+      ringGeo,
+      new THREE.MeshBasicMaterial({ color: severityColor, side: THREE.DoubleSide, transparent: true, opacity: 0.88 })
+    )
+    ring.position.set(wp.x, 0.14, wp.z)
+    routeVisualGroup?.add(ring)
+
+    const dropGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(wp.x, 0.15, wp.z),
+      new THREE.Vector3(wp.x, wp.altitudeMeters + 0.35, wp.z),
+    ])
+    routeVisualGroup?.add(new THREE.Line(dropGeo, pinMat.clone()))
+  })
+}
+
+const refreshRouteAndReport = (missionType: DroneMissionType = 'INSPECT_STRESS', redrawRoute = true) => {
+  const projected = selectedFieldGeometry.value
+  const meta = activeParcelMetadata.value
+  if (!projected || !meta) return
+
+  const plan = planOptimizedDroneRoute({
+    field: projected,
+    basePoint: { x: DRONE_BASE.x, z: DRONE_BASE.z },
+    plants: allPlants,
+    missionType,
+    altitudeMeters: FLIGHT_HEIGHT,
+  })
+  currentFlightPlan.value = plan
+  if (redrawRoute) {
+    renderOptimizedRoute3D(plan)
+  }
+
+  const report = buildSimulationReport({
+    tick: simulationTick.value,
+    parcel: meta,
+    plants: allPlants,
+    droneFlight: plan,
+  })
+  currentReport.value = report
+  parcelSimStore.setSimulationReport(report)
+}
+
+const rebuildParcelScene = (regenerateCenters = true) => {
+  const { geojson, name, fieldId } = activeFieldGeojsonAndName()
+  const projected = projectFieldGeometry(geojson)
+  if (!projected) return
+
+  const meta = extractParcelMetadata(geojson, fieldId, name)
+  selectedFieldGeometry.value = projected
+  activeParcelMetadata.value = meta
+  parcelSimStore.setActiveParcelGeometry(meta)
+
+  const baseInfo = computeTakeoffBaseForField(projected)
+  DRONE_BASE.set(baseInfo.x, 0.5, baseInfo.z)
+  const maxDim = Math.max(projected.widthMeters, projected.depthMeters)
+  const minDim = Math.max(10, Math.min(projected.widthMeters, projected.depthMeters))
+  FLIGHT_HEIGHT = Math.max(7, Math.min(26, maxDim * 0.14))
+  currentFieldFlightSpeed = Math.max(0.035, Math.min(0.11, 5 / Math.max(30, maxDim)))
+
+  if (droneGroupReady) {
+    droneGroup.position.copy(DRONE_BASE)
+    droneGroup.rotation.set(0, 0, 0)
+    const droneScale = Math.max(0.95, Math.min(3.8, maxDim / 52))
+    droneGroup.scale.set(droneScale, droneScale, droneScale)
+  }
+
+  if (mainDirLight) {
+    const shadowHalf = Math.max(45, maxDim * 0.72)
+    mainDirLight.shadow.camera.left = -shadowHalf
+    mainDirLight.shadow.camera.right = shadowHalf
+    mainDirLight.shadow.camera.top = shadowHalf
+    mainDirLight.shadow.camera.bottom = -shadowHalf
+    mainDirLight.shadow.camera.updateProjectionMatrix()
+  }
+
+  if (scene.value && graphicsQuality.value !== 'performance') {
+    scene.value.fog = new THREE.FogExp2(0x9fc6d7, Math.min(0.004, 0.24 / Math.max(55, maxDim)))
+  }
+
+  if (!scene.value || !cropGroup || !parcelOutlineGroup || !parcelSurfaceGroup || !furrowsGroup) return
+
+  disposeGroupChildren(parcelSurfaceGroup)
+  disposeGroupChildren(parcelOutlineGroup)
+  disposeGroupChildren(furrowsGroup)
+  disposeGroupChildren(cropGroup)
+  if (routeVisualGroup) disposeGroupChildren(routeVisualGroup)
+  clearSectorMarkers()
+
+  // 1. Superficie poligonal exacta a escala 1:1
+  const polyMeshes = createParcelPolygonMesh(projected)
+  polyMeshes.forEach(mesh => parcelSurfaceGroup?.add(mesh))
+
+  // 2. Contorno exacto, vértices y plataforma de despegue del dron
+  for (const polygon of projected.polygons) {
     polygon.rings.forEach((ring, ringIndex) => {
       const points = ring.map(point => new THREE.Vector3(point.x, 0.09, point.z))
       const line = new THREE.LineLoop(
@@ -239,15 +459,247 @@ const applySelectedField = () => {
           color: ringIndex === 0 ? 0xf2cf68 : 0xd7e6bd,
           linewidth: 2,
           transparent: true,
-          opacity: 0.95,
+          opacity: 0.96,
         }),
       )
       line.renderOrder = 2
-      outlineGroup.add(line)
+      parcelOutlineGroup?.add(line)
+
+      if (ringIndex === 0) {
+        const cornerScale = Math.max(0.35, Math.min(2.2, maxDim / 70))
+        const cornerGeo = new THREE.CylinderGeometry(cornerScale, cornerScale, 0.25, 10)
+        const cornerMat = new THREE.MeshBasicMaterial({ color: 0xfacc15 })
+        ring.forEach(pt => {
+          const post = new THREE.Mesh(cornerGeo.clone(), cornerMat.clone())
+          post.position.set(pt.x, 0.14, pt.z)
+          parcelOutlineGroup?.add(post)
+        })
+      }
     })
   }
 
+  // Plataforma de despegue / base del dron
+  const padScale = Math.max(1.4, Math.min(5, maxDim / 35))
+  const padRing = new THREE.Mesh(
+    new THREE.RingGeometry(padScale * 0.72, padScale, 24).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0x38bdf8, side: THREE.DoubleSide })
+  )
+  padRing.position.set(DRONE_BASE.x, 0.04, DRONE_BASE.z)
+  parcelOutlineGroup.add(padRing)
+
+  // 3. Surcos agrícolas recortados estrictamente dentro de los límites del polígono real
+  const furrowPositions: number[] = []
+  const furrowSpacing = Math.max(2.0, Math.min(18, projected.depthMeters / 24))
+  for (
+    let z = projected.bounds.minZ + furrowSpacing * 0.45;
+    z <= projected.bounds.maxZ - furrowSpacing * 0.2;
+    z += furrowSpacing
+  ) {
+    const segments = computeHorizontalScanlineSegments(z, projected)
+    for (const [segStart, segEnd] of segments) {
+      furrowPositions.push(segStart, 0.045, z, segEnd, 0.045, z)
+    }
+  }
+  const furrowGeometry = new THREE.BufferGeometry()
+  furrowGeometry.setAttribute('position', new THREE.Float32BufferAttribute(furrowPositions, 3))
+  furrowsGroup.add(
+    new THREE.LineSegments(
+      furrowGeometry,
+      new THREE.LineBasicMaterial({ color: 0xc39a64, transparent: true, opacity: 0.24 })
+    )
+  )
+
+  // 4. Plantas distribuidas exclusivamente dentro del polígono real + estrés inicial
+  const initialSlots = createInitialSimulatedPlants(projected, [])
+  if (regenerateCenters || stressCenters.length === 0) {
+    stressCenters = seedStressCentersInsideField(projected, initialSlots)
+  }
+  allPlants = createInitialSimulatedPlants(projected, stressCenters, {
+    targetCount: Math.max(180, Math.min(360, Math.round(projected.areaHectares * 140 + 180))),
+  })
+  simulationTick.value = 0
+  tickAccumulatorSec = 0
+
+  leafToPlantMap = []
+  tasselToPlantMap = []
+  earToPlantMap = []
+  let leafCount = 0
+  let tasselCount = 0
+  let earCount = 0
+
+  for (const plant of allPlants) {
+    leafCount += plant.stage === 1 ? 5 : plant.stage === 2 ? 10 : 14
+    if (plant.stage === 3) {
+      tasselCount++
+      earCount += 2
+    } else if (plant.stage === 2) {
+      earCount += 1
+    }
+  }
+
+  const spacingEst = Math.max(1.2, Math.sqrt(projected.areaSquareMeters / Math.max(1, allPlants.length)))
+  const plantScale = Math.max(0.68, Math.min(3.2, spacingEst / 3.2))
+
+  const leafMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    side: THREE.DoubleSide,
+    roughness: 0.84,
+    metalness: 0,
+  })
+  leafWindUniform = { value: simulationTime }
+  leafWindStrengthUniform = { value: windEnabled.value ? 1 : 0 }
+  leafMaterial.onBeforeCompile = shader => {
+    shader.uniforms.uWindTime = leafWindUniform!
+    shader.uniforms.uWindStrength = leafWindStrengthUniform!
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nuniform float uWindTime;\nuniform float uWindStrength;')
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+        float leafWindWeight = smoothstep(0.05, 2.4, position.y);
+        float leafWindPhase = uWindTime * 1.35 + position.y * 1.7 + instanceMatrix[3][0] * 0.24 + instanceMatrix[3][2] * 0.18;
+        transformed.x += sin(leafWindPhase) * 0.11 * leafWindWeight * uWindStrength;
+        transformed.z += cos(leafWindPhase * 0.83) * 0.055 * leafWindWeight * uWindStrength;`
+      )
+  }
+  leafMaterial.customProgramCacheKey = () => 'agronia-leaf-wind-v1'
+
+  leafMesh = new THREE.InstancedMesh(createLeafGeometry(), leafMaterial, Math.max(1, leafCount))
+  const trunkGeo = new THREE.CylinderGeometry(0.04, 0.08, 1, 8)
+  trunkGeo.translate(0, 0.5, 0)
+  trunkMesh = new THREE.InstancedMesh(
+    trunkGeo,
+    new THREE.MeshStandardMaterial({ roughness: 0.92, metalness: 0 }),
+    Math.max(1, allPlants.length)
+  )
+
+  const tasselGeo = createTasselGeometry()
+  tasselGeo.translate(0, -0.1, 0)
+  tasselMesh =
+    tasselCount > 0
+      ? new THREE.InstancedMesh(
+          tasselGeo,
+          new THREE.MeshStandardMaterial({ roughness: 0.82, metalness: 0 }),
+          tasselCount
+        )
+      : null
+
+  const earGeo = new THREE.CapsuleGeometry(0.12, 0.4, 4, 8)
+  earGeo.rotateZ(Math.PI / 8)
+  earGeo.translate(0.15, 0.2, 0)
+  earMesh =
+    earCount > 0
+      ? new THREE.InstancedMesh(
+          earGeo,
+          new THREE.MeshStandardMaterial({ roughness: 0.88, metalness: 0 }),
+          earCount
+        )
+      : null
+
+  const hitboxGeo = new THREE.CylinderGeometry(0.65 * plantScale, 0.65 * plantScale, 3.6 * plantScale, 8)
+  hitboxGeo.translate(0, 1.8 * plantScale, 0)
+  hitboxMesh = new THREE.InstancedMesh(
+    hitboxGeo,
+    new THREE.MeshBasicMaterial({ visible: false }),
+    Math.max(1, allPlants.length)
+  )
+
+  const dummy = new THREE.Object3D()
+  let cL = 0
+  let cT = 0
+  let cE = 0
+
+  allPlants.forEach((plant, pIdx) => {
+    const stageScaleY = (plant.stage === 1 ? 0.8 : plant.stage === 2 ? 1.8 : 2.8) * plantScale
+    dummy.position.set(plant.x, 0, plant.z)
+    dummy.rotation.set(0, Math.random() * Math.PI, 0)
+    dummy.scale.set(plantScale, stageScaleY, plantScale)
+    dummy.updateMatrix()
+    trunkMesh!.setMatrixAt(pIdx, dummy.matrix)
+
+    dummy.scale.set(1, 1, 1)
+    dummy.updateMatrix()
+    hitboxMesh!.setMatrixAt(pIdx, dummy.matrix)
+
+    const numLeaves = plant.stage === 1 ? 5 : plant.stage === 2 ? 10 : 14
+    for (let k = 0; k < numLeaves; k++) {
+      dummy.position.set(plant.x, (k / numLeaves) * stageScaleY * 0.9 + 0.1 * plantScale, plant.z)
+      dummy.rotation.set(0, k * 137.5 * (Math.PI / 180), 0)
+      const lScale = (plant.stage === 1 ? 0.6 : 1.0) * (1 - (k / numLeaves) * 0.4) * plantScale
+      dummy.scale.set(lScale, lScale, lScale)
+      dummy.rotateX(Math.PI / 4)
+      dummy.translateZ(0.04 * plantScale)
+      dummy.updateMatrix()
+      leafMesh!.setMatrixAt(cL, dummy.matrix)
+      leafToPlantMap.push(pIdx)
+      cL++
+    }
+
+    if (earMesh && plant.stage >= 2) {
+      for (let e = 0; e < (plant.stage === 3 ? 2 : 1); e++) {
+        dummy.position.set(plant.x, stageScaleY * (0.4 + e * 0.2), plant.z)
+        dummy.rotation.set(0, Math.random() * Math.PI * 2, 0)
+        const eScale = (plant.stage === 3 ? 1.0 : 0.6) * plantScale
+        dummy.scale.set(eScale, eScale, eScale)
+        dummy.updateMatrix()
+        earMesh.setMatrixAt(cE, dummy.matrix)
+        earToPlantMap.push(pIdx)
+        cE++
+      }
+    }
+
+    if (tasselMesh && plant.stage === 3) {
+      dummy.position.set(plant.x, stageScaleY, plant.z)
+      dummy.rotation.set(0, Math.random() * Math.PI, 0)
+      dummy.scale.set(plantScale, plantScale, plantScale)
+      dummy.updateMatrix()
+      tasselMesh.setMatrixAt(cT, dummy.matrix)
+      tasselToPlantMap.push(pIdx)
+      cT++
+    }
+  })
+
+  trunkMesh.castShadow = true
+  trunkMesh.receiveShadow = true
+  leafMesh.castShadow = true
+  cropGroup.add(trunkMesh, leafMesh, hitboxMesh)
+  if (tasselMesh) {
+    tasselMesh.castShadow = true
+    cropGroup.add(tasselMesh)
+  }
+  if (earMesh) {
+    earMesh.castShadow = true
+    cropGroup.add(earMesh)
+  }
+
+  lastInspectedPlant.value = allPlants[0] ?? null
+  hoveredPlant.value = null
+  hoveredSector.value = null
+  updateMaterials(currentMode.value)
+  updateTelemetry()
+  refreshRouteAndReport('INSPECT_STRESS', true)
   frameCameraOnField()
+
+  if (centinelaGroup) {
+    scene.value.remove(centinelaGroup)
+    centinelaGroup = null
+    centinelaPropellers = []
+  }
+  void minDim
+}
+
+const applySelectedField = () => {
+  parcelSimStore.selectField(selectedFieldId.value)
+  cameraFollowEnabled.value = true
+  liveDronePath = []
+  fallbackGpsOrigin = null
+  clearLiveDroneTrail()
+  if (droneState.value !== 'IDLE') {
+    droneState.value = 'IDLE'
+    currentAction.value = 'NONE'
+    if (particleSystem) particleSystem.visible = false
+  }
+  rebuildParcelScene(true)
 }
 
 const updateLiveDrone = () => {
@@ -377,20 +829,37 @@ const handleDroneTelemetry = (snapshot: {
 const updateTelemetry = () => {
   if (!allPlants || allPlants.length === 0) return
   const count = allPlants.length
-  let sumHealth = 0, sumNDVI = 0, sumTemp = 0
+  let sumHealth = 0, sumNDVI = 0, sumTemp = 0, sumStress = 0, sumPest = 0
+  let healthyCount = 0, mildCount = 0, moderateCount = 0, criticalCount = 0, irreversibleCount = 0
+
   for (const p of allPlants) {
     sumHealth += p.health
     sumNDVI += p.ndvi
     sumTemp += p.temp
+    sumStress += p.waterStressPercent
+    sumPest += p.pestStressPercent
+    if (p.state === 'saludable') healthyCount++
+    else if (p.state === 'estrés_leve') mildCount++
+    else if (p.state === 'estrés_moderado') moderateCount++
+    else if (p.state === 'estrés_crítico') criticalCount++
+    else if (p.state === 'pérdida_irreversible') irreversibleCount++
   }
+
+  const avgWaterStress = parseFloat((sumStress / count).toFixed(1))
   telemetry.value = {
     avgHealth: parseFloat(((sumHealth / count) * 100).toFixed(1)),
-    avgHumidity: parseFloat((((sumHealth / count) * 0.8 + 0.1) * 100).toFixed(1)),
-    avgPestIndex: parseFloat((Math.max(0, 1 - (sumNDVI / count)) * 100 * 0.5).toFixed(1)),
+    avgWaterStress,
+    avgHumidity: parseFloat(Math.max(8, Math.min(96, 94 - avgWaterStress * 0.78)).toFixed(1)),
+    avgPestIndex: parseFloat((sumPest / count).toFixed(1)),
     avgNDVI: parseFloat((sumNDVI / count).toFixed(2)),
     avgTemp: parseFloat((sumTemp / count).toFixed(1)),
     plantCount: count,
-    stressZones: stressCenters.length
+    stressZones: stressCenters.length,
+    healthyCount,
+    mildCount,
+    moderateCount,
+    criticalCount,
+    irreversibleCount,
   }
 }
 
@@ -495,13 +964,6 @@ const createTasselGeometry = () => {
 
 const lerpColor = (c1: THREE.Color, c2: THREE.Color, t: number) => new THREE.Color().lerpColors(c1, c2, t)
 
-const getStatusName = (health: number) => {
-  if (health >= 0.7) return 'Alto Vigor'
-  if (health >= 0.4) return 'Moderado'
-  if (health >= 0.25) return 'Bajo Vigor'
-  return 'Estrés'
-}
-
 const getSectorColor = (type: string, intensity: number) => {
   const t = Math.max(0, Math.min(1, (intensity - 0.6) / 0.4))
   if (type === 'DROUGHT') {
@@ -513,14 +975,20 @@ const getSectorColor = (type: string, intensity: number) => {
   return new THREE.Color().lerpColors(new THREE.Color(0xc084fc), new THREE.Color(0x7e22ce), t).getHex()
 }
 
-const getColorForPlant = (plant: PlantData, mode: 'rgb' | 'ndvi' | 'thermal') => {
-  if (mode === 'rgb') return lerpColor(new THREE.Color(0x84cc16), new THREE.Color(0x15803d), plant.health)
+const getColorForPlant = (plant: SimulatedPlantNode, mode: 'rgb' | 'ndvi' | 'thermal') => {
+  if (mode === 'rgb') {
+    if (plant.state === 'pérdida_irreversible') return new THREE.Color(0x6b4c3b)
+    if (plant.state === 'estrés_crítico') return new THREE.Color(0xd97706)
+    if (plant.state === 'estrés_moderado') return new THREE.Color(0xca8a04)
+    if (plant.state === 'estrés_leve') return new THREE.Color(0x84cc16)
+    return new THREE.Color(0x15803d)
+  }
   if (mode === 'ndvi') {
     if (plant.ndvi < 0.33) return lerpColor(new THREE.Color(0xdc2626), new THREE.Color(0xf97316), plant.ndvi / 0.33)
     if (plant.ndvi < 0.66) return lerpColor(new THREE.Color(0xf97316), new THREE.Color(0xfacc15), (plant.ndvi - 0.33) / 0.33)
     return lerpColor(new THREE.Color(0xfacc15), new THREE.Color(0x16a34a), (plant.ndvi - 0.66) / 0.34)
   }
-  const heat = Math.max(0, Math.min(1, (plant.temp - 20) / 17)) // 0 to 1 (20°C cold overhydration to 37°C drought)
+  const heat = Math.max(0, Math.min(1, (plant.temp - 22) / 17))
   if (heat < 0.33) return lerpColor(new THREE.Color(0x1d4ed8), new THREE.Color(0x06b6d4), heat / 0.33)
   if (heat < 0.66) return lerpColor(new THREE.Color(0x06b6d4), new THREE.Color(0xfde047), (heat - 0.33) / 0.33)
   return lerpColor(new THREE.Color(0xfde047), new THREE.Color(0xef4444), (heat - 0.66) / 0.34)
@@ -548,23 +1016,68 @@ const clearSectorMarkers = () => {
   sectorMarkers = []
 }
 
+const revealSectorMarkersOnScene = () => {
+  clearSectorMarkers()
+  stressCenters.forEach(center => {
+    const geo = new THREE.CircleGeometry(center.radius, 48)
+    geo.rotateX(-Math.PI / 2)
+    const mat = new THREE.MeshBasicMaterial({
+      color: getSectorColor(center.type, center.intensity),
+      map: sectorFalloffTexture,
+      transparent: true,
+      opacity: 0.72,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    })
+    const mesh = new THREE.Mesh(geo, mat)
+    mesh.position.set(center.x, 0.2, center.z)
+    mesh.userData = center
+    scene.value?.add(mesh)
+    sectorMarkers.push(mesh)
+  })
+}
+
 const updateMaterials = (mode: 'rgb' | 'ndvi' | 'thermal') => {
   currentMode.value = mode
-  if (groundMaterial) groundMaterial.color.setHex(mode === 'rgb' ? 0xffffff : (mode === 'ndvi' ? 0x1e40af : 0x450a0a))
+  const soilTint = mode === 'rgb' ? 0xffffff : mode === 'ndvi' ? 0x1e40af : 0x450a0a
+  if (groundMaterial) groundMaterial.color.setHex(mode === 'rgb' ? 0x4b3b2b : soilTint)
+  if (parcelSurfaceMaterial) parcelSurfaceMaterial.color.setHex(soilTint)
   if (!trunkMesh || !leafMesh) return
 
-  for (let i = 0; i < allPlants.length; i++) trunkMesh.setColorAt(i, mode === 'rgb' ? new THREE.Color(0x84cc16) : getColorForPlant(allPlants[i], mode))
+  for (let i = 0; i < allPlants.length; i++) {
+    const plant = allPlants[i]
+    trunkMesh.setColorAt(
+      i,
+      mode === 'rgb' && plant.state === 'saludable'
+        ? new THREE.Color(0x65a30d)
+        : getColorForPlant(plant, mode)
+    )
+  }
   trunkMesh.instanceColor!.needsUpdate = true
 
-  for (let i = 0; i < leafToPlantMap.length; i++) leafMesh.setColorAt(i, getColorForPlant(allPlants[leafToPlantMap[i]], mode))
+  for (let i = 0; i < leafToPlantMap.length; i++) {
+    leafMesh.setColorAt(i, getColorForPlant(allPlants[leafToPlantMap[i]], mode))
+  }
   leafMesh.instanceColor!.needsUpdate = true
 
-  if (tasselMesh) {
-    for (let i = 0; i < tasselToPlantMap.length; i++) tasselMesh.setColorAt(i, mode === 'rgb' ? new THREE.Color(0xfef08a) : getColorForPlant(allPlants[tasselToPlantMap[i]], mode))
+  if (tasselMesh && tasselToPlantMap.length > 0) {
+    for (let i = 0; i < tasselToPlantMap.length; i++) {
+      const p = allPlants[tasselToPlantMap[i]]
+      tasselMesh.setColorAt(
+        i,
+        mode === 'rgb' && !p.irreversible ? new THREE.Color(0xfef08a) : getColorForPlant(p, mode)
+      )
+    }
     tasselMesh.instanceColor!.needsUpdate = true
   }
-  if (earMesh) {
-    for (let i = 0; i < earToPlantMap.length; i++) earMesh.setColorAt(i, mode === 'rgb' ? new THREE.Color(0xeab308) : getColorForPlant(allPlants[earToPlantMap[i]], mode))
+  if (earMesh && earToPlantMap.length > 0) {
+    for (let i = 0; i < earToPlantMap.length; i++) {
+      const p = allPlants[earToPlantMap[i]]
+      earMesh.setColorAt(
+        i,
+        mode === 'rgb' && !p.irreversible ? new THREE.Color(0xeab308) : getColorForPlant(p, mode)
+      )
+    }
     earMesh.instanceColor!.needsUpdate = true
   }
 }
@@ -605,24 +1118,41 @@ const createParticles = () => {
   scene.value?.add(particleSystem)
 }
 
-const generateRandomStressCenters = () => {
-  stressCenters = []
-  clearSectorMarkers()
+const refreshInspectedReferences = () => {
+  if (!lastInspectedPlant.value && allPlants.length > 0) {
+    lastInspectedPlant.value = allPlants[0]
+  } else if (lastInspectedPlant.value) {
+    const refreshed = allPlants.find(p => p.id === lastInspectedPlant.value?.id)
+    if (refreshed) lastInspectedPlant.value = refreshed
+  }
+  if (hoveredPlant.value) {
+    hoveredPlant.value = allPlants.find(p => p.id === hoveredPlant.value?.id) ?? null
+  }
+}
 
-  const halfWidth = (selectedFieldGeometry.value?.widthMeters ?? 50) / 2
-  const halfDepth = (selectedFieldGeometry.value?.depthMeters ?? 40) / 2
-  const numCenters = Math.floor(Math.random() * 3) + 2
-  for (let i = 0; i < numCenters; i++) {
-    const type: StressCenter['type'] = Math.random() > 0.5 ? 'DROUGHT' : 'PEST'
+const runProgressiveTick = (eventType: PlantStressHistoryEvent = 'degradation', showBanner = true) => {
+  if (allPlants.length === 0) return
+  simulationTick.value += 1
+  const { newlyCriticalIds, newlyIrreversibleIds } = advanceSimulationTick(
+    allPlants,
+    stressCenters,
+    simulationTick.value,
+    { event: eventType }
+  )
+  refreshInspectedReferences()
+  updateMaterials(currentMode.value)
+  updateTelemetry()
+  refreshRouteAndReport('INSPECT_STRESS', true)
 
-    stressCenters.push({
-      id: `SEC-${i + 1}`,
-      x: (Math.random() * 1.6 - 0.8) * halfWidth,
-      z: (Math.random() * 1.6 - 0.8) * halfDepth,
-      intensity: 0.68 + Math.random() * 0.3,
-      radius: Math.max(2, Math.min(halfWidth, halfDepth) * (0.08 + Math.random() * 0.08)),
-      type,
-    })
+  if (showBanner && (newlyIrreversibleIds.length > 0 || newlyCriticalIds.length > 0)) {
+    const parts: string[] = []
+    if (newlyCriticalIds.length > 0) parts.push(`${newlyCriticalIds.length} planta(s) pasaron a estrés crítico`)
+    if (newlyIrreversibleIds.length > 0) parts.push(`${newlyIrreversibleIds.length} con pérdida irreversible`)
+    setActionFeedback(`Ciclo #${simulationTick.value}: ${parts.join(' · ')}.`)
+  } else if (showBanner) {
+    setActionFeedback(
+      `Ciclo #${simulationTick.value} evaluado · Estrés promedio: ${telemetry.value.avgWaterStress}% · Ahorro IA batería: ${currentFlightPlan.value?.batterySavingsPercent ?? 0}%.`
+    )
   }
 }
 
@@ -632,20 +1162,57 @@ const saveScenarioSnapshot = async (saveAlerts = false) => {
   const fieldId = selectedFieldId.value || null
 
   try {
-    await createSimulation({
+    const reportPayload = currentReport.value ?? (
+      selectedFieldGeometry.value && activeParcelMetadata.value
+        ? buildSimulationReport({
+            tick: simulationTick.value,
+            parcel: activeParcelMetadata.value,
+            plants: allPlants,
+            droneFlight:
+              currentFlightPlan.value ??
+              planOptimizedDroneRoute({
+                field: selectedFieldGeometry.value,
+                basePoint: { x: DRONE_BASE.x, z: DRONE_BASE.z },
+                plants: allPlants,
+                missionType: 'INSPECT_STRESS',
+              }),
+          })
+        : null
+    )
+
+    const stressTimeline = reportPayload ? extractStressTimeline(reportPayload) : []
+    const economics = reportPayload ? calculateSimulationEconomics(reportPayload) : null
+
+    const savedRow = await createSimulation({
       field_id: fieldId,
       scenario_title: `Simulación ${new Date().toLocaleString('es-MX')}`,
       input_parameters: {
         visualization_mode: currentMode.value,
         wind_enabled: windEnabled.value,
         field_id: fieldId,
+        tick: simulationTick.value,
       },
       results: {
         telemetry: { ...telemetry.value },
-        plants: allPlants.map(plant => ({ ...plant })),
-        stress_centers: stressCenters.map(center => ({ ...center })),
+        simulation_report: reportPayload as unknown as Json,
+        stress_timeline: stressTimeline as unknown as Json,
+        economics: economics as unknown as Json,
+        stress_centers: stressCenters.map(center => ({ ...center })) as unknown as Json,
       },
     })
+
+    if (reportPayload && economics) {
+      parcelSimStore.registerExportedSimulation({
+        id: savedRow.id,
+        title: savedRow.scenario_title,
+        exportedAt: savedRow.created_at,
+        source: 'supabase',
+        fieldId,
+        report: reportPayload,
+        stressTimeline,
+        economics,
+      })
+    }
 
     if (fieldId) {
       const writes: Promise<void>[] = [
@@ -656,10 +1223,13 @@ const saveScenarioSnapshot = async (saveAlerts = false) => {
           sustainability_index: telemetry.value.avgHealth / 100,
           raw_data: {
             source: 'simulation',
+            tick: simulationTick.value,
+            water_stress_avg: telemetry.value.avgWaterStress,
             ndvi_avg: telemetry.value.avgNDVI,
             pest_index: telemetry.value.avgPestIndex,
             plant_count: telemetry.value.plantCount,
             stress_zones: telemetry.value.stressZones,
+            drone_battery_savings_pct: currentFlightPlan.value?.batterySavingsPercent ?? 0,
           },
         }),
       ]
@@ -670,8 +1240,8 @@ const saveScenarioSnapshot = async (saveAlerts = false) => {
           alert_type: center.type === 'DROUGHT' ? 'soil_humidity' : 'pest',
           severity: center.intensity >= 0.85 ? 'high' : center.intensity >= 0.7 ? 'medium' : 'low',
           message: center.type === 'DROUGHT'
-            ? `Estrés hídrico detectado en ${center.id}.`
-            : `Posible plaga detectada en ${center.id}.`,
+            ? `Estrés hídrico detectado en ${center.id} (${center.lat.toFixed(5)}, ${center.lng.toFixed(5)}).`
+            : `Posible plaga detectada en ${center.id} (${center.lat.toFixed(5)}, ${center.lng.toFixed(5)}).`,
         })))
       }
 
@@ -679,8 +1249,8 @@ const saveScenarioSnapshot = async (saveAlerts = false) => {
     }
 
     setActionFeedback(fieldId
-      ? 'Escenario, métricas y alertas guardados en el campo.'
-      : 'Escenario guardado. Selecciona un campo para asociar métricas y alertas.')
+      ? 'Reporte de simulación, métricas y alertas guardados en Supabase.'
+      : 'Simulación guardada. Selecciona una parcela para asociar métricas y alertas.')
   } catch (error) {
     setActionFeedback(error instanceof Error
       ? `No se pudieron guardar todos los datos: ${error.message}`
@@ -688,33 +1258,6 @@ const saveScenarioSnapshot = async (saveAlerts = false) => {
   } finally {
     savingSnapshot.value = false
   }
-}
-
-const regenerateFieldHealth = () => {
-  allPlants.forEach(plant => {
-    let dStress = 0, pStress = 0, oStress = 0
-    for (const center of stressCenters) {
-      const dist = Math.sqrt(Math.pow(plant.x - center.x, 2) + Math.pow(plant.z - center.z, 2))
-      if (dist < center.radius) {
-        const effect = center.intensity * (1 - (dist / center.radius))
-        if (center.type === 'DROUGHT') dStress = Math.max(dStress, effect)
-        if (center.type === 'OVERHYDRATION') oStress = Math.max(oStress, effect)
-        if (center.type === 'PEST') pStress = Math.max(pStress, effect)
-      }
-    }
-    plant.health = Math.max(0.1, 0.92 + Math.random() * 0.08 - dStress - pStress - oStress * 0.75)
-    plant.temp = 25 + (dStress * 12) + (pStress * 3) - (oStress * 5.2)
-    plant.ndvi = Math.max(0.1, 0.84 - (pStress * 0.65) - (dStress * 0.32) - (oStress * 0.38))
-    plant.status = getStatusName(plant.health)
-  })
-  if (!lastInspectedPlant.value && allPlants.length > 0) {
-    lastInspectedPlant.value = allPlants[0]
-  } else if (lastInspectedPlant.value) {
-    const refreshed = allPlants.find(p => p.id === lastInspectedPlant.value?.id)
-    if (refreshed) lastInspectedPlant.value = refreshed
-  }
-  updateMaterials(currentMode.value)
-  updateTelemetry()
 }
 
 const handleAction = (action: 'ANALYZE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS') => {
@@ -729,21 +1272,29 @@ const handleAction = (action: 'ANALYZE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS') =
     if (droneState.value !== 'IDLE') return
     droneState.value = 'CENTINELAS'
     currentAction.value = 'CENTINELAS'
-    
-    // Si no existe el enjambre, crearlo
+    tickAccumulatorSec = 0
+
+    const projected = selectedFieldGeometry.value
+    const orbitRadius = projected
+      ? Math.max(8, Math.min(projected.widthMeters, projected.depthMeters) * 0.36)
+      : 15
+
     if (!centinelaGroup && scene.value) {
       centinelaGroup = new THREE.Group()
-      for(let i=0; i<5; i++) {
+      for (let i = 0; i < 5; i++) {
         const drone = createDrone()
-        drone.scale.set(0.5, 0.5, 0.5) // Más pequeños
+        drone.scale.set(0.55, 0.55, 0.55)
         const angle = (i / 5) * Math.PI * 2
-        drone.position.set(Math.cos(angle)*15, FLIGHT_HEIGHT, Math.sin(angle)*15)
+        drone.position.set(
+          Math.cos(angle) * orbitRadius,
+          FLIGHT_HEIGHT,
+          Math.sin(angle) * orbitRadius
+        )
         centinelaGroup.add(drone)
-        
-        // Agregar hélices del enjambre al arreglo global centinelaPropellers
+
         drone.children.forEach(c => {
           const mesh = c as THREE.Mesh
-          if (mesh.isMesh && mesh.geometry instanceof THREE.BoxGeometry && mesh.scale.x === 1) { // Hélices
+          if (mesh.isMesh && mesh.geometry instanceof THREE.BoxGeometry && mesh.scale.x === 1) {
             centinelaPropellers.push(mesh)
           }
         })
@@ -751,56 +1302,105 @@ const handleAction = (action: 'ANALYZE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS') =
       scene.value.add(centinelaGroup)
     }
     if (centinelaGroup) centinelaGroup.visible = true
+    setActionFeedback('Centinelas activos: evaluando progresión de estrés hídrico por ciclo y optimizando ruta IA.')
     return
   }
 
   if (action === 'ANALYZE') {
     if (droneState.value !== 'IDLE') return
-    setActionFeedback('Escaneo del cultivo en curso…', false)
+    const projected = selectedFieldGeometry.value
+    if (!projected) return
+
+    setActionFeedback('Escaneo multiespectral del cultivo en curso dentro del polígono real…', false)
     droneState.value = 'SCANNING'
-    generateRandomStressCenters()
-    regenerateFieldHealth()
-    void saveScenarioSnapshot(true)
-    
-    // Ruta de escaneo (Zigzag sobre el campo)
-    const halfWidth = (selectedFieldGeometry.value?.widthMeters ?? 50) * 0.45
-    const halfDepth = (selectedFieldGeometry.value?.depthMeters ?? 40) * 0.45
-    dronePath = [
-       new THREE.Vector3(-halfWidth, FLIGHT_HEIGHT, -halfDepth),
-       new THREE.Vector3(halfWidth, FLIGHT_HEIGHT, -halfDepth),
-       new THREE.Vector3(halfWidth, FLIGHT_HEIGHT, 0),
-       new THREE.Vector3(-halfWidth, FLIGHT_HEIGHT, 0),
-       new THREE.Vector3(-halfWidth, FLIGHT_HEIGHT, halfDepth),
-       new THREE.Vector3(halfWidth, FLIGHT_HEIGHT, halfDepth),
-       DRONE_BASE
-    ]
+
+    // Evalúa un ciclo actual y traza ruta de inspección exclusivamente sobre zonas anómalas (o barrido poligonal si está 100% sano)
+    simulationTick.value += 1
+    advanceSimulationTick(allPlants, stressCenters, simulationTick.value, { event: 'sentinel_scan' })
+    refreshInspectedReferences()
+    updateMaterials(currentMode.value)
+    updateTelemetry()
+
+    const inspectPlan = planOptimizedDroneRoute({
+      field: projected,
+      basePoint: { x: DRONE_BASE.x, z: DRONE_BASE.z },
+      plants: allPlants,
+      missionType: 'INSPECT_STRESS',
+      altitudeMeters: FLIGHT_HEIGHT,
+    })
+    currentFlightPlan.value = inspectPlan
+    renderOptimizedRoute3D(inspectPlan)
+
+    const inspectTargets = inspectPlan.waypoints.filter(wp => wp.type === 'target')
+    if (inspectTargets.length > 0) {
+      dronePath = [
+        ...inspectTargets.map(wp => new THREE.Vector3(wp.x, FLIGHT_HEIGHT, wp.z)),
+        DRONE_BASE.clone(),
+      ]
+    } else {
+      const scanPts: THREE.Vector3[] = []
+      const step = Math.max(4, projected.depthMeters / 4)
+      let dir = true
+      for (let z = projected.bounds.minZ + step * 0.5; z <= projected.bounds.maxZ; z += step) {
+        const segs = computeHorizontalScanlineSegments(z, projected)
+        for (const [s, e] of dir ? segs : [...segs].reverse()) {
+          scanPts.push(new THREE.Vector3(dir ? s : e, FLIGHT_HEIGHT, z))
+          scanPts.push(new THREE.Vector3(dir ? e : s, FLIGHT_HEIGHT, z))
+        }
+        dir = !dir
+      }
+      dronePath = [...scanPts, DRONE_BASE.clone()]
+    }
+
     currentPathIndex = 0
+    void saveScenarioSnapshot(true)
     return
   }
 
   if (droneState.value !== 'IDLE') return
-  
-  // Filtrar objetivos dependiendo de la acción
-  if (action === 'WATER') activeTargets = stressCenters.filter(c => c.type === 'DROUGHT')
-  if (action === 'FUMIGATE') activeTargets = stressCenters.filter(c => c.type === 'PEST')
-  
-  if (activeTargets.length === 0) {
-    setActionFeedback(action === 'WATER'
-      ? 'No se encontraron zonas con estrés hídrico que requieran riego.'
-      : 'No se encontraron zonas con indicios de plaga que requieran fumigación.')
+  const projected = selectedFieldGeometry.value
+  if (!projected) return
+
+  const plan = planOptimizedDroneRoute({
+    field: projected,
+    basePoint: { x: DRONE_BASE.x, z: DRONE_BASE.z },
+    plants: allPlants,
+    missionType: action,
+    altitudeMeters: FLIGHT_HEIGHT,
+  })
+  const targets = plan.waypoints.filter(wp => wp.type === 'target')
+
+  if (targets.length === 0) {
+    setActionFeedback(
+      action === 'WATER'
+        ? telemetry.value.irreversibleCount > 0
+          ? `Sin plantas recuperables con estrés hídrico (${telemetry.value.irreversibleCount} con pérdida irreversible).`
+          : 'No se encontraron plantas con estrés hídrico que requieran riego.'
+        : 'No se encontraron plantas con indicios de plaga que requieran fumigación.'
+    )
     return
   }
 
-  setActionFeedback(action === 'WATER' ? 'Dron de riego en misión…' : 'Dron de fumigación en misión…', false)
+  activeMissionPlan = plan
+  activeWaypoints = targets
+  activeTargetIndex = 0
+  missionRecoveredCount = 0
+  missionIrreversibleCount = 0
+  currentFlightPlan.value = plan
+  renderOptimizedRoute3D(plan)
+
+  setActionFeedback(
+    `${action === 'WATER' ? 'Riego inteligente TSP' : 'Fumigación inteligente TSP'}: ${targets.length} objetivos críticos (${plan.totalDistanceMeters.toFixed(0)} m · ahorro ${plan.batterySavingsPercent}% batería).`,
+    false
+  )
   currentAction.value = action
   droneState.value = 'FLYING'
-  activeTargetIndex = 0
-  
+
   const pMat = particleSystem.material as THREE.PointsMaterial
   if (action === 'WATER') {
-    pMat.color.setHex(0x3b82f6); pMat.size = 0.3; pMat.opacity = 0.8
+    pMat.color.setHex(0x3b82f6); pMat.size = 0.35; pMat.opacity = 0.85
   } else {
-    pMat.color.setHex(0xa7f3d0); pMat.size = 0.6; pMat.opacity = 0.4
+    pMat.color.setHex(0xa7f3d0); pMat.size = 0.6; pMat.opacity = 0.45
   }
 }
 
@@ -861,9 +1461,9 @@ const createNewScenario = async () => {
   if (centinelaGroup) centinelaGroup.visible = false
   currentAction.value = 'NONE'
   particleSystem.visible = false
-  generateRandomStressCenters()
-  regenerateFieldHealth()
-  setActionFeedback('Nuevo escenario generado. Analiza el cultivo para detectar las zonas de estrés.')
+  stressCenters = []
+  rebuildParcelScene(true)
+  setActionFeedback('Nuevo escenario poligonal generado. Analiza el cultivo o avanza ciclos para observar el estrés.')
   void saveScenarioSnapshot()
 }
 
@@ -881,14 +1481,18 @@ const toggleWind = () => {
 
 const exportCropData = () => {
   const rows = [
-    ['ID de planta', 'Etapa', 'Estado', 'Salud (%)', 'NDVI', 'Temperatura (°C)', 'Coordenada X', 'Coordenada Z'],
+    ['ID de planta', 'Etapa', 'Estado', 'Estrés hídrico (%)', 'Estrés plaga (%)', 'Salud (%)', 'NDVI', 'Temperatura (°C)', 'Latitud', 'Longitud', 'Local X (m)', 'Local Z (m)'],
     ...allPlants.map(plant => [
       plant.id,
       plant.stage === 1 ? 'Brote' : plant.stage === 2 ? 'Desarrollo' : 'Madurez',
-      plant.status,
+      plant.state,
+      plant.waterStressPercent.toFixed(1),
+      plant.pestStressPercent.toFixed(1),
       (plant.health * 100).toFixed(1),
       plant.ndvi.toFixed(2),
       plant.temp.toFixed(1),
+      plant.lat.toFixed(7),
+      plant.lng.toFixed(7),
       plant.x.toFixed(2),
       plant.z.toFixed(2),
     ]),
@@ -901,7 +1505,106 @@ const exportCropData = () => {
   link.download = `agronia-cultivo-${new Date().toISOString().slice(0, 10)}.csv`
   link.click()
   window.setTimeout(() => URL.revokeObjectURL(url), 0)
-  setActionFeedback(`Reporte exportado: ${allPlants.length} plantas y sus métricas actuales.`)
+  setActionFeedback(`CSV exportado: ${allPlants.length} plantas georreferenciadas (lat/lng) y sus métricas.`)
+}
+
+const downloadSimulationReport = () => {
+  refreshRouteAndReport('INSPECT_STRESS', false)
+  if (!currentReport.value) return
+  const jsonText = JSON.stringify(currentReport.value, null, 2)
+  const blob = new Blob([jsonText], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `agronia-simulation-report-tick-${simulationTick.value}.json`
+  link.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
+  setActionFeedback(
+    `SimulationReport JSON descargado (Ciclo #${simulationTick.value} · ${currentReport.value.plants.length} plantas · Ahorro IA ${currentReport.value.droneFlight.batterySavingsPercent}%).`
+  )
+}
+
+const exportToDashboard = async () => {
+  if (exportingToDashboard.value || allPlants.length === 0) return
+  exportingToDashboard.value = true
+  try {
+    refreshRouteAndReport('INSPECT_STRESS', false)
+    const report = currentReport.value
+    if (!report) {
+      setActionFeedback('No hay datos de simulación listos para exportar.')
+      return
+    }
+
+    const stressTimeline = extractStressTimeline(report)
+    const economics = calculateSimulationEconomics(report)
+    const fieldId = selectedFieldId.value || report.parcel.fieldId || null
+    const title = `${report.parcel.fieldName} · Ciclo #${report.tick}`
+
+    let exportedEntry = {
+      id: `local-${Date.now()}`,
+      title,
+      exportedAt: report.generatedAt,
+      source: 'local' as 'supabase' | 'local',
+      fieldId,
+      report,
+      stressTimeline,
+      economics,
+    }
+
+    try {
+      const savedRow = await createSimulation({
+        field_id: fieldId,
+        scenario_title: title,
+        input_parameters: {
+          visualization_mode: currentMode.value,
+          wind_enabled: windEnabled.value,
+          field_id: fieldId,
+          tick: simulationTick.value,
+          exported_to_dashboard: true,
+        },
+        results: {
+          telemetry: { ...telemetry.value },
+          simulation_report: report as unknown as Json,
+          stress_timeline: stressTimeline as unknown as Json,
+          economics: economics as unknown as Json,
+          stress_centers: stressCenters.map(center => ({ ...center })) as unknown as Json,
+        },
+      })
+
+      if (fieldId) {
+        await saveFieldMetric({
+          field_id: fieldId,
+          soil_humidity: telemetry.value.avgHumidity,
+          temperature: telemetry.value.avgTemp,
+          sustainability_index: telemetry.value.avgHealth / 100,
+          raw_data: {
+            source: 'simulation',
+            tick: simulationTick.value,
+            water_stress_avg: telemetry.value.avgWaterStress,
+            ndvi_avg: telemetry.value.avgNDVI,
+            pest_index: telemetry.value.avgPestIndex,
+            plant_count: telemetry.value.plantCount,
+            stress_zones: telemetry.value.stressZones,
+            drone_battery_savings_pct: report.droneFlight.batterySavingsPercent,
+          },
+        }).catch(() => {})
+      }
+
+      exportedEntry = {
+        ...exportedEntry,
+        id: savedRow.id,
+        exportedAt: savedRow.created_at,
+        source: 'supabase',
+      }
+    } catch {
+      // Mantiene exportación local en Pinia/localStorage si Supabase no está autenticado o falla
+    }
+
+    parcelSimStore.registerExportedSimulation(exportedEntry)
+    await router.push('/dashboards')
+  } finally {
+    exportingToDashboard.value = false
+  }
 }
 
 const initThree = () => {
@@ -969,36 +1672,23 @@ const initThree = () => {
 
   const soilTex = createSoilTexture()
   soilTex.anisotropy = renderer.value.capabilities.getMaxAnisotropy() || 16
-  groundMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff, map: soilTex })
+  groundMaterial = new THREE.MeshLambertMaterial({ color: 0x4b3b2b, map: soilTex })
   sectorFalloffTexture = createSectorFalloffTexture()
   const fieldExtent = selectedFieldGeometry.value
     ? Math.max(selectedFieldGeometry.value.widthMeters, selectedFieldGeometry.value.depthMeters)
     : 150
-  const groundSize = Math.max(150, fieldExtent * 1.5)
+  const groundSize = Math.max(240, fieldExtent * 2.4)
   const ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), groundMaterial)
-  ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.value.add(ground)
+  ground.rotation.x = -Math.PI / 2
+  ground.receiveShadow = true
+  scene.value.add(ground)
 
-  const furrowPositions: number[] = []
-  const furrowWidth = selectedFieldGeometry.value?.widthMeters ?? BASE_CROP_WIDTH
-  const furrowDepth = selectedFieldGeometry.value?.depthMeters ?? BASE_CROP_DEPTH
-  const furrowSpacing = Math.max(3.5, furrowWidth / 80)
-  for (let x = -furrowWidth / 2; x <= furrowWidth / 2; x += furrowSpacing) {
-    furrowPositions.push(x, 0.025, -furrowDepth / 2, x, 0.025, furrowDepth / 2)
-  }
-  const furrowGeometry = new THREE.BufferGeometry()
-  furrowGeometry.setAttribute('position', new THREE.Float32BufferAttribute(furrowPositions, 3))
-  const furrows = new THREE.LineSegments(
-    furrowGeometry,
-    new THREE.LineBasicMaterial({ color: 0xc39a64, transparent: true, opacity: 0.17 })
-  )
-  scene.value.add(furrows)
+  parcelSurfaceGroup = new THREE.Group()
+  furrowsGroup = new THREE.Group()
   cropGroup = new THREE.Group()
   parcelOutlineGroup = new THREE.Group()
-  scene.value.add(cropGroup, parcelOutlineGroup)
-  applySelectedField()
-
-  // Generación aleatoria de zonas inicial
-  generateRandomStressCenters()
+  routeVisualGroup = new THREE.Group()
+  scene.value.add(parcelSurfaceGroup, furrowsGroup, cropGroup, parcelOutlineGroup, routeVisualGroup)
 
   // Dron y Particulas
   droneGroup = createDrone()
@@ -1018,111 +1708,10 @@ const initThree = () => {
   scene.value.add(liveDroneGroup)
   createParticles()
 
-  // Generar plantas dinámicas afectadas por las zonas
-  allPlants = []; leafToPlantMap = []; tasselToPlantMap = []; earToPlantMap = []
-  let leafCount = 0, tasselCount = 0, earCount = 0
-
-  for (let i = -7; i < 7; i++) {
-    for (let j = -10; j < 10; j++) {
-      const stage = Math.random() > 0.6 ? 3 : (Math.random() > 0.3 ? 2 : 1)
-      leafCount += stage === 1 ? 5 : (stage === 2 ? 10 : 14)
-      if (stage === 3) { tasselCount++; earCount += 2 } else if (stage === 2) { earCount += 1 }
-
-      const x = i * 3.5 + (Math.random() * 0.8 - 0.4), z = j * 2.2 + (Math.random() * 0.8 - 0.4)
-      
-      // Usamos valores dummy iniciales, regenerateFieldHealth recalculará los reales
-      const health = 1, temp = 25, ndvi = 1
-
-      allPlants.push({ id: `P-${i+7}-${j+10}`, x, z, health, ndvi, temp, status: getStatusName(health), stage })
-    }
-  }
-
-  // Meshes setup
-  const leafMaterial = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    side: THREE.DoubleSide,
-    roughness: 0.84,
-    metalness: 0,
-  })
-  leafWindUniform = { value: 0 }
-  leafWindStrengthUniform = { value: 1 }
-  leafMaterial.onBeforeCompile = shader => {
-    shader.uniforms.uWindTime = leafWindUniform!
-    shader.uniforms.uWindStrength = leafWindStrengthUniform!
-    shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nuniform float uWindTime;\nuniform float uWindStrength;')
-      .replace(
-        '#include <begin_vertex>',
-        `#include <begin_vertex>
-        float leafWindWeight = smoothstep(0.05, 2.4, position.y);
-        float leafWindPhase = uWindTime * 1.35 + position.y * 1.7 + instanceMatrix[3][0] * 0.24 + instanceMatrix[3][2] * 0.18;
-        transformed.x += sin(leafWindPhase) * 0.11 * leafWindWeight * uWindStrength;
-        transformed.z += cos(leafWindPhase * 0.83) * 0.055 * leafWindWeight * uWindStrength;`
-      )
-  }
-  leafMaterial.customProgramCacheKey = () => 'agronia-leaf-wind-v1'
-  leafMesh = new THREE.InstancedMesh(createLeafGeometry(), leafMaterial, leafCount)
-  const trunkGeo = new THREE.CylinderGeometry(0.04, 0.08, 1, 8); trunkGeo.translate(0, 0.5, 0)
-  trunkMesh = new THREE.InstancedMesh(
-    trunkGeo,
-    new THREE.MeshStandardMaterial({ roughness: 0.92, metalness: 0 }),
-    allPlants.length
-  )
-  const tasselGeo = createTasselGeometry(); tasselGeo.translate(0, -0.1, 0)
-  tasselMesh = new THREE.InstancedMesh(
-    tasselGeo,
-    new THREE.MeshStandardMaterial({ roughness: 0.82, metalness: 0 }),
-    tasselCount
-  )
-  const earGeo = new THREE.CapsuleGeometry(0.12, 0.4, 4, 8); earGeo.rotateZ(Math.PI / 8); earGeo.translate(0.15, 0.2, 0)
-  earMesh = new THREE.InstancedMesh(
-    earGeo,
-    new THREE.MeshStandardMaterial({ roughness: 0.88, metalness: 0 }),
-    earCount
-  )
-  const hitboxGeo = new THREE.CylinderGeometry(0.5, 0.5, 3.5, 8); hitboxGeo.translate(0, 1.75, 0)
-  hitboxMesh = new THREE.InstancedMesh(hitboxGeo, new THREE.MeshBasicMaterial({ visible: false }), allPlants.length)
-
-  const dummy = new THREE.Object3D()
-  let cL = 0, cT = 0, cE = 0
-
-  allPlants.forEach((plant, pIdx) => {
-    const scaleY = plant.stage === 1 ? 0.8 : (plant.stage === 2 ? 1.8 : 2.8)
-    dummy.position.set(plant.x, 0, plant.z); dummy.rotation.set(0, Math.random() * Math.PI, 0); dummy.scale.set(1, scaleY, 1); dummy.updateMatrix()
-    trunkMesh.setMatrixAt(pIdx, dummy.matrix); hitboxMesh.setMatrixAt(pIdx, dummy.matrix)
-
-    const numLeaves = plant.stage === 1 ? 5 : (plant.stage === 2 ? 10 : 14)
-    for (let k = 0; k < numLeaves; k++) {
-      dummy.position.set(plant.x, (k / numLeaves) * scaleY * 0.9 + 0.1, plant.z)
-      dummy.rotation.set(0, (k * 137.5) * (Math.PI / 180), 0)
-      const lScale = (plant.stage === 1 ? 0.6 : 1.0) * (1 - (k / numLeaves) * 0.4)
-      dummy.scale.set(lScale, lScale, lScale); dummy.rotateX(Math.PI / 4); dummy.translateZ(0.04)
-      dummy.updateMatrix(); leafMesh.setMatrixAt(cL, dummy.matrix); leafToPlantMap.push(pIdx); cL++
-    }
-
-    if (plant.stage >= 2) {
-      for (let e = 0; e < (plant.stage === 3 ? 2 : 1); e++) {
-        dummy.position.set(plant.x, scaleY * (0.4 + e * 0.2), plant.z); dummy.rotation.set(0, Math.random() * Math.PI * 2, 0)
-        const eScale = plant.stage === 3 ? 1.0 : 0.6; dummy.scale.set(eScale, eScale, eScale)
-        dummy.updateMatrix(); earMesh.setMatrixAt(cE, dummy.matrix); earToPlantMap.push(pIdx); cE++
-      }
-    }
-
-    if (plant.stage === 3) {
-      dummy.position.set(plant.x, scaleY, plant.z); dummy.rotation.set(0, Math.random() * Math.PI, 0); dummy.scale.set(1, 1, 1)
-      dummy.updateMatrix(); tasselMesh.setMatrixAt(cT, dummy.matrix); tasselToPlantMap.push(pIdx); cT++
-    }
-  })
-
-  trunkMesh.castShadow = true
-  trunkMesh.receiveShadow = true
-  leafMesh.castShadow = true
-  tasselMesh.castShadow = true
-  earMesh.castShadow = true
-  cropGroup.add(trunkMesh, leafMesh, tasselMesh, earMesh, hitboxMesh)
-  applySelectedField()
-  regenerateFieldHealth()
-  raycaster.value = new THREE.Raycaster(); mouse.value = new THREE.Vector2()
+  // Construye la geometría exacta del polígono real, los surcos recortados y las plantas 1:1
+  rebuildParcelScene(true)
+  raycaster.value = new THREE.Raycaster()
+  mouse.value = new THREE.Vector2()
 
   let actionTimer = 0
   let lastFrameTimestamp = performance.now()
@@ -1166,20 +1755,20 @@ const initThree = () => {
         propeller.rotation.y += (index % 2 === 0 ? 0.12 : -0.12) * dtScale
       })
     }
-    
+
     // Raycaster optimizado: solo evalúa intersecciones cuando el cursor se mueve o durante barrido activo
     raycastTick++
-    if ((pointerDirty || (droneState.value !== 'IDLE' && raycastTick % 12 === 0)) && raycaster.value && mouse.value && camera.value && scene.value) {
+    if (hitboxMesh && (pointerDirty || (droneState.value !== 'IDLE' && raycastTick % 12 === 0)) && raycaster.value && mouse.value && camera.value && scene.value) {
       pointerDirty = false
       raycaster.value.setFromCamera(mouse.value, camera.value)
-      
+
       const plantHits = raycaster.value.intersectObject(hitboxMesh)
       const hitPlant = (plantHits.length > 0 && plantHits[0].instanceId !== undefined) ? allPlants[plantHits[0].instanceId] : null
       hoveredPlant.value = hitPlant
       if (hitPlant) {
         lastInspectedPlant.value = hitPlant
       }
-      
+
       if (sectorMarkers.length > 0) {
         const sectorHits = raycaster.value.intersectObjects(sectorMarkers)
         hoveredSector.value = (sectorHits.length > 0) ? sectorHits[0].object.userData as StressCenter : null
@@ -1188,132 +1777,148 @@ const initThree = () => {
       }
     }
 
-    // Drone Animation Logic
+    // Drone Animation & Simulación Progresiva de Estrés Hídrico
     if (droneState.value === 'CENTINELAS') {
-      centinelaFrameCounter++
-      centinelaPropellers.forEach((p, i) => p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5))
+      centinelaPropellers.forEach((p, i) => {
+        p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5) * dtScale
+      })
       if (centinelaGroup) {
-        centinelaGroup.rotation.y += 0.005 // Rotar lentamente alrededor del campo
+        centinelaGroup.rotation.y += 0.005 * dtScale
       }
-      
-      // Simular actualización en tiempo real frecuente
-      if (centinelaFrameCounter % 120 === 0) { // Cada ~2 segundos (a 60fps)
-        // Modificar ligeramente la intensidad de estrés para que se vea vivo
-        stressCenters.forEach(c => c.intensity = Math.max(0.2, Math.min(1.0, c.intensity + (Math.random()-0.5)*0.1)))
-        regenerateFieldHealth()
-        
-        // Actualizar los colores de los marcadores de sector en tiempo real
+
+      tickAccumulatorSec += deltaSec
+      if (tickAccumulatorSec >= 2.5) {
+        tickAccumulatorSec = 0
+        runProgressiveTick('sentinel_scan', false)
         sectorMarkers.forEach(mesh => {
-           const center = mesh.userData as StressCenter
-           ;(mesh.material as THREE.MeshBasicMaterial).color.setHex(getSectorColor(center.type, center.intensity))
+          const center = mesh.userData as StressCenter
+          ;(mesh.material as THREE.MeshBasicMaterial).color.setHex(getSectorColor(center.type, center.intensity))
         })
       }
     } else if (droneState.value !== 'IDLE') {
-      propellers.forEach((p, i) => p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5)) // Girar hélices
+      propellers.forEach((p, i) => {
+        p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5) * dtScale
+      })
       const currentPos = droneGroup.position
-      
+
       if (droneState.value === 'SCANNING') {
         const targetPos = dronePath[currentPathIndex]
-        currentPos.lerp(targetPos, 0.05)
-        // Rotar dron suavemente hacia donde vuela
+        currentPos.lerp(targetPos, Math.min(0.18, currentFieldFlightSpeed * dtScale))
         droneGroup.lookAt(targetPos.x, currentPos.y, targetPos.z)
-        
-        if (currentPos.distanceTo(targetPos) < 1.0) {
+
+        if (currentPos.distanceTo(targetPos) < 1.2) {
           currentPathIndex++
           if (currentPathIndex >= dronePath.length) {
             droneState.value = 'IDLE'
-            droneGroup.rotation.set(0,0,0) // Reset rotación
-            setActionFeedback('Escaneo completado. Explora las zonas de estrés detectadas.')
-            // Revelar sectores escaneados
-            stressCenters.forEach(center => {
-              const geo = new THREE.CircleGeometry(center.radius, 48)
-              geo.rotateX(-Math.PI / 2)
-              const mat = new THREE.MeshBasicMaterial({ 
-                color: getSectorColor(center.type, center.intensity),
-                map: sectorFalloffTexture,
-                transparent: true,
-                opacity: 0.72,
-                side: THREE.DoubleSide,
-                depthWrite: false,
-              })
-              const mesh = new THREE.Mesh(geo, mat)
-              mesh.position.set(center.x, 0.2, center.z) // Ligeramente elevado
-              mesh.userData = center // Guardar datos para tooltip
-              scene.value?.add(mesh)
-              sectorMarkers.push(mesh)
-            })
+            droneGroup.rotation.set(0, 0, 0)
+            revealSectorMarkersOnScene()
+            refreshRouteAndReport('INSPECT_STRESS', true)
+            setActionFeedback(
+              `Escaneo completado (Ciclo #${simulationTick.value}). Ruta IA TSP: ${currentFlightPlan.value?.totalDistanceMeters ?? 0} m · Ahorro batería ${currentFlightPlan.value?.batterySavingsPercent ?? 0}%.`
+            )
           }
         }
-      } 
-      else {
+      } else {
         let targetPos = new THREE.Vector3()
         if (droneState.value === 'FLYING' || droneState.value === 'ACTION') {
-          const targetCenter = activeTargets[activeTargetIndex]
-          targetPos.set(targetCenter.x, FLIGHT_HEIGHT, targetCenter.z)
+          const wp = activeWaypoints[activeTargetIndex]
+          targetPos.set(wp.x, FLIGHT_HEIGHT, wp.z)
         } else if (droneState.value === 'RETURNING') {
           targetPos.copy(DRONE_BASE)
         }
 
         const dist = currentPos.distanceTo(targetPos)
-        
+
         if (droneState.value === 'FLYING') {
-          currentPos.lerp(targetPos, 0.05)
+          currentPos.lerp(targetPos, Math.min(0.2, currentFieldFlightSpeed * dtScale))
           droneGroup.lookAt(targetPos.x, currentPos.y, targetPos.z)
-          if (dist < 0.5) {
+          if (dist < 0.75) {
             droneState.value = 'ACTION'
-            droneGroup.rotation.set(0,0,0)
+            droneGroup.rotation.set(0, 0, 0)
             actionTimer = 0
             particleSystem.visible = true
-            for(let i=0; i<PARTICLE_COUNT; i++) {
-               particlePositions[i*3] = currentPos.x + (Math.random() - 0.5) * 4
-               particlePositions[i*3+1] = currentPos.y
-               particlePositions[i*3+2] = currentPos.z + (Math.random() - 0.5) * 4
-               particleVelocities[i*3+1] = -Math.random() * 0.2 - 0.1
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+              particlePositions[i * 3] = currentPos.x + (Math.random() - 0.5) * 4
+              particlePositions[i * 3 + 1] = currentPos.y
+              particlePositions[i * 3 + 2] = currentPos.z + (Math.random() - 0.5) * 4
+              particleVelocities[i * 3 + 1] = -Math.random() * 0.25 - 0.1
             }
           }
         } else if (droneState.value === 'ACTION') {
-          actionTimer++
-          for(let i=0; i<PARTICLE_COUNT; i++) {
-             particlePositions[i*3+1] += particleVelocities[i*3+1]
-             if (particlePositions[i*3+1] < 0) {
-               particlePositions[i*3] = currentPos.x + (Math.random() - 0.5) * activeTargets[activeTargetIndex].radius
-               particlePositions[i*3+1] = currentPos.y - 0.5
-               particlePositions[i*3+2] = currentPos.z + (Math.random() - 0.5) * activeTargets[activeTargetIndex].radius
-             }
+          actionTimer += dtScale
+          const spreadRadius = Math.max(
+            3.5,
+            Math.min(
+              12,
+              Math.min(selectedFieldGeometry.value?.widthMeters ?? 40, selectedFieldGeometry.value?.depthMeters ?? 40) * 0.08
+            )
+          )
+          for (let i = 0; i < PARTICLE_COUNT; i++) {
+            particlePositions[i * 3 + 1] += particleVelocities[i * 3 + 1] * dtScale
+            if (particlePositions[i * 3 + 1] < 0) {
+              particlePositions[i * 3] = currentPos.x + (Math.random() - 0.5) * spreadRadius
+              particlePositions[i * 3 + 1] = currentPos.y - 0.5
+              particlePositions[i * 3 + 2] = currentPos.z + (Math.random() - 0.5) * spreadRadius
+            }
           }
           particleGeo.attributes.position.needsUpdate = true
 
-          if (actionTimer > 150) {
+          if (actionTimer >= 72) {
             particleSystem.visible = false
-            
-            // "Curar" la zona tratada
-            const treatedCenter = activeTargets[activeTargetIndex]
-            stressCenters = stressCenters.filter(c => c.id !== treatedCenter.id)
-            const markerIndex = sectorMarkers.findIndex(m => m.userData.id === treatedCenter.id)
-            if (markerIndex !== -1) {
-               scene.value?.remove(sectorMarkers[markerIndex])
-               sectorMarkers.splice(markerIndex, 1)
-            }
-            regenerateFieldHealth()
+
+            const treatedWp = activeWaypoints[activeTargetIndex]
+            const treatmentAction: 'WATER' | 'FUMIGATE' = currentAction.value === 'FUMIGATE' ? 'FUMIGATE' : 'WATER'
+            const outcome = applyTreatmentAtLocation(
+              allPlants,
+              { x: treatedWp.x, z: treatedWp.z },
+              spreadRadius,
+              treatmentAction,
+              simulationTick.value,
+              { targetPlantIds: treatedWp.coveredPlantIds }
+            )
+            missionRecoveredCount += outcome.recoveredCount
+            missionIrreversibleCount += outcome.irreversibleCount
+
+            // Despejar centros de estrés tratados cuya población ya quedó bajo control
+            stressCenters = stressCenters.filter(center => {
+              const distToWp = Math.hypot(center.x - treatedWp.x, center.z - treatedWp.z)
+              if (treatmentAction === 'WATER' && center.type === 'DROUGHT' && distToWp <= center.radius + spreadRadius) {
+                return false
+              }
+              if (treatmentAction === 'FUMIGATE' && center.type === 'PEST' && distToWp <= center.radius + spreadRadius) {
+                return false
+              }
+              return true
+            })
+            revealSectorMarkersOnScene()
+            refreshInspectedReferences()
+            updateMaterials(currentMode.value)
+            updateTelemetry()
+            refreshRouteAndReport(treatmentAction, false)
 
             activeTargetIndex++
-            if (activeTargetIndex >= activeTargets.length) {
+            if (activeTargetIndex >= activeWaypoints.length) {
               droneState.value = 'RETURNING'
             } else {
               droneState.value = 'FLYING'
             }
           }
         } else if (droneState.value === 'RETURNING') {
-          currentPos.lerp(targetPos, 0.03)
+          currentPos.lerp(targetPos, Math.min(0.18, currentFieldFlightSpeed * dtScale))
           droneGroup.lookAt(targetPos.x, currentPos.y, targetPos.z)
-          if (dist < 0.2) {
+          if (dist < 0.45) {
             droneState.value = 'IDLE'
-            droneGroup.rotation.set(0,0,0)
+            droneGroup.rotation.set(0, 0, 0)
             const completedAction = currentAction.value
+            const executedPlan = activeMissionPlan
             currentAction.value = 'NONE'
-            setActionFeedback(completedAction === 'WATER'
-              ? 'Misión de riego completada. Se actualizaron las métricas del cultivo.'
-              : 'Misión de fumigación completada. Se actualizaron las métricas del cultivo.')
+            activeMissionPlan = null
+            refreshRouteAndReport('INSPECT_STRESS', true)
+            setActionFeedback(
+              `${completedAction === 'WATER' ? 'Riego completado' : 'Fumigación completada'}: ${missionRecoveredCount} plantas recuperadas` +
+                (missionIrreversibleCount > 0 ? `, ${missionIrreversibleCount} irrecuperables` : '') +
+                (executedPlan ? ` · Ruta ${executedPlan.totalDistanceMeters} m (ahorro ${executedPlan.batterySavingsPercent}% batería).` : '.')
+            )
           }
         }
       }
@@ -1394,9 +1999,21 @@ onMounted(async () => {
   document.addEventListener('fullscreenchange', onFullscreenChange)
   try {
     fields.value = await listFields()
-    selectedFieldId.value = fields.value[0]?.id ?? ''
-    const field = fields.value.find(item => item.id === selectedFieldId.value)
-    selectedFieldGeometry.value = field ? projectFieldGeometry(field.geojson_data) : null
+    parcelSimStore.setFields(fields.value)
+
+    const preferredId = parcelSimStore.activeFieldId
+    const validPreferred = preferredId
+      ? fields.value.find(item => item.id === preferredId && Boolean(projectFieldGeometry(item.geojson_data)))
+      : null
+    const firstValidField = fields.value.find(item => Boolean(projectFieldGeometry(item.geojson_data)))
+
+    selectedFieldId.value = validPreferred?.id ?? firstValidField?.id ?? fields.value[0]?.id ?? ''
+    if (selectedFieldId.value) {
+      parcelSimStore.selectField(selectedFieldId.value)
+    }
+
+    const { geojson } = activeFieldGeojsonAndName()
+    selectedFieldGeometry.value = projectFieldGeometry(geojson)
   } catch (error) {
     setActionFeedback(error instanceof Error
       ? `No se pudieron cargar los campos: ${error.message}`
@@ -1412,6 +2029,7 @@ onBeforeUnmount(() => {
   if (containerRef.value) containerRef.value.removeEventListener('pointermove', onMouseMove)
   controls.value?.dispose()
   groundMaterial?.map?.dispose()
+  parcelSurfaceMaterial?.dispose()
   sectorFalloffTexture?.dispose()
   renderer.value?.dispose()
 })
@@ -1479,9 +2097,27 @@ onBeforeUnmount(() => {
           <Wind :size="15" />
           {{ windEnabled ? 'Viento' : 'Sin viento' }}
         </button>
+        <button class="simulation-toolbar-button" type="button" @click="runProgressiveTick('degradation', true)" :disabled="simulationPaused || allPlants.length === 0" title="Avanzar un ciclo de simulación y estrés hídrico">
+          <RotateCw :size="15" />
+          +1 Ciclo (#{{ simulationTick }})
+        </button>
         <button class="simulation-toolbar-button" type="button" @click="exportCropData" :disabled="allPlants.length === 0">
           <Download :size="15" />
           Exportar CSV
+        </button>
+        <button class="simulation-toolbar-button" type="button" @click="downloadSimulationReport" :disabled="!currentReport" title="Descargar SimulationReport JSON (GeoJSON + plantas + ruta IA)">
+          <FileJson :size="15" />
+          Reporte JSON
+        </button>
+        <button
+          class="inline-flex min-h-[40px] items-center justify-center gap-2 rounded-[10px] border border-emerald-400/40 bg-emerald-500/20 px-3.5 text-xs font-bold text-emerald-200 transition hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-45"
+          type="button"
+          :disabled="allPlants.length === 0 || exportingToDashboard"
+          title="Exportar simulación completa (polígono real, severidad y análisis económico) al Dashboard del cliente"
+          @click="exportToDashboard"
+        >
+          <BarChart3 :size="15" />
+          {{ exportingToDashboard ? 'Exportando…' : 'Enviar al Dashboard' }}
         </button>
         <button class="simulation-new-scenario" type="button" @click="createNewScenario" :disabled="droneState !== 'IDLE' || simulationPaused || savingSnapshot">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
@@ -1642,6 +2278,40 @@ onBeforeUnmount(() => {
             </div>
             <div>
               <div class="flex justify-between mb-1">
+                <span class="text-gray-400">Estrés hídrico</span>
+                <span
+                  class="font-bold"
+                  :class="
+                    inspectedPlant.waterStressPercent >= 68
+                      ? 'text-red-400'
+                      : inspectedPlant.waterStressPercent >= 42
+                        ? 'text-orange-300'
+                        : inspectedPlant.waterStressPercent >= 18
+                          ? 'text-yellow-300'
+                          : 'text-emerald-300'
+                  "
+                >
+                  {{ inspectedPlant.waterStressPercent.toFixed(1) }}%
+                </span>
+              </div>
+              <div class="w-full bg-white/10 h-1.5 rounded-full overflow-hidden">
+                <div
+                  class="h-full rounded-full transition-all duration-200"
+                  :class="
+                    inspectedPlant.waterStressPercent >= 68
+                      ? 'bg-red-500'
+                      : inspectedPlant.waterStressPercent >= 42
+                        ? 'bg-orange-400'
+                        : inspectedPlant.waterStressPercent >= 18
+                          ? 'bg-yellow-400'
+                          : 'bg-emerald-400'
+                  "
+                  :style="`width: ${Math.min(100, Math.max(2, inspectedPlant.waterStressPercent))}%`"
+                ></div>
+              </div>
+            </div>
+            <div>
+              <div class="flex justify-between mb-1">
                 <span class="text-gray-400">NDVI</span>
                 <span class="font-bold text-white">{{ inspectedPlant.ndvi.toFixed(2) }}</span>
               </div>
@@ -1661,9 +2331,20 @@ onBeforeUnmount(() => {
                 {{ inspectedPlant.temp.toFixed(1) }} °C
               </span>
             </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">GPS</span>
+              <span class="font-mono text-[10px] text-emerald-200">
+                {{ inspectedPlant.lat.toFixed(5) }}, {{ inspectedPlant.lng.toFixed(5) }}
+              </span>
+            </div>
             <div class="flex justify-between items-center pt-1 border-t border-white/10">
-              <span class="text-gray-400">Estado</span>
-              <span class="font-bold text-white">{{ inspectedPlant.status }}</span>
+              <span class="text-gray-400">Estado ({{ inspectedPlant.history.length }} reg.)</span>
+              <span
+                class="font-bold"
+                :class="inspectedPlant.irreversible ? 'text-red-400' : inspectedPlant.waterStressPercent >= 42 ? 'text-amber-300' : 'text-emerald-300'"
+              >
+                {{ STRESS_STATE_LABELS[inspectedPlant.state] }}
+              </span>
             </div>
           </div>
 
@@ -1693,8 +2374,6 @@ onBeforeUnmount(() => {
           </template>
         </div>
 
-      </div>
-
         <!-- Leyenda de Sectores -->
         <div v-if="droneState !== 'IDLE' || sectorMarkers.length > 0" class="simulation-panel simulation-severity p-3.5 text-white shadow-2xl w-64 transition-all">
           <h3 class="font-bold text-xs mb-2 border-b border-white/20 pb-1.5">Severidad de Sectores</h3>
@@ -1709,6 +2388,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </div>
+      </div>
       <!-- Columna Derecha Fija: Centro de Misión + Estado del Cultivo (sin superposición) -->
       <div class="simulation-hud-right">
         <!-- Menú de Dron / Análisis -->
@@ -1755,14 +2435,28 @@ onBeforeUnmount(() => {
 
         <!-- Panel de Telemetría en Tiempo Real -->
         <div class="simulation-panel simulation-telemetry p-3.5 text-white shadow-2xl w-64">
-          <h3 class="font-bold text-sm mb-2 border-b border-white/20 pb-1.5 flex items-center gap-2">
-            <span class="w-2 h-2 rounded-full bg-agron-green animate-pulse"></span>
-            Estado del cultivo
+          <h3 class="font-bold text-sm mb-2 border-b border-white/20 pb-1.5 flex items-center justify-between gap-2">
+            <span class="flex items-center gap-2">
+              <span class="w-2 h-2 rounded-full bg-agron-green animate-pulse"></span>
+              Estado del cultivo
+            </span>
+            <span class="text-[10px] rounded bg-white/10 px-1.5 py-0.5 text-amber-300">Ciclo #{{ simulationTick }}</span>
           </h3>
           <div class="space-y-2 text-xs">
             <div class="flex justify-between items-center">
-              <span class="text-gray-400">Plantas monitoreadas</span>
+              <span class="text-gray-400">Plantas en polígono</span>
               <span class="font-bold text-white">{{ telemetry.plantCount }}</span>
+            </div>
+            <div class="flex justify-between items-center">
+              <span class="text-gray-400">Estrés hídrico prom.</span>
+              <span class="font-bold" :class="telemetry.avgWaterStress >= 42 ? 'text-orange-400' : telemetry.avgWaterStress >= 18 ? 'text-yellow-300' : 'text-emerald-300'">
+                {{ telemetry.avgWaterStress }}%
+              </span>
+            </div>
+            <div class="grid grid-cols-3 gap-1 text-[10px] text-center">
+              <div class="rounded bg-emerald-500/15 py-1 text-emerald-300">Sanas: {{ telemetry.healthyCount }}</div>
+              <div class="rounded bg-amber-500/15 py-1 text-amber-300">Estrés: {{ telemetry.mildCount + telemetry.moderateCount }}</div>
+              <div class="rounded bg-red-500/15 py-1 text-red-300">Crít/Irr: {{ telemetry.criticalCount + telemetry.irreversibleCount }}</div>
             </div>
             <div>
               <div class="flex justify-between mb-1">
@@ -1782,26 +2476,31 @@ onBeforeUnmount(() => {
                 <div class="h-1 rounded-full bg-blue-400 transition-all duration-500" :style="`width: ${telemetry.avgHumidity}%`"></div>
               </div>
             </div>
-            <div>
-              <div class="flex justify-between mb-1">
-                <span class="text-gray-400">Índice de plagas</span>
-                <span class="font-bold" :class="telemetry.avgPestIndex > 30 ? 'text-red-400' : telemetry.avgPestIndex > 15 ? 'text-orange-400' : 'text-green-400'">{{ telemetry.avgPestIndex }}%</span>
-              </div>
-              <div class="w-full bg-white/10 rounded-full h-1">
-                <div class="h-1 rounded-full transition-all duration-500" :class="telemetry.avgPestIndex > 30 ? 'bg-red-400' : telemetry.avgPestIndex > 15 ? 'bg-orange-400' : 'bg-green-400'" :style="`width: ${telemetry.avgPestIndex}%`"></div>
-              </div>
-            </div>
             <div class="flex justify-between items-center">
-              <span class="text-gray-400">NDVI promedio</span>
-              <span class="font-bold text-green-400">{{ telemetry.avgNDVI }}</span>
+              <span class="text-gray-400">NDVI / Temp.</span>
+              <span class="font-bold text-emerald-300">{{ telemetry.avgNDVI }} · {{ telemetry.avgTemp }} °C</span>
             </div>
-            <div class="flex justify-between items-center">
-              <span class="text-gray-400">Temperatura prom.</span>
-              <span class="font-bold" :class="telemetry.avgTemp > 32 ? 'text-red-400' : 'text-orange-300'">{{ telemetry.avgTemp }} °C</span>
-            </div>
-            <div class="flex justify-between items-center border-t border-white/10 pt-1.5">
-              <span class="text-gray-400">Zonas de estrés</span>
-              <span class="font-bold" :class="telemetry.stressZones > 0 ? 'text-yellow-400' : 'text-green-400'">{{ telemetry.stressZones }}</span>
+            <div v-if="currentFlightPlan" class="mt-2 border-t border-white/15 pt-2 space-y-1 text-[11px]">
+              <div class="flex justify-between items-center font-semibold text-cyan-300">
+                <span>Ruta IA (TSP 2-opt)</span>
+                <span>{{ currentFlightPlan.waypoints.filter(w => w.type === 'target').length }} puntos</span>
+              </div>
+              <div class="flex justify-between text-gray-300">
+                <span>Objetivos / Omitidas:</span>
+                <strong>{{ currentFlightPlan.targetedPlantCount }} / {{ currentFlightPlan.skippedHealthyPlantCount }}</strong>
+              </div>
+              <div class="flex justify-between text-gray-300">
+                <span>Dist. vs barrido:</span>
+                <strong>{{ currentFlightPlan.totalDistanceMeters.toFixed(0) }} m / {{ currentFlightPlan.baselineFullSweepDistanceMeters.toFixed(0) }} m</strong>
+              </div>
+              <div class="flex justify-between text-gray-300">
+                <span>Tiempo est.:</span>
+                <strong>{{ Math.round(currentFlightPlan.estimatedFlightTimeSeconds) }} s</strong>
+              </div>
+              <div class="flex justify-between text-emerald-300 font-bold">
+                <span>Ahorro batería/comb.:</span>
+                <span>-{{ currentFlightPlan.batterySavingsPercent }}%</span>
+              </div>
             </div>
           </div>
         </div>

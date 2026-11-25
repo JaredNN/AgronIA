@@ -186,6 +186,17 @@ export const saveMapWorkspace = async (name: string, geojson: Json): Promise<str
   return data
 }
 
+export const updateFieldGeojson = async (fieldId: string, geojson: Json): Promise<FieldRecord> => {
+  const { data, error } = await requireSupabase()
+    .from('fields')
+    .update({ geojson_data: geojson })
+    .eq('id', fieldId)
+    .select('id,user_id,name,description,geojson_data,created_at,updated_at,crop_id')
+    .single()
+  if (error) throw new Error(`No se pudo actualizar la geometría de la parcela: ${error.message}`)
+  return data
+}
+
 export const createFieldCrop = async (fieldCrop: FieldCropInput): Promise<void> => {
   const { error } = await requireSupabase().from('field_crops').insert(fieldCrop)
   if (error) throw new Error(`No se pudo guardar el cultivo del campo: ${error.message}`)
@@ -352,20 +363,35 @@ export const markAlertRead = async (id: string): Promise<void> => {
   if (!data) throw new Error('La alerta no existe o no tienes permiso para modificarla.')
 }
 
-export const createSimulation = async (simulation: SimulationInput): Promise<void> => {
+export interface SimulationRecord {
+  id: string
+  user_id: string
+  field_id: string | null
+  scenario_title: string
+  input_parameters: Json
+  results: Json
+  created_at: string
+}
+
+export const createSimulation = async (simulation: SimulationInput): Promise<SimulationRecord> => {
   const client = requireSupabase()
   const { data: { user }, error: authError } = await client.auth.getUser()
   if (authError) throw new Error(`No se pudo validar la sesión para guardar la simulación: ${authError.message}`)
   if (!user) throw new Error('Inicia sesión para guardar la simulación.')
 
-  const { error } = await client.from('simulations').insert({
-    ...simulation,
-    user_id: user.id,
-  })
+  const { data, error } = await client
+    .from('simulations')
+    .insert({
+      ...simulation,
+      user_id: user.id,
+    })
+    .select('id,user_id,field_id,scenario_title,input_parameters,results,created_at')
+    .single()
   if (error) throw new Error(`No se pudo guardar la simulación: ${error.message}`)
+  return data as SimulationRecord
 }
 
-export const listSimulations = async (fieldId?: string) => {
+export const listSimulations = async (fieldId?: string): Promise<SimulationRecord[]> => {
   let query = requireSupabase()
     .from('simulations')
     .select('id,user_id,field_id,scenario_title,input_parameters,results,created_at')
@@ -374,7 +400,7 @@ export const listSimulations = async (fieldId?: string) => {
   if (fieldId) query = query.eq('field_id', fieldId)
   const { data, error } = await query
   if (error) throw new Error(`No se pudieron cargar las simulaciones: ${error.message}`)
-  return data ?? []
+  return (data ?? []) as SimulationRecord[]
 }
 
 export const listParcels = async (): Promise<ParcelRecord[]> => {
