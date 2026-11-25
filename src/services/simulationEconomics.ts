@@ -1,8 +1,17 @@
 import type { Json } from './agronomyData.ts'
+import { planOptimizedDroneRoute } from './droneRoutePlanner.ts'
+import {
+  computeTakeoffBaseForField,
+  extractParcelMetadata,
+  projectFieldGeometry,
+} from './fieldGeometry.ts'
+import { isolateOwnParcelGeoJson } from './fieldMapWorkspace.ts'
+import { buildSimulationReport, STRESS_STATE_LABELS } from './simulationEngine.ts'
 import type {
   ExportedDashboardSimulation,
   PreventiveRecommendation,
   ReactiveCostBreakdown,
+  SimulatedPlantNode,
   SimulationEconomicAnalysis,
   SimulationReport,
   SimulationStressTimePoint,
@@ -445,5 +454,103 @@ export const hydrateExportedSimulation = (row: {
     report: rawReport,
     stressTimeline,
     economics,
+  }
+}
+
+const normalizeFieldLabel = (value: string | null | undefined): string =>
+  (value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim()
+
+export const matchesSimulationField = (
+  sim: ExportedDashboardSimulation,
+  field: { id: string; name: string },
+): boolean => {
+  const simFieldId = sim.fieldId || sim.report.parcel.fieldId || null
+  if (simFieldId) {
+    return simFieldId === field.id
+  }
+  const simName = normalizeFieldLabel(sim.report.parcel.fieldName)
+  const targetName = normalizeFieldLabel(field.name)
+  return Boolean(simName && targetName && simName === targetName)
+}
+
+export const sanitizeExportedSimulationForField = (
+  sim: ExportedDashboardSimulation,
+  allFields: Array<{ id: string; name: string; geojson_data: Json | null }>,
+): ExportedDashboardSimulation => {
+  const targetFieldId = sim.fieldId ?? sim.report.parcel.fieldId
+  const otherFieldGeojsons = allFields
+    .filter(field => field.id !== targetFieldId && field.geojson_data)
+    .map(field => field.geojson_data)
+
+  if (otherFieldGeojsons.length === 0) return sim
+
+  const { geojson: cleanGeojson, removedCount } = isolateOwnParcelGeoJson(
+    sim.report.parcel.geojson,
+    otherFieldGeojsons,
+  )
+  if (removedCount === 0) return sim
+
+  const cleanProjected = projectFieldGeometry(cleanGeojson as Json)
+  if (!cleanProjected) return sim
+
+  const cleanParcel = extractParcelMetadata(
+    cleanGeojson as Json,
+    targetFieldId ?? null,
+    sim.report.parcel.fieldName,
+  )
+  if (!cleanParcel) return sim
+
+  const filteredPlants: SimulatedPlantNode[] = []
+  for (const plant of sim.report.plants) {
+    const pt = cleanProjected.projectGps(plant.lat, plant.lng)
+    if (!cleanProjected.contains(pt)) continue
+    filteredPlants.push({
+      id: plant.id,
+      x: Number(pt.x.toFixed(3)),
+      z: Number(pt.z.toFixed(3)),
+      lat: plant.lat,
+      lng: plant.lng,
+      stage: plant.stage,
+      waterStressPercent: plant.waterStressPercent,
+      pestStressPercent: plant.pestStressPercent,
+      state: plant.state,
+      health: plant.health,
+      ndvi: plant.ndvi,
+      temp: plant.tempC,
+      status: STRESS_STATE_LABELS[plant.state],
+      irreversible: plant.irreversible,
+      stressedTicks: plant.stressedTicks,
+      history: plant.history,
+    })
+  }
+
+  const takeoffBase = computeTakeoffBaseForField(cleanProjected)
+  const cleanFlight = planOptimizedDroneRoute({
+    field: cleanProjected,
+    basePoint: { x: takeoffBase.x, z: takeoffBase.z },
+    plants: filteredPlants,
+    missionType: sim.report.droneFlight.missionType,
+  })
+  const cleanReport = buildSimulationReport({
+    tick: sim.report.tick,
+    parcel: cleanParcel,
+    plants: filteredPlants,
+    droneFlight: cleanFlight,
+    generatedAt: sim.report.generatedAt,
+  })
+  const cleanTimeline = extractStressTimeline(cleanReport)
+  const cleanEconomics = calculateSimulationEconomics(cleanReport, {
+    cropValuePerHectareMxn: sim.economics.cropReferenceValuePerHectare,
+  })
+
+  return {
+    ...sim,
+    report: cleanReport,
+    stressTimeline: cleanTimeline,
+    economics: cleanEconomics,
   }
 }

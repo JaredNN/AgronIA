@@ -380,3 +380,213 @@ export const calculateParcelPriceEstimate = (
     correctiveCostPerAffectedM2Mxn,
   }
 }
+
+export type SoftwareRentalPlanKey = 'basico' | 'profesional' | 'empresarial'
+
+export interface SoftwareRentalPlan {
+  key: SoftwareRentalPlanKey
+  name: string
+  audience: string
+  hectareRangeLabel: string
+  includedHectares: number
+  basePricePerCycleMxn: number
+  extraHectareRateMxn: number
+  cycleMonthsLabel: string
+  features: string[]
+  recommendedBadge?: string
+}
+
+export interface SoftwareRentalRoiInput {
+  areaHectares: number
+  areaSquareMeters?: number
+  planKey?: SoftwareRentalPlanKey
+  grossAvoidedLossMxn?: number
+  preventiveImplementationCostMxn?: number
+  netPreventiveSavingsMxn?: number
+  droneSavingsMxn?: number
+  reactiveImpactCostMxn?: number
+  hasExportedSimulation?: boolean
+  cropKeyOrName?: string | null
+}
+
+export interface SoftwareRentalRoiBreakdown {
+  currency: 'MXN'
+  plan: SoftwareRentalPlan
+  recommendedPlanKey: SoftwareRentalPlanKey
+  areaHectares: number
+  areaSquareMeters: number
+  extraHectares: number
+  extraHectaresCostMxn: number
+  rentalCostPerCycleMxn: number
+  rentalMonthlyEquivalentMxn: number
+  rentalCostPerHectareMxn: number
+  rentalCostPerSquareMeterMxn: number
+  grossAvoidedLossMxn: number
+  preventiveImplementationCostMxn: number
+  droneSavingsMxn: number
+  producerSavingsBeforeRentalMxn: number
+  netBenefitAfterRentalMxn: number
+  roiMultiple: number
+  roiPercentAfterRental: number
+  paybackCovered: boolean
+  rentalShareOfCycleProductionPercent: number
+  isBenchmarkEstimate: boolean
+}
+
+export const SOFTWARE_RENTAL_PLANS: Record<SoftwareRentalPlanKey, SoftwareRentalPlan> = {
+  basico: {
+    key: 'basico',
+    name: 'Plan Básico (Productor)',
+    audience: 'Pequeño productor / parcela piloto',
+    hectareRangeLabel: 'Hasta 3 ha',
+    includedHectares: 3,
+    basePricePerCycleMxn: 1490,
+    extraHectareRateMxn: 320,
+    cycleMonthsLabel: '4–6 meses',
+    features: [
+      'Diagnóstico IA (60 enfermedades + PlantLens)',
+      'Gestión de parcelas y cultivos',
+      'Simulador 3D y estimación real MXN/m²',
+    ],
+  },
+  profesional: {
+    key: 'profesional',
+    name: 'Plan Profesional (Agrícola)',
+    audience: 'Productor mediano / rancho tecnificado',
+    hectareRangeLabel: '3 a 7 ha',
+    includedHectares: 7,
+    basePricePerCycleMxn: 2950,
+    extraHectareRateMxn: 260,
+    cycleMonthsLabel: '4–6 meses',
+    recommendedBadge: 'Recomendado',
+    features: [
+      'Todo lo del Plan Básico + rutas TSP 2-opt',
+      'Telemetría en vivo MAVLink / puente DJI',
+      'Dashboards ejecutivos, historial y 5 usuarios',
+    ],
+  },
+  empresarial: {
+    key: 'empresarial',
+    name: 'Plan Empresarial / Cooperativa',
+    audience: 'Agroindustria, asociaciones o servicios con dron',
+    hectareRangeLabel: '7 a 30 ha',
+    includedHectares: 30,
+    basePricePerCycleMxn: 7900,
+    extraHectareRateMxn: 180,
+    cycleMonthsLabel: '4–6 meses',
+    features: [
+      'Todo lo del Plan Profesional + usuarios ilimitados',
+      'Soporte prioritario e integración multi-dron / IoT',
+      'Reportes ejecutivos por lote y cliente',
+    ],
+  },
+}
+
+export const SOFTWARE_RENTAL_PLAN_LIST: SoftwareRentalPlan[] = [
+  SOFTWARE_RENTAL_PLANS.basico,
+  SOFTWARE_RENTAL_PLANS.profesional,
+  SOFTWARE_RENTAL_PLANS.empresarial,
+]
+
+export const recommendSoftwareRentalPlan = (areaHectares: number): SoftwareRentalPlanKey => {
+  const ha = Number.isFinite(areaHectares) ? Math.max(0, areaHectares) : 0
+  if (ha < 3) return 'basico'
+  if (ha <= 7) return 'profesional'
+  return 'empresarial'
+}
+
+export const calculateSoftwareRentalRoi = (
+  input: SoftwareRentalRoiInput,
+): SoftwareRentalRoiBreakdown => {
+  const areaHectares = Math.max(
+    0.01,
+    Number.isFinite(input.areaHectares) ? input.areaHectares : 10,
+  )
+  const areaSquareMeters = Math.max(
+    1,
+    Number.isFinite(input.areaSquareMeters) ? (input.areaSquareMeters as number) : areaHectares * 10_000,
+  )
+  const recommendedPlanKey = recommendSoftwareRentalPlan(areaHectares)
+  const plan = SOFTWARE_RENTAL_PLANS[input.planKey ?? recommendedPlanKey]
+  const benchmark = resolveCropPricingBenchmark(input.cropKeyOrName, 'maiz')
+
+  const extraHectares = Math.max(0, Number((areaHectares - plan.includedHectares).toFixed(2)))
+  const extraHectaresCostMxn = Math.round(extraHectares * plan.extraHectareRateMxn)
+  const rentalCostPerCycleMxn = plan.basePricePerCycleMxn + extraHectaresCostMxn
+  const rentalMonthlyEquivalentMxn = Math.round(rentalCostPerCycleMxn / 5)
+  const rentalCostPerHectareMxn = Number((rentalCostPerCycleMxn / areaHectares).toFixed(2))
+  const rentalCostPerSquareMeterMxn = Number((rentalCostPerCycleMxn / areaSquareMeters).toFixed(4))
+
+  const cycleProductionCostMxn = areaSquareMeters * benchmark.productionTotalPerM2
+  const rentalShareOfCycleProductionPercent =
+    cycleProductionCostMxn > 0
+      ? Number(((rentalCostPerCycleMxn / cycleProductionCostMxn) * 100).toFixed(2))
+      : 0
+
+  let grossAvoidedLossMxn = 0
+  let preventiveImplementationCostMxn = 0
+  let droneSavingsMxn = 0
+  let producerSavingsBeforeRentalMxn = 0
+  let isBenchmarkEstimate = false
+
+  if (input.hasExportedSimulation) {
+    grossAvoidedLossMxn = Math.max(0, Math.round(input.grossAvoidedLossMxn ?? 0))
+    preventiveImplementationCostMxn = Math.max(0, Math.round(input.preventiveImplementationCostMxn ?? 0))
+    droneSavingsMxn = Math.max(0, Math.round(input.droneSavingsMxn ?? 0))
+    producerSavingsBeforeRentalMxn = Math.max(
+      0,
+      Math.round(
+        input.netPreventiveSavingsMxn
+          ?? Math.max(0, grossAvoidedLossMxn - preventiveImplementationCostMxn),
+      ),
+    )
+  } else {
+    isBenchmarkEstimate = true
+    const avoidedHarvestLoss = areaSquareMeters * benchmark.harvestValuePerM2 * 0.03
+    const inputOptimizationSavings =
+      areaSquareMeters * (benchmark.irrigationPerM2 + benchmark.pestControlPerM2) * 0.12
+    grossAvoidedLossMxn = Math.round(avoidedHarvestLoss + inputOptimizationSavings)
+    preventiveImplementationCostMxn = Math.round(
+      areaSquareMeters * benchmark.preventiveMonitoringPerM2,
+    )
+    droneSavingsMxn = Math.round(areaSquareMeters * benchmark.droneSprayPassPerM2 * 0.35)
+    producerSavingsBeforeRentalMxn = Math.max(
+      0,
+      grossAvoidedLossMxn - preventiveImplementationCostMxn,
+    )
+  }
+
+  const netBenefitAfterRentalMxn = Math.round(producerSavingsBeforeRentalMxn - rentalCostPerCycleMxn)
+  const roiMultiple =
+    rentalCostPerCycleMxn > 0
+      ? Number((producerSavingsBeforeRentalMxn / rentalCostPerCycleMxn).toFixed(2))
+      : 0
+  const roiPercentAfterRental =
+    rentalCostPerCycleMxn > 0
+      ? Number(((netBenefitAfterRentalMxn / rentalCostPerCycleMxn) * 100).toFixed(1))
+      : 0
+
+  return {
+    currency: 'MXN',
+    plan,
+    recommendedPlanKey,
+    areaHectares,
+    areaSquareMeters,
+    extraHectares,
+    extraHectaresCostMxn,
+    rentalCostPerCycleMxn,
+    rentalMonthlyEquivalentMxn,
+    rentalCostPerHectareMxn,
+    rentalCostPerSquareMeterMxn,
+    grossAvoidedLossMxn,
+    preventiveImplementationCostMxn,
+    droneSavingsMxn,
+    producerSavingsBeforeRentalMxn,
+    netBenefitAfterRentalMxn,
+    roiMultiple,
+    roiPercentAfterRental,
+    paybackCovered: producerSavingsBeforeRentalMxn >= rentalCostPerCycleMxn,
+    rentalShareOfCycleProductionPercent,
+    isBenchmarkEstimate,
+  }
+}

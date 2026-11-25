@@ -89,6 +89,7 @@ const renderLayers = (refitBounds = false) => {
   parcelLayer.addTo(polygonGroup)
 
   if (refitBounds) {
+    map.invalidateSize({ animate: false })
     const bounds = parcelLayer.getBounds()
     if (bounds.isValid()) {
       map.fitBounds(bounds, { padding: [36, 36], maxZoom: 19, animate: false })

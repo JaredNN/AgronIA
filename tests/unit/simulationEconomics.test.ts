@@ -18,6 +18,8 @@ import {
   calculateSimulationEconomics,
   extractStressTimeline,
   hydrateExportedSimulation,
+  matchesSimulationField,
+  sanitizeExportedSimulationForField,
 } from '../../src/services/simulationEconomics.ts'
 import type { Json } from '../../src/services/agronomyData.ts'
 
@@ -181,4 +183,58 @@ test('hydrateExportedSimulation validates Supabase rows and ignores legacy rows 
     results: { telemetry: { avgHealth: 90 } } as unknown as Json,
   })
   assert.equal(legacyIgnored, null)
+})
+
+test('matchesSimulationField strictly isolates simulations per parcel and sanitize cleans merged polygons', () => {
+  const polyA = {
+    type: 'Polygon' as const,
+    coordinates: [[[-107.695, 24.750], [-107.690, 24.750], [-107.690, 24.755], [-107.695, 24.755], [-107.695, 24.750]]],
+  }
+  const polyB = {
+    type: 'Polygon' as const,
+    coordinates: [[[-107.505, 24.770], [-107.500, 24.770], [-107.500, 24.775], [-107.505, 24.775], [-107.505, 24.770]]],
+  }
+  const mergedGeo = {
+    type: 'FeatureCollection' as const,
+    features: [
+      { type: 'Feature' as const, geometry: polyA, properties: { name: 'Elemento 1' } },
+      { type: 'Feature' as const, geometry: polyB, properties: { name: 'Elemento 2' } },
+    ],
+  }
+
+  const mergedProj = projectFieldGeometry(mergedGeo)
+  assert.ok(mergedProj)
+  const parcelMeta = extractParcelMetadata(mergedGeo, 'field-a', 'navolato')
+  assert.ok(parcelMeta)
+  const plants = createInitialSimulatedPlants(mergedProj, [], { targetCount: 120 })
+  plants.forEach((p, idx) => {
+    if (idx % 5 === 0) {
+      p.waterStressPercent = 65
+      syncPlantDerivedMetrics(p)
+    }
+  })
+  const base = computeTakeoffBaseForField(mergedProj)
+  const flight = planOptimizedDroneRoute({ field: mergedProj, basePoint: { x: base.x, z: base.z }, plants })
+  const report = buildSimulationReport({ tick: 2, parcel: parcelMeta, plants, droneFlight: flight })
+
+  const simEntry = hydrateExportedSimulation({
+    id: 'sim-a',
+    field_id: 'field-a',
+    scenario_title: 'navolato · Ciclo #2',
+    created_at: '2026-11-25T10:18:00Z',
+    results: { simulation_report: report as unknown as Json },
+  })
+  assert.ok(simEntry)
+
+  assert.equal(matchesSimulationField(simEntry, { id: 'field-a', name: 'navolato' }), true)
+  assert.equal(matchesSimulationField(simEntry, { id: 'field-b', name: 'otra parcela' }), false)
+
+  const cleaned = sanitizeExportedSimulationForField(simEntry, [
+    { id: 'field-a', name: 'navolato', geojson_data: mergedGeo as unknown as Json },
+    { id: 'field-b', name: 'otra parcela', geojson_data: { type: 'Feature', geometry: polyB, properties: {} } as unknown as Json },
+  ])
+
+  assert.ok(cleaned.report.parcel.areaHectares < simEntry.report.parcel.areaHectares * 0.6)
+  assert.ok(cleaned.report.plants.length < simEntry.report.plants.length)
+  assert.ok(cleaned.report.droneFlight.totalDistanceMeters < simEntry.report.droneFlight.totalDistanceMeters * 0.2)
 })

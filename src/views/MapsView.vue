@@ -34,7 +34,12 @@ import {
 } from '../services/agronomyData'
 import { enrichGeoJsonWithParcelMetadata, extractParcelMetadata } from '../services/fieldGeometry'
 import { buildFieldMonitorFeatures, readFieldMonitorData, type FieldMonitorData } from '../services/fieldMonitoring'
-import { mergeFieldMapFeatures, type FieldMapElement } from '../services/fieldMapWorkspace'
+import {
+  extractNewParcelFeaturesForSave,
+  isolateOwnParcelFeatures,
+  mergeFieldMapFeatures,
+  type FieldMapElement,
+} from '../services/fieldMapWorkspace'
 
 interface SavedMapElement extends FieldMapElement {
   id: string
@@ -120,7 +125,35 @@ const handleGeoJsonUpdate = (data: GeoJSON.FeatureCollection) => {
   saveError.value = ''
   saveStatus.value = ''
   errorMessage.value = ''
-  if (!fieldName.value) fieldName.value = `Mapa ${new Date().toLocaleDateString('es-MX')}`
+  if (!fieldName.value && !selectedFieldId.value) {
+    fieldName.value = `Mapa ${new Date().toLocaleDateString('es-MX')}`
+  }
+}
+
+const startNewParcel = () => {
+  if (mapWorkspaceDirty.value && !window.confirm('Hay cambios sin guardar. ¿Deseas limpiar el mapa para dibujar una parcela nueva?')) {
+    return
+  }
+  selectedFieldId.value = ''
+  loadedFieldId.value = ''
+  savedElements.value = []
+  initialFeatures.value = []
+  geojsonData.value = { type: 'FeatureCollection', features: [] }
+  fieldName.value = ''
+  exportStatus.value = ''
+  saveError.value = ''
+  saveStatus.value = 'Lienzo limpio. Dibuja únicamente el polígono de tu nueva parcela y guárdalo con su nombre.'
+  errorMessage.value = ''
+  mapWorkspaceDirty.value = false
+}
+
+const removeFeatureAt = (index: number) => {
+  const nextFeatures = features.value.filter((_, idx) => idx !== index)
+  initialFeatures.value = nextFeatures
+  geojsonData.value = { type: 'FeatureCollection', features: nextFeatures }
+  mapWorkspaceDirty.value = true
+  saveStatus.value = ''
+  errorMessage.value = ''
 }
 
 const refreshFields = async () => {
@@ -174,12 +207,22 @@ const loadWorkspaceElements = async (fieldId: string) => {
 
     const elements = (data ?? []) as SavedMapElement[]
     const validElements = elements.filter(element => isGeometry(element.geometry_data))
-    const loadedFeatures = mergeFieldMapFeatures(fieldGeoJsonById.value.get(fieldId), validElements)
+    const mergedFeatures = mergeFieldMapFeatures(fieldGeoJsonById.value.get(fieldId), validElements)
+    const otherFieldGeojsons = fieldId
+      ? savedFields.value.filter(field => field.id !== fieldId && field.geojson_data).map(field => field.geojson_data)
+      : []
+    const { features: isolatedFeatures, removedCount } = fieldId
+      ? isolateOwnParcelFeatures(mergedFeatures, otherFieldGeojsons)
+      : { features: mergedFeatures, removedCount: 0 }
+
     savedElements.value = elements
-    geojsonData.value = { type: 'FeatureCollection', features: loadedFeatures }
-    initialFeatures.value = loadedFeatures
+    geojsonData.value = { type: 'FeatureCollection', features: isolatedFeatures }
+    initialFeatures.value = isolatedFeatures
     loadedFieldId.value = fieldId
-    mapWorkspaceDirty.value = false
+    mapWorkspaceDirty.value = removedCount > 0
+    if (removedCount > 0) {
+      saveStatus.value = `Se ocultaron ${removedCount} polígono(s) perteneciente(s) a otra parcela. Pulsa "Guardar en Supabase" para dejar limpia esta parcela definitivamente.`
+    }
   } catch (error) {
     if (requestId === workspaceRequestId) {
       errorMessage.value = error instanceof Error
@@ -295,7 +338,8 @@ const saveMap = async () => {
   saveError.value = ''
   try {
     const cleanName = fieldName.value.trim()
-    const rawGeojson = JSON.parse(JSON.stringify(geojsonData.value)) as Json
+    const rawFeatures = extractNewParcelFeaturesForSave(features.value, loadedFieldId.value, savedFields.value)
+    const rawGeojson = JSON.parse(JSON.stringify({ type: 'FeatureCollection', features: rawFeatures })) as Json
     const enrichedGeojson = enrichGeoJsonWithParcelMetadata(rawGeojson, cleanName)
     const id = await saveMapWorkspace(cleanName, enrichedGeojson, store.user.id)
     fieldName.value = ''
@@ -362,7 +406,8 @@ const saveMapElements = async () => {
   try {
     if (!selectedFieldId.value) {
       const cleanName = fieldName.value.trim() || `Mapa ${new Date().toLocaleDateString('es-MX')}`
-      const rawGeo = JSON.parse(JSON.stringify(geojsonData.value)) as Json
+      const rawFeatures = extractNewParcelFeaturesForSave(features.value, loadedFieldId.value, savedFields.value)
+      const rawGeo = JSON.parse(JSON.stringify({ type: 'FeatureCollection', features: rawFeatures })) as Json
       const enriched = enrichGeoJsonWithParcelMetadata(rawGeo, cleanName)
       const fieldId = await saveMapWorkspace(
         cleanName,
@@ -673,14 +718,20 @@ const exportGeoJson = () => {
       <section class="map-column">
         <div class="maps-field-picker">
           <label for="map-field">Relacionar con parcela</label>
-          <select
-            id="map-field"
-            v-model="selectedFieldId"
-            class="maps-field-select"
-          >
-            <option value="">Sin parcela asociada</option>
-            <option v-for="field in savedFields" :key="field.id" :value="field.id">{{ field.name }}</option>
-          </select>
+          <div class="flex flex-1 items-center gap-2 flex-wrap">
+            <select
+              id="map-field"
+              v-model="selectedFieldId"
+              class="maps-field-select flex-1 min-w-[180px]"
+            >
+              <option value="">Sin parcela asociada (nueva)</option>
+              <option v-for="field in savedFields" :key="field.id" :value="field.id">{{ field.name }}</option>
+            </select>
+            <Button variant="outline" size="sm" @click="startNewParcel">
+              <Pentagon class="mr-1.5 h-3.5 w-3.5" />
+              Nueva parcela
+            </Button>
+          </div>
         </div>
         <div v-if="errorMessage" class="map-feedback is-error" role="alert">
           {{ errorMessage }}
@@ -746,6 +797,15 @@ const exportGeoJson = () => {
                 <strong>{{ featureName(feature, index) }}</strong>
                 <small>{{ feature.geometry?.type ?? 'Geometría' }}</small>
               </span>
+              <button
+                type="button"
+                class="rounded-md p-1 text-gray-400 transition hover:bg-red-500/15 hover:text-red-300"
+                title="Quitar elemento de esta parcela"
+                :aria-label="`Quitar ${featureName(feature, index)}`"
+                @click="removeFeatureAt(index)"
+              >
+                <Trash2 :size="14" />
+              </button>
               <Check :size="15" class="feature-check" />
             </div>
 

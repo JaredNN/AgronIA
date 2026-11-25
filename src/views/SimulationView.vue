@@ -49,6 +49,7 @@ import {
 } from '../services/simulationEngine'
 import { buildFullFieldScanWaypoints, planOptimizedDroneRoute } from '../services/droneRoutePlanner'
 import { buildAgriculturalSurroundings, computeValleyMetrics } from '../services/simulationEnvironment'
+import { isolateOwnParcelGeoJson } from '../services/fieldMapWorkspace'
 import type {
   DroneFlightPlanMetrics,
   DroneMissionType,
@@ -316,8 +317,14 @@ const cropPrecautions = computed<string[]>(() => {
 
 const activeFieldGeojsonAndName = (): { geojson: Json; name: string; fieldId: string | null } => {
   const field = fields.value.find(item => item.id === selectedFieldId.value)
-  if (field?.geojson_data && projectFieldGeometry(field.geojson_data)) {
-    return { geojson: field.geojson_data, name: field.name, fieldId: field.id }
+  if (field?.geojson_data) {
+    const otherFieldGeojsons = fields.value
+      .filter(other => other.id !== field.id && other.geojson_data)
+      .map(other => other.geojson_data)
+    const isolatedGeojson = isolateOwnParcelGeoJson(field.geojson_data, otherFieldGeojsons).geojson as Json
+    if (projectFieldGeometry(isolatedGeojson)) {
+      return { geojson: isolatedGeojson, name: field.name, fieldId: field.id }
+    }
   }
   const fallbackStoreMeta = parcelSimStore.activeParcelGeometry
   if (fallbackStoreMeta && projectFieldGeometry(fallbackStoreMeta.geojson)) {

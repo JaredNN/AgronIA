@@ -40,7 +40,14 @@ import {
   type FieldRecord,
 } from '../services/agronomyData'
 import { projectFieldGeometry } from '../services/fieldGeometry'
+import { isolateOwnParcelGeoJson } from '../services/fieldMapWorkspace'
+import { matchesSimulationField, sanitizeExportedSimulationForField } from '../services/simulationEconomics'
 import { useParcelSimulationStore } from '../stores/parcelSimulation'
+import {
+  SOFTWARE_RENTAL_PLAN_LIST,
+  calculateSoftwareRentalRoi,
+  type SoftwareRentalPlanKey,
+} from '../services/cropPricingBenchmarks'
 
 use([
   CanvasRenderer,
@@ -59,12 +66,25 @@ const parcelSimStore = useParcelSimulationStore()
 // ============================================================
 // Reportes de Simulación Exportados (Mapa + Gráficas + Finanzas)
 // ============================================================
-const exportedSimulations = computed(() => parcelSimStore.exportedSimulations)
+const allExportedSimulations = computed(() => parcelSimStore.exportedSimulations)
+const fieldExportedSimulations = computed(() => {
+  const field = selectedField.value
+  if (field) {
+    return allExportedSimulations.value.filter(sim => matchesSimulationField(sim, field))
+  }
+  if (fields.value.length === 0) return allExportedSimulations.value
+  return []
+})
 const selectedSimulationId = computed({
   get: () => parcelSimStore.selectedExportedSimulationId,
   set: (value: string) => parcelSimStore.selectExportedSimulation(value),
 })
-const activeSimulation = computed(() => parcelSimStore.selectedExportedSimulation)
+const activeSimulation = computed(() => {
+  const list = fieldExportedSimulations.value
+  if (list.length === 0) return null
+  const matched = list.find(item => item.id === selectedSimulationId.value) ?? list[0]
+  return sanitizeExportedSimulationForField(matched, fields.value)
+})
 const simulationLoadNote = ref('')
 
 const formatCurrencyMxn = (value: number) =>
@@ -346,7 +366,7 @@ const droneEfficiencyChartOptions = computed(() => {
   }
 })
 
-// Gráfica 4: Comparativo Financiero (Impacto Reactivo vs Inversión Preventiva vs Ahorro Neto)
+// Gráfica 4: Comparativo Financiero (Impacto Reactivo vs Inversión Preventiva vs Renta Software vs Ahorro Neto)
 const financialComparisonChartOptions = computed(() => {
   const econ = activeSimulation.value?.economics
   if (!econ) return {}
@@ -360,7 +380,7 @@ const financialComparisonChartOptions = computed(() => {
     grid: { left: 8, right: 10, top: 16, bottom: 8, containLabel: true },
     xAxis: {
       type: 'category',
-      data: ['Tratamiento\nReactivo', 'Impacto\nTotal', 'Inversión\nPreventiva', 'Ahorro Neto\nProyectado'],
+      data: ['Tratamiento\nReactivo', 'Impacto\nTotal', 'Inversión\nPreventiva', 'Renta\nAgronIA', 'Ahorro Neto\nProyectado'],
       axisLabel: { color: '#c4ccb8', fontSize: 10, lineHeight: 13, interval: 0 },
     },
     yAxis: {
@@ -391,6 +411,10 @@ const financialComparisonChartOptions = computed(() => {
             itemStyle: { color: '#38bdf8', borderRadius: [6, 6, 0, 0] },
           },
           {
+            value: softwareRentalSummary.value.rentalCostPerCycleMxn,
+            itemStyle: { color: '#a855f7', borderRadius: [6, 6, 0, 0] },
+          },
+          {
             value: Math.max(0, econ.totalProjectedNetSavings),
             itemStyle: { color: '#22c55e', borderRadius: [6, 6, 0, 0] },
           },
@@ -398,6 +422,35 @@ const financialComparisonChartOptions = computed(() => {
       },
     ],
   }
+})
+
+// ============================================================
+// Renta del Software AgronIA por ciclo vs. Ahorros al Productor
+// ============================================================
+const selectedRentalPlanKey = ref<SoftwareRentalPlanKey | 'auto'>('auto')
+const softwareRentalSummary = computed(() => {
+  const sim = activeSimulation.value
+  const overridePlan = selectedRentalPlanKey.value === 'auto' ? undefined : selectedRentalPlanKey.value
+  if (sim) {
+    return calculateSoftwareRentalRoi({
+      areaHectares: sim.report.parcel.areaHectares,
+      areaSquareMeters: sim.report.parcel.areaSquareMeters,
+      planKey: overridePlan,
+      grossAvoidedLossMxn: sim.economics.totalProjectedGrossAvoidedCost,
+      preventiveImplementationCostMxn: sim.economics.preventiveTotalCost,
+      netPreventiveSavingsMxn: sim.economics.totalProjectedNetSavings,
+      droneSavingsMxn: sim.economics.reactive.droneFuelSavingsAmount,
+      reactiveImpactCostMxn: sim.economics.reactive.totalReactiveImpactCost,
+      hasExportedSimulation: true,
+    })
+  }
+  const geometry = selectedFieldGeometry.value
+  return calculateSoftwareRentalRoi({
+    areaHectares: geometry?.areaHectares ?? 5,
+    areaSquareMeters: geometry?.areaSquareMeters ?? 50_000,
+    planKey: overridePlan,
+    hasExportedSimulation: false,
+  })
 })
 
 // ============================================================
@@ -429,9 +482,15 @@ const observationError = ref('')
 const observationSuccess = ref('')
 let metricsRequestId = 0
 const selectedField = computed(() => fields.value.find(field => field.id === selectedFieldId.value) ?? null)
-const selectedFieldGeometry = computed(() =>
-  projectFieldGeometry(selectedField.value?.geojson_data ?? null),
-)
+const selectedFieldGeometry = computed(() => {
+  const field = selectedField.value
+  if (!field?.geojson_data) return null
+  const otherFieldGeojsons = fields.value
+    .filter(other => other.id !== field.id && other.geojson_data)
+    .map(other => other.geojson_data)
+  const isolated = isolateOwnParcelGeoJson(field.geojson_data, otherFieldGeojsons).geojson as typeof field.geojson_data
+  return projectFieldGeometry(isolated)
+})
 const fieldDimensionsLabel = computed(() => {
   const geometry = selectedFieldGeometry.value
   if (!geometry) return 'Sin geometría disponible'
@@ -557,11 +616,18 @@ const loadFields = async (): Promise<boolean> => {
     const availableFields = await listFields()
     fields.value = availableFields
     parcelSimStore.setFields(availableFields)
-    const activeSimField = activeSimulation.value?.fieldId
-    if (activeSimField && availableFields.some(field => field.id === activeSimField)) {
-      selectedFieldId.value = activeSimField
+    const preferredFieldId =
+      selectedFieldId.value
+      || parcelSimStore.activeFieldId
+      || parcelSimStore.selectedExportedSimulation?.fieldId
+    if (preferredFieldId && availableFields.some(field => field.id === preferredFieldId)) {
+      selectedFieldId.value = preferredFieldId
     } else if (!availableFields.some(field => field.id === selectedFieldId.value)) {
       selectedFieldId.value = availableFields[0]?.id ?? ''
+    }
+    const matchingSims = fieldExportedSimulations.value
+    if (!matchingSims.some(sim => sim.id === selectedSimulationId.value)) {
+      selectedSimulationId.value = matchingSims[0]?.id ?? ''
     }
     dataError.value = ''
     return true
@@ -652,21 +718,16 @@ const saveObservation = async () => {
   }
 }
 
-watch(selectedFieldId, () => {
+watch(selectedFieldId, newFieldId => {
+  parcelSimStore.selectField(newFieldId)
+  const matchingSims = fieldExportedSimulations.value
+  if (!matchingSims.some(sim => sim.id === selectedSimulationId.value)) {
+    selectedSimulationId.value = matchingSims[0]?.id ?? ''
+  }
   metrics.value = []
   lastUpdated.value = null
   void loadMetrics()
 })
-
-watch(
-  activeSimulation,
-  sim => {
-    if (sim?.fieldId && fields.value.some(field => field.id === sim.fieldId)) {
-      selectedFieldId.value = sim.fieldId
-    }
-  },
-  { immediate: true }
-)
 
 let telemetryInterval: ReturnType<typeof setInterval> | undefined
 onMounted(async () => {
@@ -908,14 +969,14 @@ const pestGaugeOptions = computed(() => ({
         <p>Visualización georreferenciada, evolución fitosanitaria y análisis económico preventivo.</p>
       </div>
       <div class="dashboard-heading-actions flex-wrap">
-        <div v-if="exportedSimulations.length" class="flex items-center gap-2">
+        <div v-if="fieldExportedSimulations.length" class="flex items-center gap-2">
           <label class="sr-only" for="dashboard-simulation-select">Simulación exportada</label>
           <select
             id="dashboard-simulation-select"
             v-model="selectedSimulationId"
             class="max-w-[270px] rounded-lg border border-amber-400/30 bg-[#182019] px-3 py-2 text-xs font-semibold text-amber-200"
           >
-            <option v-for="sim in exportedSimulations" :key="sim.id" :value="sim.id">
+            <option v-for="sim in fieldExportedSimulations" :key="sim.id" :value="sim.id">
               {{ sim.title }} · {{ formatDateTime(sim.exportedAt) }}
             </option>
           </select>
@@ -1027,7 +1088,7 @@ const pestGaugeOptions = computed(() => ({
             {{ formatCurrencyMxn(Math.max(0, activeSimulation.economics.totalProjectedNetSavings)) }}
           </div>
           <div class="dashboard-metric-note">
-            Impacto reactivo: {{ formatCurrencyMxn(activeSimulation.economics.reactive.totalReactiveImpactCost) }} · ROI {{ activeSimulation.economics.overallRoiPercent }}%
+            Renta AgronIA: {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }}/ciclo · Libre tras renta: {{ formatCurrencyMxn(softwareRentalSummary.netBenefitAfterRentalMxn) }}
           </div>
         </div>
       </div>
@@ -1236,15 +1297,207 @@ const pestGaugeOptions = computed(() => ({
       class="flex flex-col items-start justify-between gap-4 rounded-2xl border border-amber-400/25 bg-[#182019]/90 p-5 sm:flex-row sm:items-center"
     >
       <div class="space-y-1">
-        <h2 class="text-base font-bold text-white">Aún no hay simulaciones exportadas al Dashboard</h2>
+        <h2 class="text-base font-bold text-white">
+          {{ selectedField
+            ? `Aún no hay simulaciones exportadas para "${selectedField.name}"`
+            : 'Aún no hay simulaciones exportadas al Dashboard' }}
+        </h2>
         <p class="text-xs text-gray-300">
-          Ejecuta una simulación con tu polígono real en el Simulador 3D y pulsa <strong>Enviar al Dashboard</strong> para ver el mapa satelital georreferenciado, las gráficas y el análisis económico preventivo.
+          Ejecuta una simulación sobre esta parcela en el Simulador 3D y pulsa <strong>Enviar al Dashboard</strong> para ver únicamente su mapa satelital, sus gráficas y su análisis económico.
         </p>
       </div>
-      <RouterLink to="/simulacion" class="dashboard-simulation-link shrink-0">
+      <RouterLink
+        :to="{ path: '/simulacion', query: selectedFieldId ? { fieldId: selectedFieldId } : {} }"
+        class="dashboard-simulation-link shrink-0"
+      >
         Ir al simulador <ArrowRight :size="16" />
       </RouterLink>
     </div>
+
+    <!-- ================================================================ -->
+    <!-- RENTA DEL SOFTWARE AGRONIA POR CICLO VS. AHORROS AL PRODUCTOR   -->
+    <!-- ================================================================ -->
+    <Card class="dashboard-chart-card">
+      <template #header>
+        <div class="dashboard-chart-heading flex-wrap">
+          <div>
+            <span>MODELO COMERCIAL · RENTA DEL SOFTWARE POR CICLO AGRÍCOLA (4–6 MESES)</span>
+            <h3>Costo de renta AgronIA vs. ahorros entregados al productor</h3>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="rounded-full border border-purple-400/30 bg-purple-500/15 px-3 py-1 text-[11px] font-bold text-purple-200">
+              {{ softwareRentalSummary.isBenchmarkEstimate
+                ? `Referencia por superficie (${softwareRentalSummary.areaHectares.toFixed(2)} ha)`
+                : `Simulación exportada (${softwareRentalSummary.areaHectares.toFixed(2)} ha)` }}
+            </span>
+            <button
+              v-if="selectedRentalPlanKey !== 'auto'"
+              type="button"
+              class="rounded-full border border-emerald-400/30 bg-emerald-500/15 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 transition hover:bg-emerald-500/25"
+              @click="selectedRentalPlanKey = 'auto'"
+            >
+              Usar plan sugerido ({{ softwareRentalSummary.recommendedPlanKey }})
+            </button>
+          </div>
+        </div>
+      </template>
+
+      <div class="space-y-5">
+        <!-- Planes por ciclo -->
+        <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+          <button
+            v-for="plan in SOFTWARE_RENTAL_PLAN_LIST"
+            :key="plan.key"
+            type="button"
+            class="flex flex-col justify-between rounded-xl border p-4 text-left transition"
+            :class="softwareRentalSummary.plan.key === plan.key
+              ? 'border-purple-400/70 bg-purple-500/15 shadow-lg shadow-purple-950/30'
+              : 'border-white/10 bg-[#121913]/85 hover:border-emerald-400/35'"
+            @click="selectedRentalPlanKey = plan.key"
+          >
+            <div>
+              <div class="flex items-start justify-between gap-2">
+                <div>
+                  <h4 class="text-sm font-bold text-white">{{ plan.name }}</h4>
+                  <p class="mt-0.5 text-[11px] text-gray-400">{{ plan.audience }}</p>
+                </div>
+                <span
+                  v-if="softwareRentalSummary.recommendedPlanKey === plan.key"
+                  class="shrink-0 rounded-full border border-emerald-400/35 bg-emerald-500/20 px-2 py-0.5 text-[10px] font-bold text-emerald-300"
+                >
+                  Sugerido
+                </span>
+              </div>
+
+              <div class="mt-3 flex items-baseline gap-1.5">
+                <span class="text-2xl font-extrabold text-amber-200">{{ formatCurrencyMxn(plan.basePricePerCycleMxn) }}</span>
+                <span class="text-xs text-gray-300">MXN / ciclo ({{ plan.cycleMonthsLabel }})</span>
+              </div>
+              <p class="mt-1 text-[11px] text-purple-200/90">
+                Rango: <strong>{{ plan.hectareRangeLabel }}</strong> (incluye hasta {{ plan.includedHectares }} ha) · ha extra: <strong>+{{ formatCurrencyMxn(plan.extraHectareRateMxn) }}/ha</strong>
+              </p>
+
+              <ul class="mt-3 space-y-1 text-[11px] text-gray-300">
+                <li v-for="(feat, idx) in plan.features" :key="idx" class="flex items-start gap-1.5">
+                  <span class="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"></span>
+                  <span>{{ feat }}</span>
+                </li>
+              </ul>
+            </div>
+          </button>
+        </div>
+
+        <!-- 4 KPIs explícitos: Renta vs Ahorro vs Beneficio Neto vs ROI -->
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div class="rounded-xl border border-purple-400/30 bg-purple-950/25 p-3.5">
+            <span class="block text-[11px] font-semibold uppercase tracking-wider text-purple-200/80">
+              Costo de renta AgronIA (1 ciclo)
+            </span>
+            <strong class="mt-1 block text-2xl font-extrabold text-purple-200">
+              {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }}
+            </strong>
+            <span class="mt-1 block text-[11px] text-gray-300">
+              ~{{ formatCurrencyMxn(softwareRentalSummary.rentalMonthlyEquivalentMxn) }}/mes ·
+              {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerHectareMxn) }}/ha ·
+              ${{ softwareRentalSummary.rentalCostPerSquareMeterMxn.toFixed(3) }}/m²
+            </span>
+            <span v-if="softwareRentalSummary.extraHectares > 0" class="mt-0.5 block text-[10px] text-amber-300">
+              Incluye +{{ softwareRentalSummary.extraHectares }} ha excedentes (+{{ formatCurrencyMxn(softwareRentalSummary.extraHectaresCostMxn) }})
+            </span>
+          </div>
+
+          <div class="rounded-xl border border-sky-400/30 bg-sky-950/25 p-3.5">
+            <span class="block text-[11px] font-semibold uppercase tracking-wider text-sky-200/80">
+              Ahorro entregado al productor
+            </span>
+            <strong class="mt-1 block text-2xl font-extrabold text-sky-200">
+              {{ formatCurrencyMxn(softwareRentalSummary.producerSavingsBeforeRentalMxn) }}
+            </strong>
+            <span class="mt-1 block text-[11px] text-gray-300">
+              Evita {{ formatCurrencyMxn(softwareRentalSummary.grossAvoidedLossMxn) }} en merma/correctivos +
+              {{ formatCurrencyMxn(softwareRentalSummary.droneSavingsMxn) }} ahorro dron
+            </span>
+          </div>
+
+          <div
+            class="rounded-xl border p-3.5"
+            :class="softwareRentalSummary.netBenefitAfterRentalMxn >= 0
+              ? 'border-emerald-400/35 bg-emerald-950/30'
+              : 'border-amber-400/35 bg-amber-950/25'"
+          >
+            <span class="block text-[11px] font-semibold uppercase tracking-wider text-emerald-200/85">
+              Beneficio neto tras pagar AgronIA
+            </span>
+            <strong
+              class="mt-1 block text-2xl font-extrabold"
+              :class="softwareRentalSummary.netBenefitAfterRentalMxn >= 0 ? 'text-emerald-300' : 'text-amber-300'"
+            >
+              {{ formatCurrencyMxn(softwareRentalSummary.netBenefitAfterRentalMxn) }}
+            </strong>
+            <span class="mt-1 block text-[11px] text-gray-300">
+              Ahorro neto al productor menos la renta del ciclo ({{ softwareRentalSummary.plan.name }})
+            </span>
+          </div>
+
+          <div class="rounded-xl border border-amber-400/30 bg-amber-950/20 p-3.5">
+            <span class="block text-[11px] font-semibold uppercase tracking-wider text-amber-200/85">
+              Retorno sobre la renta (ROI)
+            </span>
+            <strong class="mt-1 block text-2xl font-extrabold text-amber-200">
+              {{ softwareRentalSummary.roiMultiple.toFixed(2) }}×
+              <span class="text-sm font-bold">
+                ({{ softwareRentalSummary.roiPercentAfterRental >= 0 ? '+' : '' }}{{ softwareRentalSummary.roiPercentAfterRental }}%)
+              </span>
+            </strong>
+            <span class="mt-1 block text-[11px] text-gray-300">
+              {{ softwareRentalSummary.paybackCovered
+                ? 'La licencia se paga sola en el mismo ciclo'
+                : 'Se compensa al ampliar superficie o hectáreas tratadas' }} ·
+              {{ softwareRentalSummary.rentalShareOfCycleProductionPercent }}% del costo FIRA
+            </span>
+          </div>
+        </div>
+
+        <!-- Balance explícito línea por línea -->
+        <div class="rounded-xl border border-white/10 bg-[#101711]/90 p-4 text-xs">
+          <div class="mb-2.5 flex items-center justify-between border-b border-white/10 pb-2">
+            <strong class="text-sm text-white">Balance explícito por ciclo agrícola ({{ softwareRentalSummary.areaHectares.toFixed(2) }} ha)</strong>
+            <span class="text-[11px] text-gray-400">Moneda: MXN · Duración estándar 4–6 meses</span>
+          </div>
+          <div class="space-y-2">
+            <div class="flex items-center justify-between gap-4">
+              <span class="text-gray-300">(+) Pérdida de cosecha y tratamientos correctivos evitados con AgronIA</span>
+              <strong class="text-emerald-300">+{{ formatCurrencyMxn(softwareRentalSummary.grossAvoidedLossMxn) }}</strong>
+            </div>
+            <div class="flex items-center justify-between gap-4">
+              <span class="text-gray-300">(+) Ahorro operativo en vuelo y batería del dron (ruta TSP 2-opt)</span>
+              <strong class="text-sky-300">+{{ formatCurrencyMxn(softwareRentalSummary.droneSavingsMxn) }} <small class="font-normal text-gray-400">(incluido en eficiencia)</small></strong>
+            </div>
+            <div class="flex items-center justify-between gap-4">
+              <span class="text-gray-300">(−) Inversión preventiva operativa en campo (riego/monitoreo/insumos)</span>
+              <strong class="text-orange-300">−{{ formatCurrencyMxn(softwareRentalSummary.preventiveImplementationCostMxn) }}</strong>
+            </div>
+            <div class="flex items-center justify-between gap-4 border-t border-white/10 pt-2 font-semibold text-white">
+              <span>(=) Ahorro neto generado al productor (antes de licencia)</span>
+              <span>{{ formatCurrencyMxn(softwareRentalSummary.producerSavingsBeforeRentalMxn) }}</span>
+            </div>
+            <div class="flex items-center justify-between gap-4 rounded-lg border border-purple-400/25 bg-purple-500/10 px-3 py-2 font-semibold text-purple-200">
+              <span>(−) Renta del software AgronIA — {{ softwareRentalSummary.plan.name }}</span>
+              <span>−{{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }}</span>
+            </div>
+            <div
+              class="flex items-center justify-between gap-4 rounded-lg border px-3 py-2.5 text-sm font-extrabold"
+              :class="softwareRentalSummary.netBenefitAfterRentalMxn >= 0
+                ? 'border-emerald-400/35 bg-emerald-500/15 text-emerald-200'
+                : 'border-amber-400/35 bg-amber-500/15 text-amber-200'"
+            >
+              <span>(=) Beneficio neto final para el productor después de pagar AgronIA</span>
+              <span>{{ formatCurrencyMxn(softwareRentalSummary.netBenefitAfterRentalMxn) }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Card>
 
     <!-- ================================================================ -->
     <!-- SECCIÓN SECUNDARIA: AVANCE DEL CULTIVO, OBSERVACIONES Y HISTORIAL -->
