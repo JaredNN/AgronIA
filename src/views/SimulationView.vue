@@ -35,10 +35,11 @@ import {
   applyTreatmentAtLocation,
   buildSimulationReport,
   createInitialSimulatedPlants,
+  introduceEmergentAffections,
   seedStressCentersInsideField,
   STRESS_STATE_LABELS,
 } from '../services/simulationEngine'
-import { planOptimizedDroneRoute } from '../services/droneRoutePlanner'
+import { buildFullFieldScanWaypoints, planOptimizedDroneRoute } from '../services/droneRoutePlanner'
 import { buildAgriculturalSurroundings, computeValleyMetrics } from '../services/simulationEnvironment'
 import type {
   DroneFlightPlanMetrics,
@@ -94,6 +95,7 @@ const currentMode = ref<'rgb' | 'ndvi' | 'thermal'>('rgb')
 const droneState = ref<'IDLE' | 'SCANNING' | 'FLYING' | 'ACTION' | 'RETURNING' | 'CENTINELAS'>('IDLE')
 const currentAction = ref<'NONE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS'>('NONE')
 const simulationPaused = ref(false)
+const hasAnalyzedCrop = ref(false)
 const simulationSpeed = ref<SimulationSpeedMultiplier>(1)
 const showDroneRoute = ref(true)
 const windEnabled = ref(true)
@@ -160,6 +162,7 @@ let pendingDroneSnapshot: typeof liveDrone.value | null = null
 let lastDroneMetricSavedAt = 0
 let propellers: THREE.Mesh[] = []
 let sectorMarkers: THREE.Mesh[] = []
+const discoveredCenterIds = new Set<string>()
 let particleSystem: THREE.Points
 let particleGeo: THREE.BufferGeometry
 let activeWaypoints: DroneRouteWaypoint[] = []
@@ -211,6 +214,43 @@ const fieldDimensionsLabel = computed(() => {
   const field = selectedFieldGeometry.value
   if (!field) return ''
   return `${field.widthMeters.toFixed(1)} m × ${field.depthMeters.toFixed(1)} m · ${field.areaHectares.toFixed(2)} ha · ${field.vertexCount} vértices`
+})
+
+const cropPrecautions = computed<string[]>(() => {
+  if (!hasAnalyzedCrop.value) return []
+  const items: string[] = []
+  const affectedCount =
+    telemetry.value.mildCount +
+    telemetry.value.moderateCount +
+    telemetry.value.criticalCount +
+    telemetry.value.irreversibleCount
+  const recoverableDrought = allPlants.filter(p => p.waterStressPercent >= 18 && !p.irreversible).length
+  const recoverablePest = allPlants.filter(p => p.pestStressPercent >= 18 && !p.irreversible).length
+
+  if (telemetry.value.criticalCount > 0) {
+    items.push(
+      `Priorizar ${telemetry.value.criticalCount} planta(s) críticas antes de que pasen a pérdida irreversible.`
+    )
+  }
+  if (recoverableDrought > 0) {
+    items.push(
+      `Aplicar "Regar" sobre ${recoverableDrought} planta(s) con estrés hídrico siguiendo la ruta TSP optimizada.`
+    )
+  }
+  if (recoverablePest > 0) {
+    items.push(
+      `Ejecutar "Fumigar" focalizado en ${recoverablePest} planta(s) con indicios de plaga.`
+    )
+  }
+  if (telemetry.value.irreversibleCount > 0) {
+    items.push(
+      `Aislar ${telemetry.value.irreversibleCount} planta(s) irreversibles para no desperdiciar agua ni insumos.`
+    )
+  }
+  if (items.length === 0 && affectedCount === 0) {
+    items.push('Cultivo estable. Mantén Centinelas activos para detectar anomalías tempranas.')
+  }
+  return items
 })
 
 const activeFieldGeojsonAndName = (): { geojson: Json; name: string; fieldId: string | null } => {
@@ -462,6 +502,22 @@ const rebuildParcelScene = (regenerateCenters = true) => {
   const { geojson, name, fieldId } = activeFieldGeojsonAndName()
   const projected = projectFieldGeometry(geojson)
   if (!projected) return
+
+  // Reinicia al estado inicial limpio sin trazar ruta hasta que se analice el cultivo
+  hasAnalyzedCrop.value = false
+  droneState.value = 'IDLE'
+  currentAction.value = 'NONE'
+  simulationPaused.value = false
+  simulationTick.value = 0
+  tickAccumulatorSec = 0
+  dronePath = []
+  currentPathIndex = 0
+  activeWaypoints = []
+  activeMissionPlan = null
+  discoveredCenterIds.clear()
+  currentFlightPlan.value = null
+  currentReport.value = null
+  if (particleSystem) particleSystem.visible = false
 
   const meta = extractParcelMetadata(geojson, fieldId, name)
   selectedFieldGeometry.value = projected
@@ -753,10 +809,13 @@ const rebuildParcelScene = (regenerateCenters = true) => {
   hoveredSector.value = null
   updateMaterials(currentMode.value)
   updateTelemetry()
-  refreshRouteAndReport('INSPECT_STRESS', true)
+  if (routeVisualGroup) disposeGroupChildren(routeVisualGroup)
+  currentFlightPlan.value = null
+  currentReport.value = null
   frameCameraOnField()
 
   if (centinelaGroup) {
+    disposeGroupChildren(centinelaGroup)
     scene.value.remove(centinelaGroup)
     centinelaGroup = null
     centinelaPropellers = []
@@ -1108,25 +1167,27 @@ const clearSectorMarkers = () => {
   sectorMarkers = []
 }
 
+const addSingleSectorMarker = (center: StressCenter) => {
+  const geo = new THREE.CircleGeometry(center.radius, 48)
+  geo.rotateX(-Math.PI / 2)
+  const mat = new THREE.MeshBasicMaterial({
+    color: getSectorColor(center.type, center.intensity),
+    map: sectorFalloffTexture,
+    transparent: true,
+    opacity: 0.72,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  })
+  const mesh = new THREE.Mesh(geo, mat)
+  mesh.position.set(center.x, 0.2, center.z)
+  mesh.userData = center
+  scene.value?.add(mesh)
+  sectorMarkers.push(mesh)
+}
+
 const revealSectorMarkersOnScene = () => {
   clearSectorMarkers()
-  stressCenters.forEach(center => {
-    const geo = new THREE.CircleGeometry(center.radius, 48)
-    geo.rotateX(-Math.PI / 2)
-    const mat = new THREE.MeshBasicMaterial({
-      color: getSectorColor(center.type, center.intensity),
-      map: sectorFalloffTexture,
-      transparent: true,
-      opacity: 0.72,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    })
-    const mesh = new THREE.Mesh(geo, mat)
-    mesh.position.set(center.x, 0.2, center.z)
-    mesh.userData = center
-    scene.value?.add(mesh)
-    sectorMarkers.push(mesh)
-  })
+  stressCenters.forEach(addSingleSectorMarker)
 }
 
 const updateMaterials = (mode: 'rgb' | 'ndvi' | 'thermal') => {
@@ -1234,7 +1295,7 @@ const runProgressiveTick = (eventType: PlantStressHistoryEvent = 'degradation', 
   refreshInspectedReferences()
   updateMaterials(currentMode.value)
   updateTelemetry()
-  refreshRouteAndReport('INSPECT_STRESS', true)
+  refreshRouteAndReport('INSPECT_STRESS', hasAnalyzedCrop.value)
 
   if (showBanner && (newlyIrreversibleIds.length > 0 || newlyCriticalIds.length > 0)) {
     const parts: string[] = []
@@ -1244,6 +1305,46 @@ const runProgressiveTick = (eventType: PlantStressHistoryEvent = 'degradation', 
   } else if (showBanner) {
     setActionFeedback(
       `Ciclo #${simulationTick.value} evaluado · Estrés promedio: ${telemetry.value.avgWaterStress}% · Ahorro IA batería: ${currentFlightPlan.value?.batterySavingsPercent ?? 0}%.`
+    )
+  }
+}
+
+const runSentinelCycle = (isInitialActivation = false) => {
+  const projected = selectedFieldGeometry.value
+  if (!projected || allPlants.length === 0) return
+
+  simulationTick.value += 1
+  advanceSimulationTick(allPlants, stressCenters, simulationTick.value, {
+    event: 'sentinel_scan',
+  })
+
+  const emergent = introduceEmergentAffections(
+    projected,
+    allPlants,
+    stressCenters,
+    simulationTick.value,
+    {
+      maxCenters: 8,
+      maxNewPlants: isInitialActivation ? 8 : 6,
+    }
+  )
+
+  hasAnalyzedCrop.value = true
+  refreshInspectedReferences()
+  updateMaterials(currentMode.value)
+  updateTelemetry()
+  revealSectorMarkersOnScene()
+  refreshRouteAndReport('INSPECT_STRESS', true)
+
+  const wpCount = currentFlightPlan.value?.waypoints.filter(w => w.type === 'target').length ?? 0
+  const savingsPct = currentFlightPlan.value?.batterySavingsPercent ?? 0
+  if (emergent.newlyAffectedPlantIds.length > 0) {
+    setActionFeedback(
+      `Centinelas (Ciclo #${simulationTick.value}): ${emergent.newlyAffectedPlantIds.length} planta(s) previamente sanas presentan nuevas afectaciones · Ruta TSP actualizada (${wpCount} puntos, ahorro ${savingsPct}%).`
+    )
+  } else if (isInitialActivation) {
+    setActionFeedback(
+      `Centinelas activos (Ciclo #${simulationTick.value}): ruta TSP optimizada con ${wpCount} puntos (ahorro ${savingsPct}% batería).`
     )
   }
 }
@@ -1423,7 +1524,7 @@ const handleAction = (action: 'ANALYZE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS') =
       scene.value.add(centinelaGroup)
     }
     if (centinelaGroup) centinelaGroup.visible = true
-    setActionFeedback('Centinelas activos: evaluando progresión de estrés hídrico por ciclo y optimizando ruta IA.')
+    runSentinelCycle(true)
     return
   }
 
@@ -1432,49 +1533,28 @@ const handleAction = (action: 'ANALYZE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS') =
     const projected = selectedFieldGeometry.value
     if (!projected) return
 
-    setActionFeedback('Escaneo multiespectral del cultivo en curso dentro del polígono real…', false)
+    // Limpiar cualquier trazado o marcador previo antes de iniciar el barrido completo del campo
+    hasAnalyzedCrop.value = false
+    currentFlightPlan.value = null
+    if (routeVisualGroup) disposeGroupChildren(routeVisualGroup)
+    clearSectorMarkers()
+    discoveredCenterIds.clear()
+
+    setActionFeedback('Recorriendo todo el campo dentro del polígono real para detectar plantas afectadas…', false)
     droneState.value = 'SCANNING'
 
-    // Evalúa un ciclo actual y traza ruta de inspección exclusivamente sobre zonas anómalas (o barrido poligonal si está 100% sano)
-    simulationTick.value += 1
-    advanceSimulationTick(allPlants, stressCenters, simulationTick.value, { event: 'sentinel_scan' })
-    refreshInspectedReferences()
-    updateMaterials(currentMode.value)
-    updateTelemetry()
-
-    const inspectPlan = planOptimizedDroneRoute({
-      field: projected,
-      basePoint: { x: DRONE_BASE.x, z: DRONE_BASE.z },
-      plants: allPlants,
-      missionType: 'INSPECT_STRESS',
-      altitudeMeters: FLIGHT_HEIGHT,
-    })
-    currentFlightPlan.value = inspectPlan
-    renderOptimizedRoute3D(inspectPlan)
-
-    const inspectTargets = inspectPlan.waypoints.filter(wp => wp.type === 'target')
-    if (inspectTargets.length > 0) {
-      dronePath = [
-        ...inspectTargets.map(wp => new THREE.Vector3(wp.x, FLIGHT_HEIGHT, wp.z)),
-        DRONE_BASE.clone(),
-      ]
-    } else {
-      const scanPts: THREE.Vector3[] = []
-      const step = Math.max(4, projected.depthMeters / 4)
-      let dir = true
-      for (let z = projected.bounds.minZ + step * 0.5; z <= projected.bounds.maxZ; z += step) {
-        const segs = computeHorizontalScanlineSegments(z, projected)
-        for (const [s, e] of dir ? segs : [...segs].reverse()) {
-          scanPts.push(new THREE.Vector3(dir ? s : e, FLIGHT_HEIGHT, z))
-          scanPts.push(new THREE.Vector3(dir ? e : s, FLIGHT_HEIGHT, z))
-        }
-        dir = !dir
-      }
-      dronePath = [...scanPts, DRONE_BASE.clone()]
-    }
+    const fullSweep = buildFullFieldScanWaypoints(
+      projected,
+      { x: DRONE_BASE.x, z: DRONE_BASE.z },
+      { passCount: 6 }
+    )
+    dronePath = fullSweep.map((pt, idx) =>
+      idx === 0 || idx === fullSweep.length - 1
+        ? DRONE_BASE.clone()
+        : new THREE.Vector3(pt.x, FLIGHT_HEIGHT, pt.z)
+    )
 
     currentPathIndex = 0
-    void saveScenarioSnapshot(true)
     return
   }
 
@@ -1578,14 +1658,14 @@ const toggleFullscreen = async () => {
 }
 
 const createNewScenario = async () => {
-  if (droneState.value !== 'IDLE' || simulationPaused.value) return
+  if (savingSnapshot.value) return
   if (centinelaGroup) centinelaGroup.visible = false
   currentAction.value = 'NONE'
+  droneState.value = 'IDLE'
   particleSystem.visible = false
   stressCenters = []
   rebuildParcelScene(true)
-  setActionFeedback('Nuevo escenario poligonal generado. Analiza el cultivo o avanza ciclos para observar el estrés.')
-  void saveScenarioSnapshot()
+  setActionFeedback('Escenario reiniciado al estado inicial. Pulsa "Analizar cultivo" para recorrer el campo y trazar la ruta óptima.')
 }
 
 const toggleSimulation = () => {
@@ -1936,11 +2016,7 @@ const initThree = () => {
       tickAccumulatorSec += simDeltaSec
       if (tickAccumulatorSec >= 2.5) {
         tickAccumulatorSec = 0
-        runProgressiveTick('sentinel_scan', false)
-        sectorMarkers.forEach(mesh => {
-          const center = mesh.userData as StressCenter
-          ;(mesh.material as THREE.MeshBasicMaterial).color.setHex(getSectorColor(center.type, center.intensity))
-        })
+        runSentinelCycle(false)
       }
     } else if (droneState.value !== 'IDLE') {
       const rotorSpinScale = dtScale * Math.min(3, speedMult)
@@ -1959,15 +2035,45 @@ const initThree = () => {
           simDeltaSec
         )
 
+        // Detectar sectores dañados conforme el dron sobrevuela todo el polígono
+        for (const center of stressCenters) {
+          if (!discoveredCenterIds.has(center.id)) {
+            const detectRange = Math.max(
+              center.radius * 1.45,
+              (selectedFieldGeometry.value?.widthMeters ?? 50) * 0.18
+            )
+            if (Math.hypot(currentPos.x - center.x, currentPos.z - center.z) <= detectRange) {
+              discoveredCenterIds.add(center.id)
+              addSingleSectorMarker(center)
+            }
+          }
+        }
+
         if (remainingDist < 0.75) {
           currentPathIndex++
           if (currentPathIndex >= dronePath.length) {
             droneState.value = 'IDLE'
             droneGroup.rotation.set(0, 0, 0)
+            hasAnalyzedCrop.value = true
+            simulationTick.value += 1
+            advanceSimulationTick(allPlants, stressCenters, simulationTick.value, {
+              event: 'sentinel_scan',
+            })
+            refreshInspectedReferences()
+            updateMaterials(currentMode.value)
+            updateTelemetry()
             revealSectorMarkersOnScene()
             refreshRouteAndReport('INSPECT_STRESS', true)
+            void saveScenarioSnapshot(true)
+
+            const affectedTotal =
+              telemetry.value.mildCount +
+              telemetry.value.moderateCount +
+              telemetry.value.criticalCount +
+              telemetry.value.irreversibleCount
+            const precautionLead = cropPrecautions.value[0] ?? 'Cultivo listo para seguimiento preventivo.'
             setActionFeedback(
-              `Escaneo completado (Ciclo #${simulationTick.value}). Ruta IA TSP: ${currentFlightPlan.value?.totalDistanceMeters ?? 0} m · Ahorro batería ${currentFlightPlan.value?.batterySavingsPercent ?? 0}%.`
+              `Análisis completo (Ciclo #${simulationTick.value}): ${affectedTotal} planta(s) dañadas detectadas · Ruta TSP óptima: ${currentFlightPlan.value?.totalDistanceMeters ?? 0} m (ahorro ${currentFlightPlan.value?.batterySavingsPercent ?? 0}% batería). Precaución: ${precautionLead}`
             )
           }
         }
@@ -2306,7 +2412,7 @@ onBeforeUnmount(() => {
           <BarChart3 :size="15" />
           {{ exportingToDashboard ? 'Exportando…' : 'Enviar al Dashboard' }}
         </button>
-        <button class="simulation-new-scenario" type="button" @click="createNewScenario" :disabled="droneState !== 'IDLE' || simulationPaused || savingSnapshot">
+        <button class="simulation-new-scenario" type="button" @click="createNewScenario" :disabled="savingSnapshot" title="Reiniciar simulación al estado inicial sin trazado de ruta">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
             <path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.64 5.64l2.12 2.12m8.48 8.48 2.12 2.12m0-12.72-2.12 2.12m-8.48 8.48-2.12 2.12M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" />
           </svg>
@@ -2637,6 +2743,18 @@ onBeforeUnmount(() => {
               </button>
             </div>
           </div>
+
+          <div v-if="hasAnalyzedCrop && cropPrecautions.length" class="mt-3 border-t border-white/10 pt-2.5 space-y-1.5">
+            <span class="block text-[10px] font-bold uppercase tracking-wider text-amber-300">
+              Precauciones recomendadas
+            </span>
+            <ul class="space-y-1 text-[11px] leading-snug text-emerald-100/90">
+              <li v-for="(item, idx) in cropPrecautions" :key="idx" class="flex items-start gap-1.5">
+                <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400"></span>
+                <span>{{ item }}</span>
+              </li>
+            </ul>
+          </div>
         </div>
 
         <!-- Panel de Telemetría en Tiempo Real -->
@@ -2686,7 +2804,7 @@ onBeforeUnmount(() => {
               <span class="text-gray-400">NDVI / Temp.</span>
               <span class="font-bold text-emerald-300">{{ telemetry.avgNDVI }} · {{ telemetry.avgTemp }} °C</span>
             </div>
-            <div v-if="currentFlightPlan" class="mt-2 border-t border-white/15 pt-2 space-y-1 text-[11px]">
+            <div v-if="hasAnalyzedCrop && currentFlightPlan" class="mt-2 border-t border-white/15 pt-2 space-y-1 text-[11px]">
               <div class="flex justify-between items-center font-semibold text-cyan-300">
                 <span>Ruta IA (TSP 2-opt)</span>
                 <span>{{ currentFlightPlan.waypoints.filter(w => w.type === 'target').length }} puntos</span>
@@ -2708,6 +2826,9 @@ onBeforeUnmount(() => {
                 <span>-{{ currentFlightPlan.batterySavingsPercent }}%</span>
               </div>
             </div>
+            <p v-else class="mt-2 border-t border-white/10 pt-2 text-[11px] leading-snug text-gray-400">
+              Pulsa <strong class="text-amber-200">Analizar cultivo</strong> para recorrer el campo y trazar la ruta óptima sobre plantas afectadas.
+            </p>
           </div>
         </div>
       </div>

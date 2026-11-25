@@ -28,6 +28,53 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
 
 const dist2d = (a: FieldPoint, b: FieldPoint): number => Math.hypot(b.x - a.x, b.z - a.z)
 
+/**
+ * Genera el trazado boustrophedon (zig-zag) de inspección completa sobre todo
+ * el polígono real de la parcela para usarse al pulsar "Analizar cultivo".
+ */
+export const buildFullFieldScanWaypoints = (
+  field: ProjectedField,
+  basePoint: FieldPoint,
+  options?: { passCount?: number }
+): FieldPoint[] => {
+  const passCount = clamp(Math.round(options?.passCount ?? 6), 3, 10)
+  const zMin = field.bounds.minZ + field.depthMeters * 0.08
+  const zMax = field.bounds.maxZ - field.depthMeters * 0.08
+  const useSinglePass = zMax <= zMin
+  const step = useSinglePass ? 0 : (zMax - zMin) / Math.max(1, passCount - 1)
+
+  const waypoints: FieldPoint[] = [{ x: basePoint.x, z: basePoint.z }]
+  let leftToRight = true
+  let sweepPoints = 0
+
+  const lineCount = useSinglePass ? 1 : passCount
+  for (let p = 0; p < lineCount; p++) {
+    const z = useSinglePass ? field.centroidLocal.z : zMin + step * p
+    const segments = computeHorizontalScanlineSegments(z, field)
+    if (segments.length === 0) continue
+    const ordered = leftToRight ? segments : [...segments].reverse()
+    for (const [segStart, segEnd] of ordered) {
+      if (leftToRight) {
+        waypoints.push({ x: segStart, z }, { x: segEnd, z })
+      } else {
+        waypoints.push({ x: segEnd, z }, { x: segStart, z })
+      }
+      sweepPoints += 2
+    }
+    leftToRight = !leftToRight
+  }
+
+  if (sweepPoints === 0) {
+    waypoints.push(
+      { x: field.bounds.minX, z: field.centroidLocal.z },
+      { x: field.bounds.maxX, z: field.centroidLocal.z }
+    )
+  }
+
+  waypoints.push({ x: basePoint.x, z: basePoint.z })
+  return waypoints
+}
+
 const computePriorityScore = (
   plant: SimulatedPlantNode,
   missionType: DroneMissionType

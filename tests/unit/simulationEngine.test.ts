@@ -12,6 +12,7 @@ import {
   buildSimulationReport,
   classifyPlantStressState,
   createInitialSimulatedPlants,
+  introduceEmergentAffections,
   seedStressCentersInsideField,
 } from '../../src/services/simulationEngine.ts'
 import { planOptimizedDroneRoute } from '../../src/services/droneRoutePlanner.ts'
@@ -114,4 +115,36 @@ test('buildSimulationReport returns complete typed parcel GeoJSON, lat/lng plant
   assert.ok(report.plants.every(p => Number.isFinite(p.lat) && Number.isFinite(p.lng) && p.history.length === 2))
   assert.equal(report.droneFlight.algorithm, 'priority-nn-2opt-tsp')
   assert.equal(report.droneFlight.orderedCoordinates.length, report.droneFlight.waypoints.length)
+})
+
+test('introduceEmergentAffections affects previously healthy plants and expands optimized drone targets', () => {
+  const field = projectFieldGeometry(DEFAULT_DEMO_PARCEL_GEOJSON)
+  assert.ok(field)
+  const base = computeTakeoffBaseForField(field)
+
+  const slots = createInitialSimulatedPlants(field, [], { targetCount: 120 })
+  const centers = seedStressCentersInsideField(field, slots, { count: 1 })
+  const plants = createInitialSimulatedPlants(field, centers, { targetCount: 120 })
+
+  const planBefore = planOptimizedDroneRoute({
+    field,
+    basePoint: { x: base.x, z: base.z },
+    plants,
+    missionType: 'INSPECT_STRESS',
+  })
+
+  const healthyBefore = new Set(plants.filter(p => p.state === 'saludable').map(p => p.id))
+  const outcome = introduceEmergentAffections(field, plants, centers, 1, { maxCenters: 6, maxNewPlants: 8 })
+  assert.ok(outcome.newlyAffectedPlantIds.length > 0)
+  for (const id of outcome.newlyAffectedPlantIds) {
+    assert.ok(healthyBefore.has(id), `Planta ${id} debía estar previamente sana`)
+  }
+
+  const planAfter = planOptimizedDroneRoute({
+    field,
+    basePoint: { x: base.x, z: base.z },
+    plants,
+    missionType: 'INSPECT_STRESS',
+  })
+  assert.ok(planAfter.targetedPlantCount > planBefore.targetedPlantCount)
 })

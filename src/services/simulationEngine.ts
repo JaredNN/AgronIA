@@ -292,7 +292,7 @@ export const advanceSimulationTick = (
       newlyIrreversibleIds.push(plant.id)
     }
 
-    const entryEvent: PlantStressHistoryEvent =
+  const entryEvent: PlantStressHistoryEvent =
       plant.state === 'pérdida_irreversible' ? 'irreversible_loss' : baseEvent
     pushHistoryEntry(plant, nextTick, timestamp, entryEvent)
   }
@@ -302,6 +302,91 @@ export const advanceSimulationTick = (
     newlyCriticalIds,
     newlyIrreversibleIds,
   }
+}
+
+/**
+ * Al activar o ejecutar Centinelas, introduce focos emergentes sobre plantas que
+ * inicialmente estaban sanas para simular anomalías nuevas y forzar el recálculo de ruta.
+ */
+export const introduceEmergentAffections = (
+  field: ProjectedField,
+  plants: SimulatedPlantNode[],
+  stressCenters: StressCenter[],
+  tick: number,
+  options?: {
+    maxCenters?: number
+    maxNewPlants?: number
+    random?: () => number
+    timestamp?: string
+  }
+): {
+  newlyAffectedPlantIds: string[]
+  addedCenter: StressCenter | null
+} => {
+  const random = options?.random ?? Math.random
+  const timestamp = options?.timestamp ?? new Date().toISOString()
+  const maxCenters = options?.maxCenters ?? 8
+  const maxNewPlants = options?.maxNewPlants ?? 8
+
+  const healthyCandidates = plants.filter(
+    p => p.state === 'saludable' && p.pestStressPercent < 18 && !p.irreversible
+  )
+  if (healthyCandidates.length === 0) {
+    return { newlyAffectedPlantIds: [], addedCenter: null }
+  }
+
+  const outsideExisting = healthyCandidates.filter(p =>
+    stressCenters.every(center => Math.hypot(p.x - center.x, p.z - center.z) >= center.radius * 1.15)
+  )
+  const anchorPool = outsideExisting.length > 0 ? outsideExisting : healthyCandidates
+  const anchor = anchorPool[Math.floor(random() * anchorPool.length)]
+
+  const minDim = Math.max(8, Math.min(field.widthMeters, field.depthMeters))
+  const radius = Number(clamp(minDim * (0.12 + random() * 0.08), 4, 28).toFixed(2))
+  const focusType: StressCenter['type'] = stressCenters.length % 2 === 0 ? 'DROUGHT' : 'PEST'
+
+  let addedCenter: StressCenter | null = null
+  if (stressCenters.length < maxCenters) {
+    addedCenter = {
+      id: `SEC-${stressCenters.length + 1}`,
+      x: anchor.x,
+      z: anchor.z,
+      lat: anchor.lat,
+      lng: anchor.lng,
+      intensity: Number((0.65 + random() * 0.2).toFixed(2)),
+      radius,
+      type: focusType,
+    }
+    stressCenters.push(addedCenter)
+  }
+
+  const effectiveRadius = Math.max(radius, 3.5)
+  const affectedBatch = healthyCandidates
+    .map(plant => ({ plant, dist: Math.hypot(plant.x - anchor.x, plant.z - anchor.z) }))
+    .filter(item => item.dist <= effectiveRadius || item.plant.id === anchor.id)
+    .sort((a, b) => a.dist - b.dist)
+    .slice(0, Math.max(1, maxNewPlants))
+
+  const newlyAffectedPlantIds: string[] = []
+  for (const { plant } of affectedBatch) {
+    if (focusType === 'DROUGHT') {
+      plant.waterStressPercent = clamp(24 + random() * 18, 20, 48)
+    } else {
+      plant.pestStressPercent = clamp(26 + random() * 18, 22, 50)
+      plant.waterStressPercent = clamp(Math.max(plant.waterStressPercent, 20) + random() * 8, 20, 38)
+    }
+    plant.stressedTicks = Math.max(1, plant.stressedTicks + 1)
+    syncPlantDerivedMetrics(plant)
+
+    const lastEntry = plant.history[plant.history.length - 1]
+    if (lastEntry && lastEntry.tick === tick) {
+      plant.history.pop()
+    }
+    pushHistoryEntry(plant, tick, timestamp, 'sentinel_scan')
+    newlyAffectedPlantIds.push(plant.id)
+  }
+
+  return { newlyAffectedPlantIds, addedCenter }
 }
 
 export const applyTreatmentAtLocation = (

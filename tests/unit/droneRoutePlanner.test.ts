@@ -9,7 +9,10 @@ import {
   createInitialSimulatedPlants,
   syncPlantDerivedMetrics,
 } from '../../src/services/simulationEngine.ts'
-import { planOptimizedDroneRoute } from '../../src/services/droneRoutePlanner.ts'
+import {
+  buildFullFieldScanWaypoints,
+  planOptimizedDroneRoute,
+} from '../../src/services/droneRoutePlanner.ts'
 
 test('plans an optimized 2-opt TSP route starting/ending at base, skipping healthy plants, and saving battery', () => {
   const field = projectFieldGeometry(DEFAULT_DEMO_PARCEL_GEOJSON)
@@ -92,4 +95,20 @@ test('returns zero-flight mission when all plants in polygon are healthy', () =>
   assert.equal(plan.totalDistanceMeters, 0)
   assert.equal(plan.estimatedBatteryPercent, 0)
   assert.equal(plan.batterySavingsPercent, 100)
+})
+
+test('buildFullFieldScanWaypoints generates full-field zig-zag sweep strictly inside polygon from/to base', () => {
+  const field = projectFieldGeometry(DEFAULT_DEMO_PARCEL_GEOJSON)
+  assert.ok(field)
+  const base = computeTakeoffBaseForField(field)
+
+  const waypoints = buildFullFieldScanWaypoints(field, { x: base.x, z: base.z }, { passCount: 6 })
+  assert.ok(waypoints.length >= 14)
+  assert.deepEqual(waypoints[0], { x: base.x, z: base.z })
+  assert.deepEqual(waypoints[waypoints.length - 1], { x: base.x, z: base.z })
+
+  const interior = waypoints.slice(1, -1)
+  const minZ = Math.min(...interior.map(p => p.z))
+  const maxZ = Math.max(...interior.map(p => p.z))
+  assert.ok(maxZ - minZ > field.depthMeters * 0.7)
 })
