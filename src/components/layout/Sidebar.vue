@@ -78,16 +78,52 @@ const roleColor = computed(() => {
   return 'text-blue-600'
 })
 
+
+const sidebarDrones = [
+  { id: 'gold-a', color: 'gold', top: '12%', size: '38px', duration: '19s', delay: '-2s', direction: 'right' },
+  { id: 'orange-a', color: 'orange', top: '27%', size: '34px', duration: '23s', delay: '-9s', direction: 'left' },
+  { id: 'green-a', color: 'green', top: '43%', size: '42px', duration: '21s', delay: '-14s', direction: 'right' },
+  { id: 'lime-a', color: 'lime', top: '58%', size: '36px', duration: '25s', delay: '-6s', direction: 'left' },
+  { id: 'teal-a', color: 'teal', top: '72%', size: '40px', duration: '22s', delay: '-18s', direction: 'right' },
+  { id: 'gold-b', color: 'gold', top: '88%', size: '32px', duration: '27s', delay: '-12s', direction: 'left' },
+]
+
 </script>
 
 <template>
   <aside class="app-sidebar topo-sidebar w-64 bg-white border-r border-gray-200 h-screen flex flex-col" aria-label="Navegación principal">
+
+    <div class="topo-drone-scene" aria-hidden="true">
+      <svg
+        v-for="drone in sidebarDrones"
+        :key="drone.id"
+        class="topo-drone"
+        :class="[`topo-drone-${drone.color}`, `topo-drone-${drone.direction}`]"
+        :style="{
+          '--drone-top': drone.top,
+          '--drone-size': drone.size,
+          '--drone-duration': drone.duration,
+          '--drone-delay': drone.delay
+        }"
+        viewBox="0 0 64 32"
+        fill="none"
+      >
+        <ellipse class="topo-drone-rotor" cx="12" cy="10" rx="10" ry="2" fill="currentColor" opacity="0.62" />
+        <ellipse class="topo-drone-rotor" cx="52" cy="10" rx="10" ry="2" fill="currentColor" opacity="0.62" />
+        <path d="M24 14 12 10m28 4 12-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+        <rect x="24" y="12" width="16" height="8" rx="3" fill="#17200f" stroke="currentColor" stroke-width="1.5" />
+        <circle cx="32" cy="22" r="3" fill="currentColor" />
+        <circle class="topo-drone-beacon" cx="32" cy="22" r="6" fill="currentColor" />
+      </svg>
+    </div>
+
     <div class="topo-brand h-16 flex items-center px-6 border-b border-gray-100">
       <div class="topo-brand-content flex items-center">
         <img class="topo-brand-logo" :src="agroniaLogo" alt="AgronIA" />
         <div class="topo-brand-copy" aria-hidden="true">
-          <span>AGRICULTURA</span>
-          <strong>DE PRECISIÓN</strong>
+          <span>PLATAFORMA</span>
+          <strong>AGRÍCOLA</strong>
+          <span>CAMPO · DATOS</span>
         </div>
       </div>
       <span class="topo-brand-version"><i aria-hidden="true"></i> {{ isDesktopApp ? 'DESKTOP' : 'FIELD' }}</span>

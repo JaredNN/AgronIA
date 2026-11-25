@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount, shallowRef } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { BarChart3, Cpu, Download, FileJson, LocateFixed, Maximize2, Minimize2, Move, Pause, Play, RotateCw, Wind } from 'lucide-vue-next'
@@ -51,6 +51,7 @@ import type {
 } from '../types/simulation'
 
 const parcelSimStore = useParcelSimulationStore()
+const route = useRoute()
 const router = useRouter()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -1156,6 +1157,41 @@ const runProgressiveTick = (eventType: PlantStressHistoryEvent = 'degradation', 
   }
 }
 
+const buildSimulationResultsPayload = (
+  reportPayload: SimulationReport | null,
+  stressTimeline: ReturnType<typeof extractStressTimeline>,
+  economics: ReturnType<typeof calculateSimulationEconomics> | null,
+): Json => {
+  const stressedPlants = allPlants.filter(plant => plant.state !== 'saludable').length
+  const deadPlants = allPlants.filter(plant => plant.irreversible).length
+
+  return {
+    telemetry: {
+      ...telemetry.value,
+      stressedPlants,
+      deadPlants,
+    },
+    plants: allPlants.map(plant => ({
+      id: plant.id,
+      gps: { latitude: plant.lat, longitude: plant.lng },
+      health: Number((plant.health / 100).toFixed(3)),
+      waterStress: Number((plant.waterStressPercent / 100).toFixed(3)),
+      dead: plant.irreversible,
+      status: STRESS_STATE_LABELS[plant.state],
+    })) as unknown as Json,
+    timeline: stressTimeline.map(point => ({
+      elapsed: point.tick,
+      health: Number(Math.max(0, Math.min(100, 100 - point.avgWaterStressPercent * 0.75)).toFixed(1)),
+      humidity: Number(Math.max(0, Math.min(100, 100 - point.avgWaterStressPercent)).toFixed(1)),
+      ndvi: Number((point.avgNdvi * 100).toFixed(1)),
+    })) as unknown as Json,
+    simulation_report: reportPayload as unknown as Json,
+    stress_timeline: stressTimeline as unknown as Json,
+    economics: economics as unknown as Json,
+    stress_centers: stressCenters.map(center => ({ ...center })) as unknown as Json,
+  }
+}
+
 const saveScenarioSnapshot = async (saveAlerts = false) => {
   if (savingSnapshot.value) return
   savingSnapshot.value = true
@@ -1192,13 +1228,7 @@ const saveScenarioSnapshot = async (saveAlerts = false) => {
         field_id: fieldId,
         tick: simulationTick.value,
       },
-      results: {
-        telemetry: { ...telemetry.value },
-        simulation_report: reportPayload as unknown as Json,
-        stress_timeline: stressTimeline as unknown as Json,
-        economics: economics as unknown as Json,
-        stress_centers: stressCenters.map(center => ({ ...center })) as unknown as Json,
-      },
+      results: buildSimulationResultsPayload(reportPayload, stressTimeline, economics),
     })
 
     if (reportPayload && economics) {
@@ -1562,13 +1592,7 @@ const exportToDashboard = async () => {
           tick: simulationTick.value,
           exported_to_dashboard: true,
         },
-        results: {
-          telemetry: { ...telemetry.value },
-          simulation_report: report as unknown as Json,
-          stress_timeline: stressTimeline as unknown as Json,
-          economics: economics as unknown as Json,
-          stress_centers: stressCenters.map(center => ({ ...center })) as unknown as Json,
-        },
+        results: buildSimulationResultsPayload(report, stressTimeline, economics),
       })
 
       if (fieldId) {
@@ -2001,7 +2025,8 @@ onMounted(async () => {
     fields.value = await listFields()
     parcelSimStore.setFields(fields.value)
 
-    const preferredId = parcelSimStore.activeFieldId
+    const requestedFieldId = typeof route.query.fieldId === 'string' ? route.query.fieldId : ''
+    const preferredId = requestedFieldId || parcelSimStore.activeFieldId
     const validPreferred = preferredId
       ? fields.value.find(item => item.id === preferredId && Boolean(projectFieldGeometry(item.geojson_data)))
       : null

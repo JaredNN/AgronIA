@@ -36,10 +36,14 @@ test('projects a GeoJSON parcel to meters and measures its bounding dimensions a
   const center = field.projectGps(24.7999, -107.3934)
   assert.ok(Math.abs(center.x) < 1e-8)
   assert.ok(Math.abs(center.z) < 1e-8)
-
   const roundTrip = field.unprojectPoint(center.x, center.z)
   assert.ok(Math.abs(roundTrip.lat - 24.7999) < 1e-6)
   assert.ok(Math.abs(roundTrip.lng - (-107.3934)) < 1e-6)
+  const gps = field.unprojectGps(center)
+  assert.ok(Math.abs(gps.latitude - 24.7999) < 1e-8)
+  assert.ok(Math.abs(gps.longitude + 107.3934) < 1e-8)
+  assert.equal(field.contains(center), true)
+  assert.equal(field.contains({ x: field.widthMeters, z: field.depthMeters }), false)
 })
 
 test('supports multipolygons and rejects invalid or non-polygon geometry', () => {
@@ -124,3 +128,16 @@ test('handles polygon with interior hole in scanline clipping, plant generation,
   assert.ok(meta.perimeterMeters > 0)
 })
 
+test('excludes interior rings when determining whether a simulated plant is in a parcel', () => {
+  const field = projectFieldGeometry({
+    type: 'Polygon',
+    coordinates: [
+      [[0, 0], [0.01, 0], [0.01, 0.01], [0, 0.01], [0, 0]],
+      [[0.004, 0.004], [0.006, 0.004], [0.006, 0.006], [0.004, 0.006], [0.004, 0.004]],
+    ],
+  })
+
+  assert.ok(field)
+  assert.equal(field.contains(field.projectGps(0.005, 0.005)), false)
+  assert.equal(field.contains(field.projectGps(0.002, 0.002)), true)
+})

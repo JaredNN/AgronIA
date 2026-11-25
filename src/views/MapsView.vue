@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, shallowRef } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, ref, shallowRef, watch } from 'vue'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { useMainStore } from '../stores'
 import { useParcelSimulationStore } from '../stores/parcelSimulation'
 import { supabase } from '../services/supabase'
@@ -26,60 +26,69 @@ import {
 } from 'lucide-vue-next'
 import {
   listFields,
+  listSimulations,
   saveMapWorkspace,
-  updateFieldGeojson,
+  updateFieldGeometry,
   type FieldRecord,
-  type Json
+  type Json,
 } from '../services/agronomyData'
 import { enrichGeoJsonWithParcelMetadata, extractParcelMetadata } from '../services/fieldGeometry'
+import { buildFieldMonitorFeatures, readFieldMonitorData, type FieldMonitorData } from '../services/fieldMonitoring'
+import { mergeFieldMapFeatures, type FieldMapElement } from '../services/fieldMapWorkspace'
 
-interface MapFeature {
-  type: 'Feature'
-  geometry: GeoJSON.Geometry | null
-  properties?: Record<string, unknown> | null
-}
-
-interface MapFeatureCollection {
-  type: 'FeatureCollection'
-  features: MapFeature[]
-}
-
-interface SavedMapElement {
+interface SavedMapElement extends FieldMapElement {
   id: string
   user_id: string
   field_id: string | null
   element_type: string
-  name: string | null
-  geometry_data: GeoJSON.Geometry
-  properties: Record<string, unknown> | null
   created_at: string
 }
 
-interface FieldOption {
-  id: string
-  name: string
-}
-
 const store = useMainStore()
+const route = useRoute()
 const router = useRouter()
 const parcelSimStore = useParcelSimulationStore()
-const geojsonData = ref<MapFeatureCollection | null>(null)
+const geojsonData = ref<GeoJSON.FeatureCollection | null>(null)
 const exportStatus = ref('')
 const saveError = ref('')
 const fieldName = ref('')
 const savedFields = shallowRef<FieldRecord[]>([])
+const fieldGeoJsonById = ref(new Map<string, unknown>())
 const isSaving = ref(false)
 const saveStatus = ref('')
 const errorMessage = ref('')
 const loadingSaved = ref(false)
 const saving = ref(false)
 const savedElements = ref<SavedMapElement[]>([])
-const fields = ref<FieldOption[]>([])
 const selectedFieldId = ref('')
+const loadedFieldId = ref('')
+const mapWorkspaceDirty = ref(false)
 const mapBasemap = ref<'satellite' | 'streets'>('satellite')
+const monitorField = ref<FieldRecord | null>(null)
+const monitorData = ref<FieldMonitorData | null>(null)
+const monitorLoading = ref(false)
+const monitorError = ref('')
+const monitorCreatedAt = ref('')
+let monitorRequestId = 0
+let workspaceRequestId = 0
 
-const features = computed(() => geojsonData.value?.features ?? [])
+const monitorFieldId = computed(() =>
+  typeof route.query.fieldId === 'string' ? route.query.fieldId : '',
+)
+const isMonitoring = computed(() => monitorFieldId.value.length > 0)
+const features = computed<GeoJSON.Feature[]>(() => geojsonData.value?.features ?? [])
 const initialFeatures = ref<GeoJSON.Feature[]>([])
+const monitorMapFeatures = ref<GeoJSON.Feature[]>([])
+const mapInitialFeatures = computed<GeoJSON.Feature[]>(() =>
+  isMonitoring.value ? monitorMapFeatures.value : initialFeatures.value,
+)
+const affectedMonitorPlants = computed(() =>
+  (monitorData.value?.plants ?? [])
+    .filter(plant =>
+      plant.dead || plant.waterStress >= 0.15 || (plant.health !== null && plant.health < 0.7),
+    )
+    .sort((left, right) => Number(right.dead) - Number(left.dead) || right.waterStress - left.waterStress),
+)
 const polygonCount = computed(() =>
   features.value.filter(feature =>
     feature.geometry?.type === 'Polygon' || feature.geometry?.type === 'MultiPolygon'
@@ -104,8 +113,9 @@ const lineCount = computed(() =>
   ).length
 )
 
-const handleGeoJsonUpdate = (data: MapFeatureCollection) => {
+const handleGeoJsonUpdate = (data: GeoJSON.FeatureCollection) => {
   geojsonData.value = data
+  mapWorkspaceDirty.value = true
   exportStatus.value = ''
   saveError.value = ''
   saveStatus.value = ''
@@ -114,8 +124,7 @@ const handleGeoJsonUpdate = (data: MapFeatureCollection) => {
 }
 
 const refreshFields = async () => {
-  savedFields.value = await listFields()
-  parcelSimStore.setFields(savedFields.value)
+  setSavedFields(await listFields())
 }
 
 const openInSimulation = (fieldId?: string) => {
@@ -128,14 +137,159 @@ const openInSimulation = (fieldId?: string) => {
   void router.push('/simulacion')
 }
 
-onMounted(() => {
-  void refreshFields().catch(error => {
-    saveError.value = error instanceof Error ? error.message : 'No se pudieron cargar los campos guardados.'
-  })
+const setSavedFields = (fields: FieldRecord[]) => {
+  savedFields.value = fields
+  parcelSimStore.setFields(fields)
+  const geometries = new Map<string, unknown>()
+  for (const field of fields) geometries.set(field.id, field.geojson_data)
+  fieldGeoJsonById.value = geometries
+}
+
+const loadWorkspaceElements = async (fieldId: string) => {
+  if (!supabase || !store.user?.id) {
+    errorMessage.value = 'Inicia sesión y configura Supabase para cargar los elementos del mapa.'
+    return
+  }
+
+  const requestId = ++workspaceRequestId
+  loadingSaved.value = true
+  errorMessage.value = ''
+  try {
+    const result = fieldId
+      ? await supabase
+        .from('map_elements')
+        .select('*')
+        .eq('user_id', store.user.id)
+        .eq('field_id', fieldId)
+        .order('created_at', { ascending: true })
+      : await supabase
+        .from('map_elements')
+        .select('*')
+        .eq('user_id', store.user.id)
+        .is('field_id', null)
+        .order('created_at', { ascending: true })
+    const { data, error } = result
+    if (error) throw new Error(`No se pudieron consultar los elementos de la parcela: ${error.message}`)
+    if (requestId !== workspaceRequestId) return
+
+    const elements = (data ?? []) as SavedMapElement[]
+    const validElements = elements.filter(element => isGeometry(element.geometry_data))
+    const loadedFeatures = mergeFieldMapFeatures(fieldGeoJsonById.value.get(fieldId), validElements)
+    savedElements.value = elements
+    geojsonData.value = { type: 'FeatureCollection', features: loadedFeatures }
+    initialFeatures.value = loadedFeatures
+    loadedFieldId.value = fieldId
+    mapWorkspaceDirty.value = false
+  } catch (error) {
+    if (requestId === workspaceRequestId) {
+      errorMessage.value = error instanceof Error
+        ? error.message
+        : 'No se pudieron cargar los elementos guardados de esta parcela.'
+    }
+  } finally {
+    if (requestId === workspaceRequestId) loadingSaved.value = false
+  }
+}
+
+const loadSavedWorkspace = async () => {
+  loadingSaved.value = true
+  try {
+    const fields = await listFields()
+    setSavedFields(fields)
+    const requestedFieldId = monitorFieldId.value
+      || (typeof route.query.fieldId === 'string' ? route.query.fieldId : '')
+    if (requestedFieldId && !fields.some(field => field.id === requestedFieldId)) {
+      selectedFieldId.value = ''
+      loadedFieldId.value = ''
+      geojsonData.value = { type: 'FeatureCollection', features: [] }
+      initialFeatures.value = []
+      errorMessage.value = 'No se encontró la parcela solicitada o no tienes permiso para verla.'
+      loadingSaved.value = false
+      return
+    }
+    const fieldId = fields.some(field => field.id === requestedFieldId)
+      ? requestedFieldId
+      : fields[0]?.id ?? ''
+    selectedFieldId.value = fieldId
+    await loadWorkspaceElements(fieldId)
+  } catch (error) {
+    errorMessage.value = error instanceof Error
+      ? error.message
+      : 'No se pudieron cargar las parcelas guardadas.'
+    loadingSaved.value = false
+  }
+}
+
+const loadFieldMonitoring = async () => {
+  const requestId = ++monitorRequestId
+  const fieldId = monitorFieldId.value
+  monitorError.value = ''
+  monitorField.value = null
+  monitorData.value = null
+  monitorMapFeatures.value = []
+  monitorCreatedAt.value = ''
+  monitorLoading.value = false
+  if (!fieldId) return
+
+  monitorLoading.value = true
+  try {
+    const [availableFields, simulations] = await Promise.all([
+      listFields(),
+      listSimulations(fieldId),
+    ])
+    if (requestId !== monitorRequestId) return
+    setSavedFields(availableFields)
+    const field = availableFields.find(item => item.id === fieldId)
+    if (!field) throw new Error('No se encontró la parcela o no tienes permiso para verla.')
+    monitorField.value = field
+    const latestSimulation = simulations[0]
+    if (latestSimulation) {
+      monitorData.value = readFieldMonitorData(latestSimulation.results)
+      monitorCreatedAt.value = latestSimulation.created_at
+    }
+    monitorMapFeatures.value = buildFieldMonitorFeatures(field.geojson_data, monitorData.value)
+  } catch (error) {
+    if (requestId === monitorRequestId) {
+      monitorError.value = error instanceof Error
+        ? error.message
+        : 'No se pudo cargar el monitoreo de esta parcela.'
+    }
+  } finally {
+    if (requestId === monitorRequestId) monitorLoading.value = false
+  }
+}
+
+const monitorTrendPoints = (key: 'health' | 'humidity' | 'ndvi') => {
+  const history = monitorData.value?.timeline ?? []
+  if (history.length < 2) return ''
+  return history.map((sample, index) => {
+    const x = (index / (history.length - 1)) * 300
+    const y = 90 - Math.min(100, Math.max(0, sample[key])) * 0.8
+    return `${x.toFixed(1)},${y.toFixed(1)}`
+  }).join(' ')
+}
+
+const monitorValue = (value: number | null | undefined, suffix = '%') =>
+  value === null || value === undefined ? '—' : `${value.toFixed(0)}${suffix}`
+
+onMounted(() => { void loadSavedWorkspace() })
+watch(monitorFieldId, () => { void loadFieldMonitoring() }, { immediate: true })
+
+watch(selectedFieldId, (fieldId, previousFieldId) => {
+  if (fieldId === loadedFieldId.value) return
+  if (mapWorkspaceDirty.value && !window.confirm('Hay cambios sin guardar. ¿Deseas descartarlos y cargar otra parcela?')) {
+    selectedFieldId.value = previousFieldId
+    return
+  }
+  void loadWorkspaceElements(fieldId)
 })
 
 const saveMap = async () => {
   if (!geojsonData.value || features.value.length === 0 || !fieldName.value.trim() || isSaving.value) return
+  if (!store.user?.id) {
+    saveError.value = 'Inicia sesión para guardar este mapa.'
+    return
+  }
   isSaving.value = true
   exportStatus.value = ''
   saveError.value = ''
@@ -143,13 +297,15 @@ const saveMap = async () => {
     const cleanName = fieldName.value.trim()
     const rawGeojson = JSON.parse(JSON.stringify(geojsonData.value)) as Json
     const enrichedGeojson = enrichGeoJsonWithParcelMetadata(rawGeojson, cleanName)
-    const id = await saveMapWorkspace(cleanName, enrichedGeojson)
-    selectedFieldId.value = id
+    const id = await saveMapWorkspace(cleanName, enrichedGeojson, store.user.id)
     fieldName.value = ''
+    selectedFieldId.value = id
+    loadedFieldId.value = id
     exportStatus.value = `Polígono y metadatos guardados (campo ${id.slice(0, 8)}). Listo para simular.`
     try {
       await refreshFields()
       parcelSimStore.selectField(id)
+      await loadWorkspaceElements(id)
     } catch (error) {
       saveError.value = error instanceof Error
         ? `El mapa se guardó, pero no se pudo actualizar la lista: ${error.message}`
@@ -166,7 +322,7 @@ const handleBasemapUpdate = (basemap: 'satellite' | 'streets') => {
   mapBasemap.value = basemap
 }
 
-const featureName = (feature: MapFeature, index: number) => {
+const featureName = (feature: GeoJSON.Feature, index: number) => {
   const name = feature.properties?.name
   return typeof name === 'string' && name.trim()
     ? name
@@ -180,172 +336,170 @@ const isGeometry = (value: unknown): value is GeoJSON.Geometry => {
     : 'coordinates' in value
 }
 
-const loadSavedElements = async () => {
+const saveMapElements = async () => {
+  if (saving.value || loadingSaved.value) return
   if (!supabase || !store.user?.id) {
     errorMessage.value = 'Inicia sesión y configura Supabase para guardar elementos del mapa.'
     return
   }
-
-  loadingSaved.value = true
-  errorMessage.value = ''
-  const [elementsResult, fieldsResult] = await Promise.all([
-    supabase
-      .from('map_elements')
-      .select('*')
-      .eq('user_id', store.user.id)
-      .order('created_at', { ascending: true }),
-    supabase
-      .from('fields')
-      .select('id, name')
-      .eq('user_id', store.user.id)
-      .order('name')
-  ])
-
-  if (elementsResult.error) {
-    errorMessage.value = `No se pudieron consultar los elementos guardados: ${elementsResult.error.message}`
-    savedElements.value = []
-    loadingSaved.value = false
+  if (!geojsonData.value) {
+    errorMessage.value = 'No hay un mapa cargado para guardar.'
     return
   }
-
-  if (fieldsResult.error) {
-    errorMessage.value = `No se pudieron consultar las parcelas: ${fieldsResult.error.message}`
-  } else {
-    fields.value = (fieldsResult.data ?? []) as FieldOption[]
-  }
-
-  savedElements.value = (elementsResult.data ?? []) as SavedMapElement[]
-  selectedFieldId.value = savedElements.value.find(element => element.field_id)?.field_id ?? ''
-  const savedFeatures = savedElements.value.flatMap(element => {
-    if (!isGeometry(element.geometry_data)) return []
-    return [{
-      type: 'Feature' as const,
-      geometry: element.geometry_data,
-      properties: {
-        ...(element.properties ?? {}),
-        name: element.name ?? 'Elemento guardado',
-        map_element_id: element.id
-      }
-    }]
-  })
-
-  geojsonData.value = { type: 'FeatureCollection', features: savedFeatures }
-  initialFeatures.value = savedFeatures
-  loadingSaved.value = false
-}
-
-onMounted(loadSavedElements)
-
-const saveMapElements = async () => {
-  if (!supabase || !store.user?.id || !geojsonData.value || saving.value || loadingSaved.value) return
 
   saving.value = true
   saveStatus.value = ''
   errorMessage.value = ''
   const currentIds = new Set<string>()
-
-  for (const [index, feature] of features.value.entries()) {
-    if (!feature.geometry) {
-      errorMessage.value = `No se pudo guardar ${featureName(feature, index)} porque no tiene geometría.`
-      break
-    }
-
-    const properties = { ...(feature.properties ?? {}) }
-    const elementId = properties.map_element_id
-    delete properties.map_element_id
-    const name = featureName(feature, index)
-    const record = {
-      user_id: store.user.id,
-      field_id: selectedFieldId.value || null,
-      element_type: feature.geometry.type,
-      name,
-      geometry_data: feature.geometry,
-      properties
-    }
-
-    if (typeof elementId === 'string') {
-      const { data, error } = await supabase
-        .from('map_elements')
-        .update(record)
-        .eq('id', elementId)
-        .eq('user_id', store.user.id)
-        .select('id')
-        .maybeSingle()
-
-      if (error || !data) {
-        errorMessage.value = `No se pudo actualizar ${name}: ${error?.message ?? 'No se encontró el registro o faltan permisos.'}`
-        break
-      }
-      currentIds.add(elementId)
-    } else {
-      const { data, error } = await supabase
-        .from('map_elements')
-        .insert(record)
-        .select('id')
-        .single()
-
-      if (error) {
-        errorMessage.value = `No se pudo guardar ${name}: ${error.message}`
-        break
-      }
-
-      if (!data) {
-        errorMessage.value = `No se pudo guardar ${name}: Supabase no devolvió el identificador del elemento.`
-        break
-      }
-      feature.properties = { ...(feature.properties ?? {}), map_element_id: data.id }
-      currentIds.add(data.id)
-    }
+  const invalidFeatureIndex = features.value.findIndex(feature => !feature.geometry)
+  if (invalidFeatureIndex >= 0) {
+    errorMessage.value = `No se pudo guardar ${featureName(features.value[invalidFeatureIndex], invalidFeatureIndex)} porque no tiene geometría.`
+    saving.value = false
+    return
   }
+  let fieldGeometrySaved = false
 
-  if (!errorMessage.value) {
-    const removedIds = savedElements.value
-      .filter(element => !currentIds.has(element.id))
-      .map(element => element.id)
-
-    if (removedIds.length > 0) {
-      const { data, error } = await supabase
-        .from('map_elements')
-        .delete()
-        .eq('user_id', store.user.id)
-        .in('id', removedIds)
-        .select('id')
-
-      if (error) {
-        errorMessage.value = `Los elementos se actualizaron, pero no se pudieron eliminar los que quitaste del mapa: ${error.message}`
-      } else if (data?.length !== removedIds.length) {
-        errorMessage.value = 'Los elementos se actualizaron, pero no se eliminaron todos los que quitaste del mapa. Comprueba los permisos RLS.'
-      }
-    }
-  }
-
-  if (!errorMessage.value) {
-    if (selectedFieldId.value && polygonCount.value > 0 && geojsonData.value) {
-      const targetField = fields.value.find(f => f.id === selectedFieldId.value)
+  try {
+    if (!selectedFieldId.value) {
+      const cleanName = fieldName.value.trim() || `Mapa ${new Date().toLocaleDateString('es-MX')}`
       const rawGeo = JSON.parse(JSON.stringify(geojsonData.value)) as Json
-      const enriched = enrichGeoJsonWithParcelMetadata(rawGeo, targetField?.name || 'Parcela')
+      const enriched = enrichGeoJsonWithParcelMetadata(rawGeo, cleanName)
+      const fieldId = await saveMapWorkspace(
+        cleanName,
+        enriched,
+        store.user.id,
+      )
+      fieldName.value = ''
+      loadedFieldId.value = fieldId
+      selectedFieldId.value = fieldId
+      mapWorkspaceDirty.value = false
+      saveStatus.value = 'Polígono, dimensiones y elementos guardados en Supabase.'
       try {
-        const updated = await updateFieldGeojson(selectedFieldId.value, enriched)
-        parcelSimStore.upsertField(updated)
-        parcelSimStore.selectField(updated.id)
         await refreshFields()
-      } catch (syncError) {
-        errorMessage.value = syncError instanceof Error
-          ? `Elementos guardados, pero no se sincronizó la geometría del campo: ${syncError.message}`
-          : 'Elementos guardados, pero no se sincronizó la geometría del campo.'
+        parcelSimStore.selectField(fieldId)
+        await loadWorkspaceElements(fieldId)
+      } catch (error) {
+        errorMessage.value = error instanceof Error
+          ? `El campo se guardó, pero no se pudo actualizar la lista: ${error.message}`
+          : 'El campo se guardó, pero no se pudo actualizar la lista.'
+      }
+      return
+    }
+
+    const activeFieldName = savedFields.value.find(field => field.id === selectedFieldId.value)?.name || 'Parcela'
+    const rawGeojson = JSON.parse(JSON.stringify(geojsonData.value)) as Json
+    const enrichedGeojson = polygonCount.value > 0
+      ? enrichGeoJsonWithParcelMetadata(rawGeojson, activeFieldName)
+      : rawGeojson
+
+    await updateFieldGeometry(selectedFieldId.value, enrichedGeojson)
+    fieldGeometrySaved = true
+
+    for (const [index, feature] of features.value.entries()) {
+      if (errorMessage.value || !feature.geometry) break
+
+      const properties = { ...(feature.properties ?? {}) }
+      const elementId = properties.map_element_id
+      delete properties.map_element_id
+      const name = featureName(feature, index)
+      const record = {
+        user_id: store.user.id,
+        field_id: selectedFieldId.value || null,
+        element_type: feature.geometry.type,
+        name,
+        geometry_data: feature.geometry,
+        properties
+      }
+
+      if (typeof elementId === 'string') {
+        let updateQuery = supabase
+          .from('map_elements')
+          .update(record)
+          .eq('id', elementId)
+          .eq('user_id', store.user.id)
+        updateQuery = selectedFieldId.value
+          ? updateQuery.eq('field_id', selectedFieldId.value)
+          : updateQuery.is('field_id', null)
+        const { data, error } = await updateQuery.select('id').maybeSingle()
+
+        if (error || !data) {
+          errorMessage.value = `No se pudo actualizar ${name}: ${error?.message ?? 'No se encontró el registro o faltan permisos.'}`
+          break
+        }
+        currentIds.add(elementId)
+      } else {
+        const { data, error } = await supabase
+          .from('map_elements')
+          .insert(record)
+          .select('id')
+          .single()
+
+        if (error) {
+          errorMessage.value = `No se pudo guardar ${name}: ${error.message}`
+          break
+        }
+
+        if (!data) {
+          errorMessage.value = `No se pudo guardar ${name}: Supabase no devolvió el identificador del elemento.`
+          break
+        }
+        feature.properties = { ...(feature.properties ?? {}), map_element_id: data.id }
+        currentIds.add(data.id)
       }
     }
+
+    if (!errorMessage.value) {
+      const removedIds = savedElements.value
+        .filter(element => element.field_id === (selectedFieldId.value || null))
+        .filter(element => isGeometry(element.geometry_data))
+        .filter(element => !currentIds.has(element.id))
+        .map(element => element.id)
+
+      if (removedIds.length > 0) {
+        let deleteQuery = supabase
+          .from('map_elements')
+          .delete()
+          .eq('user_id', store.user.id)
+          .in('id', removedIds)
+        deleteQuery = selectedFieldId.value
+          ? deleteQuery.eq('field_id', selectedFieldId.value)
+          : deleteQuery.is('field_id', null)
+        const { data, error } = await deleteQuery.select('id')
+
+        if (error) {
+          errorMessage.value = `Los elementos se actualizaron, pero no se pudieron eliminar los que quitaste del mapa: ${error.message}`
+        } else if (data?.length !== removedIds.length) {
+          errorMessage.value = 'Los elementos se actualizaron, pero no se eliminaron todos los que quitaste del mapa. Comprueba los permisos RLS.'
+        }
+      }
+    }
+
     if (!errorMessage.value) {
       saveStatus.value = 'Polígono, vértices y elementos guardados en Supabase.'
+      mapWorkspaceDirty.value = false
+      loadedFieldId.value = selectedFieldId.value
+      await refreshFields()
+      parcelSimStore.selectField(selectedFieldId.value)
+      await loadWorkspaceElements(selectedFieldId.value)
+    } else {
+      geojsonData.value = {
+        type: 'FeatureCollection',
+        features: [...features.value]
+      }
+      if (fieldGeometrySaved) {
+        errorMessage.value = `La geometría de la parcela se guardó, pero los elementos no se guardaron: ${errorMessage.value}`
+      }
     }
-    await loadSavedElements()
-  } else {
-    geojsonData.value = {
-      type: 'FeatureCollection',
-      features: [...features.value]
+  } catch (error) {
+    errorMessage.value = error instanceof Error
+      ? error.message
+      : 'No se pudieron guardar los cambios del mapa.'
+    if (fieldGeometrySaved) {
+      errorMessage.value = `La geometría de la parcela se guardó, pero los elementos no se guardaron: ${errorMessage.value}`
     }
+  } finally {
+    saving.value = false
   }
-  saving.value = false
 }
 
 const exportGeoJson = () => {
@@ -375,7 +529,7 @@ const exportGeoJson = () => {
         <p>Explora el terreno, delimita parcelas y prepara tus datos espaciales.</p>
       </div>
 
-      <div class="maps-heading-actions">
+      <div v-if="!isMonitoring" class="maps-heading-actions">
         <div class="maps-live-pill"><Activity :size="15" /> {{ mapBasemap === 'satellite' ? 'Vista satelital' : 'Mapa de calles' }}</div>
         <Button
           variant="outline"
@@ -396,8 +550,106 @@ const exportGeoJson = () => {
           Exportar GeoJSON
         </Button>
       </div>
+      <div v-else class="maps-heading-actions">
+        <RouterLink class="open-simulation-link" :to="{ name: 'maps', query: {} }">
+          <MapPinned :size="15" />
+          Volver al mapa editable
+        </RouterLink>
+      </div>
     </header>
 
+    <section v-if="isMonitoring" class="monitor-view" aria-labelledby="monitor-title">
+      <header class="monitor-heading">
+        <div>
+          <span class="maps-eyebrow"><span></span> MONITOREO DEL CAMPO · CAPA SATELITAL</span>
+          <h2 id="monitor-title">{{ monitorField?.name ?? 'Cargando parcela…' }}</h2>
+          <p>Ubicaciones y métricas de la simulación guardada sobre el contorno geográfico real.</p>
+        </div>
+        <span v-if="monitorCreatedAt" class="monitor-updated">
+          Último análisis: {{ new Date(monitorCreatedAt).toLocaleString('es-MX') }}
+        </span>
+      </header>
+
+      <div v-if="monitorLoading" class="monitor-message" role="status">Cargando parcela y último análisis…</div>
+      <div v-if="monitorError" class="monitor-message is-error" role="alert">{{ monitorError }}</div>
+
+      <template v-if="monitorField">
+        <div class="monitor-summary">
+          <article><span>Salud promedio</span><strong>{{ monitorValue(monitorData?.avgHealth) }}</strong></article>
+          <article><span>Humedad</span><strong>{{ monitorValue(monitorData?.avgHumidity) }}</strong></article>
+          <article><span>NDVI</span><strong>{{ monitorData?.avgNDVI?.toFixed(2) ?? '—' }}</strong></article>
+          <article><span>Plantas afectadas</span><strong class="monitor-warning">{{ monitorData?.stressedPlants ?? affectedMonitorPlants.length }}</strong></article>
+        </div>
+
+        <div class="monitor-layout">
+          <div class="map-card monitor-map-card">
+            <div class="map-card-header">
+              <div>
+                <h2><MapPinned :size="17" /> Parcela y plantas afectadas</h2>
+                <p>El contorno es GeoJSON guardado; los marcadores rojos son ubicaciones simuladas.</p>
+              </div>
+              <span class="map-source"><span></span> {{ mapBasemap === 'satellite' ? 'VISTA SATELITAL' : 'MAPA DE CALLES' }}</span>
+            </div>
+            <div class="map-canvas monitor-map-canvas">
+              <AgroMap
+                :initial-features="mapInitialFeatures"
+                :read-only="true"
+                @update:basemap="handleBasemapUpdate"
+              />
+            </div>
+            <div class="monitor-map-legend">
+              <span><i class="monitor-field-key"></i> Geometría guardada</span>
+              <span><i class="monitor-plant-key"></i> Planta afectada</span>
+              <span>{{ monitorMapFeatures.length }} elementos en el mapa</span>
+            </div>
+          </div>
+
+          <aside class="monitor-details">
+            <section class="monitor-panel">
+              <header>
+                <div><h3>Tendencia del cultivo</h3><p>Datos guardados del análisis</p></div>
+                <Activity :size="17" />
+              </header>
+              <template v-if="monitorData?.timeline.length">
+                <svg class="monitor-chart" viewBox="0 0 300 100" role="img" aria-label="Tendencia de salud, humedad y NDVI">
+                  <line v-for="y in [10, 30, 50, 70, 90]" :key="y" x1="0" :y1="y" x2="300" :y2="y" />
+                  <polyline class="monitor-line-health" :points="monitorTrendPoints('health')" />
+                  <polyline class="monitor-line-humidity" :points="monitorTrendPoints('humidity')" />
+                  <polyline class="monitor-line-ndvi" :points="monitorTrendPoints('ndvi')" />
+                </svg>
+                <div class="monitor-chart-legend">
+                  <span><i class="monitor-line-health-key"></i> Salud</span>
+                  <span><i class="monitor-line-humidity-key"></i> Humedad</span>
+                  <span><i class="monitor-line-ndvi-key"></i> NDVI</span>
+                </div>
+              </template>
+              <p v-else class="monitor-empty">Aún no hay una simulación guardada para esta parcela. Ejecuta un análisis o Centinelas y guarda sus resultados.</p>
+            </section>
+
+            <section class="monitor-panel monitor-plant-panel">
+              <header>
+                <div><h3>Plantas afectadas</h3><p>Estrés hídrico, baja salud o pérdida</p></div>
+                <strong>{{ affectedMonitorPlants.length }}</strong>
+              </header>
+              <div v-if="affectedMonitorPlants.length" class="monitor-plant-list">
+                <div v-for="plant in affectedMonitorPlants.slice(0, 12)" :key="plant.id" class="monitor-plant-row">
+                  <span class="monitor-plant-dot" :class="{ 'is-dead': plant.dead }"></span>
+                  <span><strong>{{ plant.id }}</strong><small>{{ plant.status }} · estrés {{ (plant.waterStress * 100).toFixed(0) }}%</small></span>
+                  <small class="monitor-plant-gps">{{ plant.latitude.toFixed(5) }}, {{ plant.longitude.toFixed(5) }}</small>
+                </div>
+              </div>
+              <p v-else class="monitor-empty">No se registraron plantas afectadas con coordenadas en el último análisis.</p>
+              <p v-if="affectedMonitorPlants.length > 12" class="monitor-footnote">
+                El mapa muestra {{ affectedMonitorPlants.length }} marcadores; aquí se listan los 12 de mayor prioridad.
+              </p>
+              <p class="monitor-footnote">Son datos simulados, no detecciones satelitales en tiempo real. Verifica las plantas en campo.</p>
+            </section>
+          </aside>
+        </div>
+      </template>
+    </section>
+
+    <template v-else>
     <div class="maps-overview" aria-label="Resumen de elementos dibujados">
       <div class="overview-item">
         <span class="overview-icon overview-icon-green"><Shapes :size="17" /></span>
@@ -419,21 +671,21 @@ const exportGeoJson = () => {
 
     <div class="maps-layout">
       <section class="map-column">
-        <div class="mb-3 flex flex-wrap items-center gap-3">
-          <label for="map-field" class="text-sm font-medium text-gray-300">Relacionar con parcela</label>
+        <div class="maps-field-picker">
+          <label for="map-field">Relacionar con parcela</label>
           <select
             id="map-field"
             v-model="selectedFieldId"
-            class="rounded-lg border border-gray-700 bg-gray-900 px-3 py-2 text-sm text-gray-100"
+            class="maps-field-select"
           >
             <option value="">Sin parcela asociada</option>
-            <option v-for="field in fields" :key="field.id" :value="field.id">{{ field.name }}</option>
+            <option v-for="field in savedFields" :key="field.id" :value="field.id">{{ field.name }}</option>
           </select>
         </div>
-        <div v-if="errorMessage" class="mb-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700" role="alert">
+        <div v-if="errorMessage" class="map-feedback is-error" role="alert">
           {{ errorMessage }}
         </div>
-        <div v-if="saveStatus" class="mb-3 rounded-lg border border-green-300 bg-green-50 p-3 text-sm text-green-700" role="status">
+        <div v-if="saveStatus" class="map-feedback is-success" role="status">
           {{ saveStatus }}
         </div>
         <div class="map-card">
@@ -447,7 +699,7 @@ const exportGeoJson = () => {
 
           <div class="map-canvas">
             <AgroMap
-              :initial-features="initialFeatures"
+              :initial-features="mapInitialFeatures"
               @update:geojson="handleGeoJsonUpdate"
               @update:basemap="handleBasemapUpdate"
             />
@@ -557,6 +809,14 @@ const exportGeoJson = () => {
           </button>
         </p>
         <p v-if="saveError" class="export-error" role="alert">{{ saveError }}</p>
+        <RouterLink
+          v-if="selectedFieldId"
+          class="open-simulation-link saved-simulation-link"
+          :to="{ name: 'simulation', query: { fieldId: selectedFieldId } }"
+        >
+          <MapPinned :size="15" />
+          Abrir esta parcela en simulación
+        </RouterLink>
 
         <Card v-if="savedFields.length" class="map-guide-card">
           <template #header>
@@ -607,6 +867,7 @@ const exportGeoJson = () => {
         </Card>
       </aside>
     </div>
+    </template>
   </div>
 </template>
 
@@ -615,15 +876,22 @@ const exportGeoJson = () => {
   --maps-text: #f5f1df;
   --maps-muted: #98a18c;
   min-width: 0;
-  animation: maps-enter 0.48s cubic-bezier(0.16, 1, 0.3, 1) both;
+  color: #e8eddf;
 }
 
 .maps-heading {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
   gap: 1.25rem;
-  margin-bottom: 1.25rem;
+  margin-bottom: 1rem;
+  padding: 20px 22px;
+  border: 1px solid rgba(196, 218, 147, 0.14);
+  border-radius: 20px;
+  background:
+    radial-gradient(ellipse at 2% 0%, rgba(120, 150, 76, 0.15), transparent 54%),
+    linear-gradient(125deg, rgba(27, 35, 25, 0.96), rgba(17, 23, 18, 0.92));
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.14), inset 0 1px rgba(255, 255, 255, 0.035);
 }
 
 .maps-heading-copy { min-width: 0; }
@@ -667,6 +935,104 @@ const exportGeoJson = () => {
   white-space: nowrap;
 }
 
+.open-simulation-link {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 12px;
+  border: 1px solid rgba(142, 180, 91, 0.32);
+  border-radius: 10px;
+  color: #dcedc1;
+  background: rgba(55, 151, 93, 0.12);
+  font-size: 0.74rem;
+  font-weight: 750;
+  text-decoration: none;
+  transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+}
+.open-simulation-link:hover {
+  transform: translateY(-1px);
+  border-color: rgba(142, 180, 91, 0.55);
+  background: rgba(55, 151, 93, 0.2);
+}
+.open-simulation-link:focus-visible { outline: 2px solid #c1e19a; outline-offset: 2px; }
+.open-simulation-link svg { color: #a9d287; }
+.saved-simulation-link { margin-top: 10px; }
+
+.monitor-view { display: grid; gap: 16px; }
+.monitor-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 18px 20px;
+  border: 1px solid rgba(196, 218, 147, 0.13);
+  border-radius: 17px;
+  background: linear-gradient(140deg, rgba(28, 35, 25, 0.95), rgba(15, 20, 16, 0.9));
+}
+.monitor-heading .maps-eyebrow { margin-bottom: 6px; }
+.monitor-heading h2 { margin: 0; color: var(--maps-text); font-size: 1.25rem; font-weight: 800; }
+.monitor-heading p { margin: 5px 0 0; color: var(--maps-muted); font-size: 0.76rem; }
+.monitor-updated { color: #aab69d; font-size: 0.68rem; white-space: nowrap; }
+.monitor-message { padding: 12px 14px; border: 1px solid rgba(196, 218, 147, 0.14); border-radius: 11px; color: #dce5d4; background: rgba(255,255,255,0.035); font-size: 0.78rem; }
+.monitor-message.is-error { border-color: rgba(239, 68, 68, 0.32); color: #fecaca; background: rgba(127, 29, 29, 0.18); }
+.monitor-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.monitor-summary article {
+  display: grid;
+  gap: 6px;
+  padding: 13px 15px;
+  border: 1px solid rgba(196, 218, 147, 0.12);
+  border-radius: 13px;
+  background: rgba(24, 30, 23, 0.88);
+}
+.monitor-summary article span { color: var(--maps-muted); font-size: 0.68rem; }
+.monitor-summary article strong { color: #e8eedf; font-size: 1.2rem; font-weight: 800; }
+.monitor-summary article strong.monitor-warning { color: #ffb79f; }
+.monitor-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(290px, 360px); gap: 16px; align-items: start; }
+.monitor-map-card { min-width: 0; }
+.monitor-map-canvas { height: clamp(450px, 65vh, 700px); }
+.monitor-map-canvas :deep(.agro-map-shell) { height: 100%; }
+.monitor-map-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding: 11px 15px; border-top: 1px solid rgba(196, 218, 147, 0.09); color: #a8b397; font-size: 0.66rem; }
+.monitor-map-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.monitor-field-key { width: 14px; height: 8px; border: 2px solid #f2cf68; border-radius: 2px; }
+.monitor-plant-key { width: 9px; height: 9px; border: 2px solid #fff; border-radius: 50%; background: #e55c4a; box-shadow: 0 0 0 2px rgba(229, 92, 74, 0.28); }
+.monitor-details { display: grid; gap: 14px; min-width: 0; }
+.monitor-panel {
+  min-width: 0;
+  padding: 15px;
+  border: 1px solid rgba(196, 218, 147, 0.13);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(25, 31, 24, 0.96), rgba(15, 20, 16, 0.92));
+}
+.monitor-panel > header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.monitor-panel > header h3 { margin: 0; color: var(--maps-text); font-size: 0.83rem; font-weight: 800; }
+.monitor-panel > header p { margin: 3px 0 0; color: var(--maps-muted); font-size: 0.65rem; }
+.monitor-panel > header > svg { color: #d2b75c; }
+.monitor-panel > header > strong { color: #ffc2aa; font-size: 1.1rem; }
+.monitor-chart { display: block; width: 100%; height: auto; margin: 13px 0 8px; overflow: visible; }
+.monitor-chart line { stroke: rgba(196, 218, 147, 0.12); stroke-width: 0.7; }
+.monitor-chart polyline { fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+.monitor-line-health { stroke: #8ed39c; }
+.monitor-line-humidity { stroke: #76b8f4; }
+.monitor-line-ndvi { stroke: #e1bc60; }
+.monitor-chart-legend { display: flex; flex-wrap: wrap; gap: 12px; color: #abb59f; font-size: 0.63rem; }
+.monitor-chart-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.monitor-chart-legend i { width: 8px; height: 8px; border-radius: 50%; }
+.monitor-line-health-key { background: #8ed39c; }
+.monitor-line-humidity-key { background: #76b8f4; }
+.monitor-line-ndvi-key { background: #e1bc60; }
+.monitor-empty { margin: 10px 0 2px; padding: 10px; border: 1px dashed rgba(196, 218, 147, 0.16); border-radius: 10px; color: #aeb8a4; font-size: 0.7rem; line-height: 1.5; }
+.monitor-plant-list { display: grid; max-height: 310px; overflow: auto; }
+.monitor-plant-row { display: grid; grid-template-columns: 10px minmax(0, 1fr); align-items: center; gap: 9px; padding: 9px 0; border-top: 1px solid rgba(196, 218, 147, 0.08); }
+.monitor-plant-row > span:nth-child(2) { display: grid; gap: 2px; }
+.monitor-plant-row strong { color: #e7ecde; font-size: 0.68rem; }
+.monitor-plant-row small { color: #aab49f; font-size: 0.61rem; }
+.monitor-plant-row .monitor-plant-gps { grid-column: 2; color: #8f9b84; font-family: ui-monospace, monospace; }
+.monitor-plant-dot { width: 8px; height: 8px; border-radius: 50%; background: #edac52; box-shadow: 0 0 0 3px rgba(237, 172, 82, 0.15); }
+.monitor-plant-dot.is-dead { background: #e55c4a; box-shadow: 0 0 0 3px rgba(229, 92, 74, 0.17); }
+.monitor-footnote { margin: 9px 0 0; color: #87927d; font-size: 0.6rem; line-height: 1.45; }
+
 .map-quick-actions {
   display: grid;
   gap: 12px;
@@ -696,7 +1062,7 @@ const exportGeoJson = () => {
 .maps-overview {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin-bottom: 1.2rem;
+  margin-bottom: 1rem;
   border: 1px solid rgba(196, 218, 147, 0.12);
   border-radius: 18px;
   background: linear-gradient(180deg, rgba(24, 29, 23, 0.96), rgba(18, 22, 18, 0.88));
@@ -728,11 +1094,62 @@ const exportGeoJson = () => {
 
 .maps-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(270px, 332px);
-  gap: 18px;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 330px);
+  gap: 16px;
   align-items: start;
 }
 .map-column, .map-card, .map-sidebar { min-width: 0; }
+.maps-field-picker {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 11px;
+  padding: 6px 8px 6px 14px;
+  border: 1px solid rgba(196, 218, 147, 0.12);
+  border-radius: 13px;
+  background: rgba(22, 29, 22, 0.82);
+}
+.maps-field-picker label {
+  color: #b6c0aa;
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.maps-field-select {
+  width: min(100%, 300px);
+  min-height: 36px !important;
+  margin-left: auto;
+  padding: 0 34px 0 11px !important;
+  border: 1px solid rgba(196, 218, 147, 0.18) !important;
+  border-radius: 9px !important;
+  color: #e9eedf !important;
+  background-color: rgba(9, 15, 11, 0.72) !important;
+  font-size: 0.72rem;
+}
+.maps-field-select:focus-visible {
+  outline: 2px solid rgba(211, 189, 103, 0.5);
+  outline-offset: 2px;
+}
+.map-feedback {
+  margin-bottom: 11px;
+  padding: 11px 13px;
+  border: 1px solid rgba(196, 218, 147, 0.15);
+  border-radius: 11px;
+  color: #dce5d4;
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.75rem;
+}
+.map-feedback.is-error {
+  border-color: rgba(248, 113, 113, 0.25);
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.2);
+}
+.map-feedback.is-success {
+  border-color: rgba(114, 213, 159, 0.22);
+  color: #a8e0ba;
+  background: rgba(16, 105, 69, 0.16);
+}
 .map-card {
   overflow: hidden;
   border: 1px solid rgba(196, 218, 147, 0.14);
@@ -855,6 +1272,8 @@ const exportGeoJson = () => {
 
 @media (max-width: 1023px) {
   .maps-layout { grid-template-columns: minmax(0, 1fr); }
+  .monitor-layout { grid-template-columns: minmax(0, 1fr); }
+  .monitor-details { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .map-sidebar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .maps-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .overview-item { padding-inline: 12px; }
@@ -868,14 +1287,19 @@ const exportGeoJson = () => {
 }
 
 @media (max-width: 767px) {
-  .maps-heading { align-items: flex-start; flex-direction: column; }
-  .maps-heading-actions { width: 100%; justify-content: space-between; }
+  .maps-heading { align-items: flex-start; flex-direction: column; padding: 17px; }
+  .maps-heading-actions { width: 100%; flex-wrap: wrap; justify-content: flex-start; }
+  .monitor-heading { align-items: flex-start; flex-direction: column; }
+  .monitor-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .monitor-details { grid-template-columns: minmax(0, 1fr); }
   .maps-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .overview-item { padding: 12px; }
   .overview-item:nth-child(3) { border-left: 0; border-top: 1px solid rgba(196, 218, 147, 0.1); }
   .overview-item:nth-child(4) { border-top: 1px solid rgba(196, 218, 147, 0.1); }
   .maps-layout { grid-template-columns: minmax(0, 1fr); }
   .map-sidebar { grid-template-columns: 1fr; }
+  .maps-field-picker { align-items: stretch; flex-direction: column; gap: 7px; padding: 11px; }
+  .maps-field-select { width: 100%; margin-left: 0; }
   .map-canvas { height: clamp(320px, 52vh, 500px); height: clamp(320px, 52dvh, 500px); min-height: 0; }
   .map-sidebar { grid-template-columns: minmax(0, 1fr); }
 }
@@ -883,6 +1307,8 @@ const exportGeoJson = () => {
 @media (max-width: 420px) {
   .maps-heading-actions { align-items: stretch; flex-direction: column; }
   .maps-heading-actions > :deep(button) { width: 100%; }
+  .maps-heading-actions > .open-simulation-link { width: 100%; }
+  .maps-live-pill { justify-content: center; }
   .map-card-header { align-items: flex-start; flex-direction: column; }
   .map-source { align-self: flex-start; }
   .map-card-footer { align-items: flex-start; flex-direction: column; }
@@ -890,6 +1316,6 @@ const exportGeoJson = () => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .maps-page, .map-card, .map-sidebar :deep(.app-card), .empty-map-icon, .feature-row { animation: none; }
+  .map-card, .map-sidebar :deep(.app-card), .empty-map-icon, .feature-row { animation: none; }
 }
 </style>

@@ -29,6 +29,8 @@ export interface ProjectedField {
   vertexCount: number
   projectGps(latitude: number, longitude: number): FieldPoint
   unprojectPoint(x: number, z: number): GeoCoordinate
+  unprojectGps(point: FieldPoint): { latitude: number; longitude: number }
+  contains(point: FieldPoint): boolean
 }
 
 export interface GeneratedPlantSlot {
@@ -452,6 +454,14 @@ export const projectFieldGeometry = (geojson: Json | null): ProjectedField | nul
       return { x: point.x - centerX, z: point.z - centerZ }
     },
     unprojectPoint,
+    unprojectGps: point => ({
+      latitude: originLatitude - (point.z + centerZ) / 110_540,
+      longitude: originLongitude + (point.x + centerX) / longitudeScale,
+    }),
+    contains: point => centeredPolygons.some(polygon => {
+      const [exterior, ...holes] = polygon.rings
+      return isPointInRing(point, exterior) && !holes.some(ring => isPointInRing(point, ring))
+    }),
   }
 }
 
