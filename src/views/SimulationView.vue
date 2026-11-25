@@ -3,7 +3,7 @@ import { computed, ref, onMounted, onBeforeUnmount, shallowRef } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
-import { BarChart3, Cpu, Download, FileJson, LocateFixed, Maximize2, Minimize2, Move, Pause, Play, RotateCw, Wind } from 'lucide-vue-next'
+import { BarChart3, Cpu, Download, EyeOff, FastForward, FileJson, LocateFixed, Maximize2, Minimize2, Move, Pause, Play, RotateCw, Route, Wind } from 'lucide-vue-next'
 import DroneConnectionPanel from '../components/simulation/DroneConnectionPanel.vue'
 import { useParcelSimulationStore } from '../stores/parcelSimulation'
 import { calculateSimulationEconomics, extractStressTimeline } from '../services/simulationEconomics'
@@ -39,6 +39,7 @@ import {
   STRESS_STATE_LABELS,
 } from '../services/simulationEngine'
 import { planOptimizedDroneRoute } from '../services/droneRoutePlanner'
+import { buildAgriculturalSurroundings, computeValleyMetrics } from '../services/simulationEnvironment'
 import type {
   DroneFlightPlanMetrics,
   DroneMissionType,
@@ -86,10 +87,15 @@ const liveDrone = ref<{
   groundSpeed: null,
   heading: null,
 })
+const SPEED_OPTIONS = [1, 2, 4, 8] as const
+type SimulationSpeedMultiplier = (typeof SPEED_OPTIONS)[number]
+
 const currentMode = ref<'rgb' | 'ndvi' | 'thermal'>('rgb')
 const droneState = ref<'IDLE' | 'SCANNING' | 'FLYING' | 'ACTION' | 'RETURNING' | 'CENTINELAS'>('IDLE')
 const currentAction = ref<'NONE' | 'WATER' | 'FUMIGATE' | 'CENTINELAS'>('NONE')
 const simulationPaused = ref(false)
+const simulationSpeed = ref<SimulationSpeedMultiplier>(1)
+const showDroneRoute = ref(true)
 const windEnabled = ref(true)
 const cameraFollowEnabled = ref(true)
 const cameraPanMode = ref(false)
@@ -127,6 +133,7 @@ let leafMesh: THREE.InstancedMesh | null = null
 let tasselMesh: THREE.InstancedMesh | null = null
 let earMesh: THREE.InstancedMesh | null = null
 let hitboxMesh: THREE.InstancedMesh | null = null
+let groundMesh: THREE.Mesh | null = null
 let groundMaterial: THREE.MeshLambertMaterial
 let parcelSurfaceMaterial: THREE.MeshLambertMaterial | null = null
 let cropGroup: THREE.Group | null = null
@@ -134,6 +141,7 @@ let parcelSurfaceGroup: THREE.Group | null = null
 let parcelOutlineGroup: THREE.Group | null = null
 let furrowsGroup: THREE.Group | null = null
 let routeVisualGroup: THREE.Group | null = null
+let surroundingsGroup: THREE.Group | null = null
 let leafWindUniform: { value: number } | null = null
 let leafWindStrengthUniform: { value: number } | null = null
 let sectorFalloffTexture: THREE.CanvasTexture | null = null
@@ -170,7 +178,8 @@ let centinelaPropellers: THREE.Mesh[] = []
 
 const DRONE_BASE = new THREE.Vector3(-15, 0.5, 15)
 let FLIGHT_HEIGHT = 8
-let currentFieldFlightSpeed = 0.06
+let currentDroneSpeedMetersPerSec = 16
+const droneStepTemp = new THREE.Vector3()
 const PARTICLE_COUNT = 500
 const particlePositions = new Float32Array(PARTICLE_COUNT * 3)
 const particleVelocities = new Float32Array(PARTICLE_COUNT * 3)
@@ -227,12 +236,58 @@ const activeFieldGeojsonAndName = (): { geojson: Json; name: string; fieldId: st
 const disposeGroupChildren = (group: THREE.Group) => {
   for (const child of [...group.children]) {
     group.remove(child)
-    if (child instanceof THREE.Mesh || child instanceof THREE.Line || child instanceof THREE.LineSegments || child instanceof THREE.InstancedMesh) {
+    if (child instanceof THREE.Group) {
+      disposeGroupChildren(child)
+    } else if (
+      child instanceof THREE.Mesh ||
+      child instanceof THREE.Line ||
+      child instanceof THREE.LineSegments ||
+      child instanceof THREE.InstancedMesh
+    ) {
       child.geometry.dispose()
       const materials = Array.isArray(child.material) ? child.material : [child.material]
       materials.forEach(material => material.dispose())
     }
   }
+}
+
+const applySceneFog = (projected: ProjectedField | null) => {
+  if (!scene.value) return
+  if (graphicsQuality.value === 'performance') {
+    scene.value.fog = null
+    return
+  }
+  if (projected) {
+    const valley = computeValleyMetrics(projected)
+    scene.value.fog = new THREE.Fog(
+      0xa8cad9,
+      valley.innerMountainRadius * 0.85,
+      valley.outerMountainRadius * 1.48
+    )
+  } else {
+    scene.value.fog = new THREE.Fog(0xa8cad9, 130, 520)
+  }
+}
+
+const moveDroneToward = (
+  current: THREE.Vector3,
+  target: THREE.Vector3,
+  speedMetersPerSec: number,
+  stepSec: number
+): number => {
+  const distance = current.distanceTo(target)
+  if (distance <= 1e-5) {
+    current.copy(target)
+    return 0
+  }
+  const maxStep = speedMetersPerSec * stepSec
+  if (maxStep >= distance) {
+    current.copy(target)
+    return 0
+  }
+  droneStepTemp.subVectors(target, current)
+  current.addScaledVector(droneStepTemp, maxStep / distance)
+  return distance - maxStep
 }
 
 const clearLiveDroneTrail = () => {
@@ -252,18 +307,20 @@ const frameCameraOnField = () => {
   if (!geometry) {
     camera.value.position.set(0, 29, 42)
     controls.value.minDistance = 3
-    controls.value.maxDistance = 180
+    controls.value.maxDistance = 240
+    camera.value.far = 2400
+    camera.value.updateProjectionMatrix()
   } else {
-    const maxDimension = Math.max(geometry.widthMeters, geometry.depthMeters)
-    const fieldRadius = Math.hypot(geometry.widthMeters, geometry.depthMeters) / 2
+    const valley = computeValleyMetrics(geometry)
+    const fieldRadius = valley.fieldRadius
     const aspect = Math.max(camera.value.aspect, 0.01)
     const halfVerticalFov = THREE.MathUtils.degToRad(camera.value.fov / 2)
     const halfFitFov = Math.atan(Math.tan(halfVerticalFov) * Math.min(aspect, 1))
     const distance = fieldRadius / Math.sin(halfFitFov) * 1.2
     camera.value.position.set(0, distance * 0.58, distance * 0.82)
     controls.value.minDistance = 3
-    controls.value.maxDistance = Math.max(120, distance * 2, maxDimension * 4)
-    camera.value.far = Math.max(1000, distance * 4)
+    controls.value.maxDistance = Math.max(160, distance * 2.2, valley.innerMountainRadius * 0.92)
+    camera.value.far = Math.max(2400, valley.outerMountainRadius * 3.5)
     camera.value.updateProjectionMatrix()
   }
   controls.value.update()
@@ -275,7 +332,7 @@ const createParcelPolygonMesh = (projected: ProjectedField): THREE.Mesh[] => {
   texture.anisotropy = renderer.value?.capabilities.getMaxAnisotropy() || 8
   if (parcelSurfaceMaterial) parcelSurfaceMaterial.dispose()
   parcelSurfaceMaterial = new THREE.MeshLambertMaterial({
-    color: currentMode.value === 'rgb' ? 0xffffff : currentMode.value === 'ndvi' ? 0x1e40af : 0x450a0a,
+    color: currentMode.value === 'rgb' ? 0xebd0b0 : currentMode.value === 'ndvi' ? 0x1e40af : 0x450a0a,
     map: texture,
     side: THREE.DoubleSide,
   })
@@ -320,6 +377,7 @@ const createParcelPolygonMesh = (projected: ProjectedField): THREE.Mesh[] => {
 const renderOptimizedRoute3D = (plan: DroneFlightPlanMetrics) => {
   if (!routeVisualGroup) return
   disposeGroupChildren(routeVisualGroup)
+  routeVisualGroup.visible = showDroneRoute.value
 
   const targetWaypoints = plan.waypoints.filter(wp => wp.type === 'target')
   if (targetWaypoints.length === 0) return
@@ -412,10 +470,11 @@ const rebuildParcelScene = (regenerateCenters = true) => {
 
   const baseInfo = computeTakeoffBaseForField(projected)
   DRONE_BASE.set(baseInfo.x, 0.5, baseInfo.z)
-  const maxDim = Math.max(projected.widthMeters, projected.depthMeters)
+  const valley = computeValleyMetrics(projected)
+  const maxDim = valley.maxDim
   const minDim = Math.max(10, Math.min(projected.widthMeters, projected.depthMeters))
   FLIGHT_HEIGHT = Math.max(7, Math.min(26, maxDim * 0.14))
-  currentFieldFlightSpeed = Math.max(0.035, Math.min(0.11, 5 / Math.max(30, maxDim)))
+  currentDroneSpeedMetersPerSec = Math.max(10, Math.min(42, maxDim * 0.18))
 
   if (droneGroupReady) {
     droneGroup.position.copy(DRONE_BASE)
@@ -425,7 +484,7 @@ const rebuildParcelScene = (regenerateCenters = true) => {
   }
 
   if (mainDirLight) {
-    const shadowHalf = Math.max(45, maxDim * 0.72)
+    const shadowHalf = Math.max(55, maxDim * 0.92)
     mainDirLight.shadow.camera.left = -shadowHalf
     mainDirLight.shadow.camera.right = shadowHalf
     mainDirLight.shadow.camera.top = shadowHalf
@@ -433,8 +492,24 @@ const rebuildParcelScene = (regenerateCenters = true) => {
     mainDirLight.shadow.camera.updateProjectionMatrix()
   }
 
-  if (scene.value && graphicsQuality.value !== 'performance') {
-    scene.value.fog = new THREE.FogExp2(0x9fc6d7, Math.min(0.004, 0.24 / Math.max(55, maxDim)))
+  applySceneFog(projected)
+
+  if (groundMesh) {
+    groundMesh.geometry.dispose()
+    groundMesh.geometry = new THREE.PlaneGeometry(valley.groundSize, valley.groundSize)
+    if (groundMaterial.map) {
+      const tileRepeat = Math.max(14, Math.round(valley.groundSize / 20))
+      groundMaterial.map.repeat.set(tileRepeat, tileRepeat)
+    }
+  }
+
+  if (surroundingsGroup) {
+    disposeGroupChildren(surroundingsGroup)
+    const builtSurroundings = buildAgriculturalSurroundings(projected, {
+      x: DRONE_BASE.x,
+      z: DRONE_BASE.z,
+    })
+    surroundingsGroup.add(builtSurroundings.group)
   }
 
   if (!scene.value || !cropGroup || !parcelOutlineGroup || !parcelSurfaceGroup || !furrowsGroup) return
@@ -756,6 +831,7 @@ const updateLiveDrone = () => {
       ),
       new THREE.LineBasicMaterial({ color: 0x55e6d0, transparent: true, opacity: 0.9 }),
     )
+    liveDroneTrail.visible = showDroneRoute.value
     liveDroneTrail.renderOrder = 3
     scene.value?.add(liveDroneTrail)
   }
@@ -872,7 +948,8 @@ const createSoilTexture = () => {
   const context = canvas.getContext('2d')
   if (!context) throw new Error('No se pudo crear la textura del terreno.')
 
-  context.fillStyle = '#765b40'
+  // Base cálida de tierra agrícola
+  context.fillStyle = '#9c6b43'
   context.fillRect(0, 0, size, size)
 
   let seed = 82471
@@ -880,10 +957,24 @@ const createSoilTexture = () => {
     seed = (seed * 16807) % 2147483647
     return (seed - 1) / 2147483646
   }
+
+  // Manchas orgánicas y variación mineral del suelo
+  for (let i = 0; i < 420; i++) {
+    context.fillStyle = random() > 0.48
+      ? 'rgba(122, 78, 44, 0.16)'
+      : 'rgba(182, 134, 88, 0.14)'
+    const rx = 8 + random() * 24
+    const ry = 5 + random() * 14
+    context.beginPath()
+    context.ellipse(random() * size, random() * size, rx, ry, random() * Math.PI, 0, Math.PI * 2)
+    context.fill()
+  }
+
+  // Grano fino y terrones naturales de tierra
   for (let i = 0; i < 9000; i++) {
     context.fillStyle = random() > 0.52
-      ? 'rgba(42, 35, 25, 0.12)'
-      : 'rgba(208, 174, 119, 0.11)'
+      ? 'rgba(54, 34, 18, 0.16)'
+      : 'rgba(218, 179, 130, 0.14)'
     const diameter = 0.5 + random() * 2
     context.beginPath()
     context.ellipse(
@@ -1040,8 +1131,8 @@ const revealSectorMarkersOnScene = () => {
 
 const updateMaterials = (mode: 'rgb' | 'ndvi' | 'thermal') => {
   currentMode.value = mode
-  const soilTint = mode === 'rgb' ? 0xffffff : mode === 'ndvi' ? 0x1e40af : 0x450a0a
-  if (groundMaterial) groundMaterial.color.setHex(mode === 'rgb' ? 0x4b3b2b : soilTint)
+  const soilTint = mode === 'rgb' ? 0xebd0b0 : mode === 'ndvi' ? 0x1e40af : 0x450a0a
+  if (groundMaterial) groundMaterial.color.setHex(mode === 'rgb' ? 0xd8b48c : soilTint)
   if (parcelSurfaceMaterial) parcelSurfaceMaterial.color.setHex(soilTint)
   if (!trunkMesh || !leafMesh) return
 
@@ -1509,6 +1600,32 @@ const toggleWind = () => {
   setActionFeedback(windEnabled.value ? 'Viento suave activado.' : 'Viento desactivado.')
 }
 
+const setSimulationSpeed = (speed: SimulationSpeedMultiplier) => {
+  simulationSpeed.value = speed
+  setActionFeedback(
+    speed === 1
+      ? 'Velocidad normal de simulación (1x).'
+      : `Tiempo y vuelo del dron acelerados a ${speed}x.`
+  )
+}
+
+const cycleSimulationSpeed = () => {
+  const currentIndex = SPEED_OPTIONS.indexOf(simulationSpeed.value)
+  const nextSpeed = SPEED_OPTIONS[(currentIndex + 1) % SPEED_OPTIONS.length]
+  setSimulationSpeed(nextSpeed)
+}
+
+const toggleDroneRouteVisibility = () => {
+  showDroneRoute.value = !showDroneRoute.value
+  if (routeVisualGroup) routeVisualGroup.visible = showDroneRoute.value
+  if (liveDroneTrail) liveDroneTrail.visible = showDroneRoute.value
+  setActionFeedback(
+    showDroneRoute.value
+      ? 'Trazado de ruta del dron visible.'
+      : 'Trazado de ruta del dron oculto.'
+  )
+}
+
 const exportCropData = () => {
   const rows = [
     ['ID de planta', 'Etapa', 'Estado', 'Estrés hídrico (%)', 'Estrés plaga (%)', 'Salud (%)', 'NDVI', 'Temperatura (°C)', 'Latitud', 'Longitud', 'Local X (m)', 'Local Z (m)'],
@@ -1658,10 +1775,10 @@ const initThree = () => {
   renderer.value.toneMappingExposure = 1.14
 
   scene.value = new THREE.Scene()
-  scene.value.background = new THREE.Color(0x9fc6d7)
-  scene.value.fog = quality === 'performance' ? null : new THREE.FogExp2(0x9fc6d7, 0.0038)
+  scene.value.background = new THREE.Color(0xa8cad9)
+  applySceneFog(selectedFieldGeometry.value)
 
-  camera.value = new THREE.PerspectiveCamera(60, width / height, 0.1, 1000)
+  camera.value = new THREE.PerspectiveCamera(60, width / height, 0.1, 2800)
   camera.value.position.set(0, 29, 42)
   controls.value = new OrbitControls(camera.value, renderer.value.domElement)
   controls.value.target.set(0, 0, 0)
@@ -1671,7 +1788,7 @@ const initThree = () => {
   controls.value.screenSpacePanning = true
   controls.value.mouseButtons.LEFT = THREE.MOUSE.ROTATE
   controls.value.minDistance = 3
-  controls.value.maxDistance = 180
+  controls.value.maxDistance = 240
   controls.value.maxPolarAngle = Math.PI / 2.02
   controls.value.addEventListener('start', () => {
     cameraFollowEnabled.value = false
@@ -1680,7 +1797,7 @@ const initThree = () => {
     pointerDirty = true
   })
 
-  scene.value.add(new THREE.HemisphereLight(0xeaf1df, 0x493b2c, 1.48))
+  scene.value.add(new THREE.HemisphereLight(0xf3f7ec, 0x5c432d, 1.52))
   const dirLight = new THREE.DirectionalLight(0xfff0d2, 2.15)
   dirLight.position.set(-35, 65, 25)
   dirLight.castShadow = quality !== 'performance'
@@ -1696,23 +1813,25 @@ const initThree = () => {
 
   const soilTex = createSoilTexture()
   soilTex.anisotropy = renderer.value.capabilities.getMaxAnisotropy() || 16
-  groundMaterial = new THREE.MeshLambertMaterial({ color: 0x4b3b2b, map: soilTex })
+  groundMaterial = new THREE.MeshLambertMaterial({ color: 0xd8b48c, map: soilTex })
   sectorFalloffTexture = createSectorFalloffTexture()
-  const fieldExtent = selectedFieldGeometry.value
-    ? Math.max(selectedFieldGeometry.value.widthMeters, selectedFieldGeometry.value.depthMeters)
-    : 150
-  const groundSize = Math.max(240, fieldExtent * 2.4)
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), groundMaterial)
-  ground.rotation.x = -Math.PI / 2
-  ground.receiveShadow = true
-  scene.value.add(ground)
+  const initialValley = selectedFieldGeometry.value
+    ? computeValleyMetrics(selectedFieldGeometry.value)
+    : null
+  const groundSize = initialValley ? initialValley.groundSize : 900
+  groundMesh = new THREE.Mesh(new THREE.PlaneGeometry(groundSize, groundSize), groundMaterial)
+  groundMesh.rotation.x = -Math.PI / 2
+  groundMesh.receiveShadow = true
+  scene.value.add(groundMesh)
 
   parcelSurfaceGroup = new THREE.Group()
   furrowsGroup = new THREE.Group()
   cropGroup = new THREE.Group()
   parcelOutlineGroup = new THREE.Group()
   routeVisualGroup = new THREE.Group()
-  scene.value.add(parcelSurfaceGroup, furrowsGroup, cropGroup, parcelOutlineGroup, routeVisualGroup)
+  routeVisualGroup.visible = showDroneRoute.value
+  surroundingsGroup = new THREE.Group()
+  scene.value.add(parcelSurfaceGroup, furrowsGroup, cropGroup, parcelOutlineGroup, routeVisualGroup, surroundingsGroup)
 
   // Dron y Particulas
   droneGroup = createDrone()
@@ -1748,6 +1867,9 @@ const initThree = () => {
     const now = performance.now()
     const deltaSec = Math.min(0.05, Math.max(0.001, (now - lastFrameTimestamp) / 1000))
     const dtScale = deltaSec * 60
+    const speedMult = simulationSpeed.value
+    const simDeltaSec = deltaSec * speedMult
+    const simDtScale = dtScale * speedMult
     lastFrameTimestamp = now
 
     fpsFrameCounter++
@@ -1767,14 +1889,14 @@ const initThree = () => {
       if (renderer.value && scene.value && camera.value) renderer.value.render(scene.value, camera.value)
       return
     }
-    simulationTime += deltaSec
+    simulationTime += simDeltaSec
     if (leafWindUniform) leafWindUniform.value = simulationTime
     if (leafWindStrengthUniform) leafWindStrengthUniform.value = windEnabled.value ? 1 : 0
 
     if (droneState.value === 'IDLE') {
-      const hover = Math.sin(now * 0.0018) * 0.08
+      const hover = Math.sin(simulationTime * 1.8) * 0.08
       droneGroup.position.y = DRONE_BASE.y + hover
-      droneGroup.rotation.z = Math.sin(now * 0.0012) * 0.012
+      droneGroup.rotation.z = Math.sin(simulationTime * 1.2) * 0.012
       propellers.forEach((propeller, index) => {
         propeller.rotation.y += (index % 2 === 0 ? 0.12 : -0.12) * dtScale
       })
@@ -1803,14 +1925,15 @@ const initThree = () => {
 
     // Drone Animation & Simulación Progresiva de Estrés Hídrico
     if (droneState.value === 'CENTINELAS') {
+      const rotorSpinScale = dtScale * Math.min(3, speedMult)
       centinelaPropellers.forEach((p, i) => {
-        p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5) * dtScale
+        p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5) * rotorSpinScale
       })
       if (centinelaGroup) {
-        centinelaGroup.rotation.y += 0.005 * dtScale
+        centinelaGroup.rotation.y += 0.005 * simDtScale
       }
 
-      tickAccumulatorSec += deltaSec
+      tickAccumulatorSec += simDeltaSec
       if (tickAccumulatorSec >= 2.5) {
         tickAccumulatorSec = 0
         runProgressiveTick('sentinel_scan', false)
@@ -1820,17 +1943,23 @@ const initThree = () => {
         })
       }
     } else if (droneState.value !== 'IDLE') {
+      const rotorSpinScale = dtScale * Math.min(3, speedMult)
       propellers.forEach((p, i) => {
-        p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5) * dtScale
+        p.rotation.y += (i % 2 === 0 ? 0.5 : -0.5) * rotorSpinScale
       })
       const currentPos = droneGroup.position
 
       if (droneState.value === 'SCANNING') {
         const targetPos = dronePath[currentPathIndex]
-        currentPos.lerp(targetPos, Math.min(0.18, currentFieldFlightSpeed * dtScale))
         droneGroup.lookAt(targetPos.x, currentPos.y, targetPos.z)
+        const remainingDist = moveDroneToward(
+          currentPos,
+          targetPos,
+          currentDroneSpeedMetersPerSec * 1.25,
+          simDeltaSec
+        )
 
-        if (currentPos.distanceTo(targetPos) < 1.2) {
+        if (remainingDist < 0.75) {
           currentPathIndex++
           if (currentPathIndex >= dronePath.length) {
             droneState.value = 'IDLE'
@@ -1843,7 +1972,7 @@ const initThree = () => {
           }
         }
       } else {
-        let targetPos = new THREE.Vector3()
+        const targetPos = new THREE.Vector3()
         if (droneState.value === 'FLYING' || droneState.value === 'ACTION') {
           const wp = activeWaypoints[activeTargetIndex]
           targetPos.set(wp.x, FLIGHT_HEIGHT, wp.z)
@@ -1851,11 +1980,9 @@ const initThree = () => {
           targetPos.copy(DRONE_BASE)
         }
 
-        const dist = currentPos.distanceTo(targetPos)
-
         if (droneState.value === 'FLYING') {
-          currentPos.lerp(targetPos, Math.min(0.2, currentFieldFlightSpeed * dtScale))
           droneGroup.lookAt(targetPos.x, currentPos.y, targetPos.z)
+          const dist = moveDroneToward(currentPos, targetPos, currentDroneSpeedMetersPerSec, simDeltaSec)
           if (dist < 0.75) {
             droneState.value = 'ACTION'
             droneGroup.rotation.set(0, 0, 0)
@@ -1869,7 +1996,8 @@ const initThree = () => {
             }
           }
         } else if (droneState.value === 'ACTION') {
-          actionTimer += dtScale
+          actionTimer += simDtScale
+          const particleFallScale = dtScale * Math.min(3, speedMult)
           const spreadRadius = Math.max(
             3.5,
             Math.min(
@@ -1878,7 +2006,7 @@ const initThree = () => {
             )
           )
           for (let i = 0; i < PARTICLE_COUNT; i++) {
-            particlePositions[i * 3 + 1] += particleVelocities[i * 3 + 1] * dtScale
+            particlePositions[i * 3 + 1] += particleVelocities[i * 3 + 1] * particleFallScale
             if (particlePositions[i * 3 + 1] < 0) {
               particlePositions[i * 3] = currentPos.x + (Math.random() - 0.5) * spreadRadius
               particlePositions[i * 3 + 1] = currentPos.y - 0.5
@@ -1928,8 +2056,13 @@ const initThree = () => {
             }
           }
         } else if (droneState.value === 'RETURNING') {
-          currentPos.lerp(targetPos, Math.min(0.18, currentFieldFlightSpeed * dtScale))
           droneGroup.lookAt(targetPos.x, currentPos.y, targetPos.z)
+          const dist = moveDroneToward(
+            currentPos,
+            targetPos,
+            currentDroneSpeedMetersPerSec * 1.35,
+            simDeltaSec
+          )
           if (dist < 0.45) {
             droneState.value = 'IDLE'
             droneGroup.rotation.set(0, 0, 0)
@@ -1981,7 +2114,7 @@ const onGraphicsQualityChange = (preset: GraphicsQualityPreset) => {
   renderer.value.shadowMap.enabled = preset !== 'performance' && !isSmallScreen
   renderer.value.shadowMap.type = preset === 'ultra' ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap
   renderer.value.shadowMap.needsUpdate = true
-  scene.value.fog = preset === 'performance' ? null : new THREE.FogExp2(0x9fc6d7, 0.0038)
+  applySceneFog(selectedFieldGeometry.value)
   if (mainDirLight) {
     mainDirLight.castShadow = preset !== 'performance'
     const shadowRes = preset === 'ultra' ? 4096 : preset === 'balanced' ? 2048 : 1024
@@ -2053,6 +2186,8 @@ onBeforeUnmount(() => {
   resizeObserver.value?.disconnect()
   if (containerRef.value) containerRef.value.removeEventListener('pointermove', onMouseMove)
   controls.value?.dispose()
+  if (surroundingsGroup) disposeGroupChildren(surroundingsGroup)
+  groundMesh?.geometry.dispose()
   groundMaterial?.map?.dispose()
   parcelSurfaceMaterial?.dispose()
   sectorFalloffTexture?.dispose()
@@ -2112,6 +2247,22 @@ onBeforeUnmount(() => {
           <Pause v-else :size="15" />
           {{ simulationPaused ? 'Reanudar' : 'Pausar' }}
         </button>
+        <div class="simulation-speed-group" role="group" aria-label="Velocidad de simulación">
+          <span class="simulation-speed-label" title="Acelerar tiempo y vuelo del dron">
+            <FastForward :size="14" />
+          </span>
+          <button
+            v-for="speed in SPEED_OPTIONS"
+            :key="speed"
+            type="button"
+            class="simulation-speed-btn"
+            :aria-pressed="simulationSpeed === speed"
+            :title="`Acelerar simulación a ${speed}x`"
+            @click="setSimulationSpeed(speed)"
+          >
+            {{ speed }}x
+          </button>
+        </div>
         <button
           class="simulation-toolbar-button"
           type="button"
@@ -2121,6 +2272,17 @@ onBeforeUnmount(() => {
         >
           <Wind :size="15" />
           {{ windEnabled ? 'Viento' : 'Sin viento' }}
+        </button>
+        <button
+          class="simulation-toolbar-button"
+          type="button"
+          @click="toggleDroneRouteVisibility"
+          :aria-pressed="showDroneRoute"
+          :title="showDroneRoute ? 'Ocultar trazado de ruta del dron' : 'Mostrar trazado de ruta del dron'"
+        >
+          <Route v-if="showDroneRoute" :size="15" />
+          <EyeOff v-else :size="15" />
+          {{ showDroneRoute ? 'Ocultar ruta' : 'Mostrar ruta' }}
         </button>
         <button class="simulation-toolbar-button" type="button" @click="runProgressiveTick('degradation', true)" :disabled="simulationPaused || allPlants.length === 0" title="Avanzar un ciclo de simulación y estrés hídrico">
           <RotateCw :size="15" />
@@ -2185,6 +2347,25 @@ onBeforeUnmount(() => {
           : 'Esperando telemetría real' }}
       </div>
       <div class="simulation-camera-tools" role="group" aria-label="Controles de cámara">
+        <button
+          type="button"
+          @click="cycleSimulationSpeed"
+          :aria-pressed="simulationSpeed > 1"
+          :title="`Acelerar tiempo y vuelo del dron (actual ${simulationSpeed}x)`"
+        >
+          <FastForward />
+          <span>{{ simulationSpeed }}x</span>
+        </button>
+        <button
+          type="button"
+          @click="toggleDroneRouteVisibility"
+          :aria-pressed="showDroneRoute"
+          :aria-label="showDroneRoute ? 'Ocultar trazado del dron' : 'Mostrar trazado del dron'"
+          :title="showDroneRoute ? 'Ocultar trazado del dron' : 'Mostrar trazado del dron'"
+        >
+          <Route v-if="showDroneRoute" />
+          <EyeOff v-else />
+        </button>
         <button
           type="button"
           @click="toggleCameraPanMode"
@@ -2616,9 +2797,49 @@ onBeforeUnmount(() => {
 
       .simulation-toolbar-button:hover:not(:disabled) { transform: translateY(-1px); }
       .simulation-toolbar-button:disabled { cursor: not-allowed; opacity: 0.45; }
-      .simulation-toolbar-button:focus-visible {
+      .simulation-toolbar-button:focus-visible,
+      .simulation-speed-btn:focus-visible {
         outline: 2px solid #f2d474;
         outline-offset: 2px;
+      }
+
+      .simulation-speed-group {
+        display: inline-flex;
+        min-height: 40px;
+        align-items: center;
+        gap: 3px;
+        padding: 3px 5px;
+        border: 1px solid rgba(196, 218, 147, 0.17);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.035);
+      }
+
+      .simulation-speed-label {
+        display: inline-flex;
+        align-items: center;
+        padding: 0 4px;
+        color: #d2b65d;
+      }
+
+      .simulation-speed-btn {
+        min-height: 30px;
+        padding: 0 8px;
+        border-radius: 7px;
+        color: #aeb7a4;
+        font-size: 0.71rem;
+        font-weight: 700;
+        transition: color 0.18s ease, background 0.18s ease;
+      }
+
+      .simulation-speed-btn:hover {
+        color: #f3f5ea;
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .simulation-speed-btn[aria-pressed="true"] {
+        color: #1f1907;
+        background: linear-gradient(135deg, #f6d977, #dfb53d);
+        box-shadow: 0 4px 12px rgba(214, 172, 58, 0.24);
       }
 
       .simulation-new-scenario {
