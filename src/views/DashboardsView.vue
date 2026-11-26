@@ -44,6 +44,7 @@ import { isolateOwnParcelGeoJson } from '../services/fieldMapWorkspace'
 import { matchesSimulationField, sanitizeExportedSimulationForField } from '../services/simulationEconomics'
 import { useParcelSimulationStore } from '../stores/parcelSimulation'
 import {
+  AGRONIA_RETROFITTING_PRICING,
   SOFTWARE_RENTAL_PLAN_LIST,
   calculateSoftwareRentalRoi,
   type SoftwareRentalPlanKey,
@@ -380,7 +381,13 @@ const financialComparisonChartOptions = computed(() => {
     grid: { left: 8, right: 10, top: 16, bottom: 8, containLabel: true },
     xAxis: {
       type: 'category',
-      data: ['Tratamiento\nReactivo', 'Impacto\nTotal', 'Inversión\nPreventiva', 'Renta\nAgronIA', 'Ahorro Neto\nProyectado'],
+      data: [
+        'Tratamiento\nReactivo',
+        'Impacto\nTotal',
+        'Inversión\nPreventiva',
+        includeRetrofitting.value ? 'AgronIA\n(Paquete)' : 'Renta\nAgronIA',
+        'Ahorro Neto\nProyectado',
+      ],
       axisLabel: { color: '#c4ccb8', fontSize: 10, lineHeight: 13, interval: 0 },
     },
     yAxis: {
@@ -411,7 +418,7 @@ const financialComparisonChartOptions = computed(() => {
             itemStyle: { color: '#38bdf8', borderRadius: [6, 6, 0, 0] },
           },
           {
-            value: softwareRentalSummary.value.rentalCostPerCycleMxn,
+            value: softwareRentalSummary.value.totalCommercialInvestmentMxn,
             itemStyle: { color: '#a855f7', borderRadius: [6, 6, 0, 0] },
           },
           {
@@ -428,6 +435,7 @@ const financialComparisonChartOptions = computed(() => {
 // Renta del Software AgronIA por ciclo vs. Ahorros al Productor
 // ============================================================
 const selectedRentalPlanKey = ref<SoftwareRentalPlanKey | 'auto'>('auto')
+const includeRetrofitting = ref(false)
 const softwareRentalSummary = computed(() => {
   const sim = activeSimulation.value
   const overridePlan = selectedRentalPlanKey.value === 'auto' ? undefined : selectedRentalPlanKey.value
@@ -436,6 +444,7 @@ const softwareRentalSummary = computed(() => {
       areaHectares: sim.report.parcel.areaHectares,
       areaSquareMeters: sim.report.parcel.areaSquareMeters,
       planKey: overridePlan,
+      includeRetrofitting: includeRetrofitting.value,
       grossAvoidedLossMxn: sim.economics.totalProjectedGrossAvoidedCost,
       preventiveImplementationCostMxn: sim.economics.preventiveTotalCost,
       netPreventiveSavingsMxn: sim.economics.totalProjectedNetSavings,
@@ -449,6 +458,7 @@ const softwareRentalSummary = computed(() => {
     areaHectares: geometry?.areaHectares ?? 5,
     areaSquareMeters: geometry?.areaSquareMeters ?? 50_000,
     planKey: overridePlan,
+    includeRetrofitting: includeRetrofitting.value,
     hasExportedSimulation: false,
   })
 })
@@ -1088,7 +1098,7 @@ const pestGaugeOptions = computed(() => ({
             {{ formatCurrencyMxn(Math.max(0, activeSimulation.economics.totalProjectedNetSavings)) }}
           </div>
           <div class="dashboard-metric-note">
-            Renta AgronIA: {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }}/ciclo · Libre tras renta: {{ formatCurrencyMxn(softwareRentalSummary.netBenefitAfterRentalMxn) }}
+            {{ includeRetrofitting ? 'Paquete AgronIA' : 'Renta AgronIA' }}: {{ formatCurrencyMxn(softwareRentalSummary.totalCommercialInvestmentMxn) }} · Libre tras pago: {{ formatCurrencyMxn(softwareRentalSummary.netBenefitAfterRentalMxn) }}
           </div>
         </div>
       </div>
@@ -1387,19 +1397,55 @@ const pestGaugeOptions = computed(() => ({
           </button>
         </div>
 
+        <!-- Retrofitting (Hardware) + Paquete de Entrada -->
+        <div class="flex flex-col gap-3 rounded-xl border border-amber-400/25 bg-gradient-to-r from-[#1a2219] via-[#172017] to-[#1f1c14] p-4 md:flex-row md:items-center md:justify-between">
+          <div class="space-y-1">
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="rounded-full border border-amber-400/35 bg-amber-500/15 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-200">
+                Retrofitting de Dron + Paquete de Entrada
+              </span>
+              <span class="text-xs font-bold text-emerald-300">
+                Paquete Profesional (Retrofitting + 1er Ciclo 3–7 ha): {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.starterBundlePriceMxn) }} MXN
+              </span>
+            </div>
+            <p class="text-xs text-gray-300">
+              Reacondicionamiento único del dron cliente:
+              <strong class="text-white">{{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.retrofittingSalePriceMxn) }} MXN</strong>
+              <span class="text-gray-400">
+                (Kit sensores {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.kitCostMxn) }} +
+                calibración {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.installationLaborMxn) }} +
+                integración IA {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.techMarginMxn) }}).
+                En paquete ahorra {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.starterBundleDiscountMxn) }} MXN frente al costo por separado.
+              </span>
+            </p>
+          </div>
+          <label class="inline-flex shrink-0 cursor-pointer items-center gap-2.5 rounded-xl border border-purple-400/35 bg-purple-500/15 px-3.5 py-2.5 text-xs font-semibold text-purple-100 transition hover:bg-purple-500/25">
+            <input
+              v-model="includeRetrofitting"
+              type="checkbox"
+              class="h-4 w-4 rounded border-purple-300 accent-purple-400"
+            >
+            <span>Incluir Retrofitting (1er ciclo)</span>
+          </label>
+        </div>
+
         <!-- 4 KPIs explícitos: Renta vs Ahorro vs Beneficio Neto vs ROI -->
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <div class="rounded-xl border border-purple-400/30 bg-purple-950/25 p-3.5">
             <span class="block text-[11px] font-semibold uppercase tracking-wider text-purple-200/80">
-              Costo de renta AgronIA (1 ciclo)
+              {{ includeRetrofitting ? 'Inversión AgronIA (1er ciclo + Dron)' : 'Costo de renta AgronIA (1 ciclo)' }}
             </span>
             <strong class="mt-1 block text-2xl font-extrabold text-purple-200">
-              {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }}
+              {{ formatCurrencyMxn(softwareRentalSummary.totalCommercialInvestmentMxn) }}
             </strong>
             <span class="mt-1 block text-[11px] text-gray-300">
-              ~{{ formatCurrencyMxn(softwareRentalSummary.rentalMonthlyEquivalentMxn) }}/mes ·
-              {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerHectareMxn) }}/ha ·
-              ${{ softwareRentalSummary.rentalCostPerSquareMeterMxn.toFixed(3) }}/m²
+              Licencia {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }} (~{{ formatCurrencyMxn(softwareRentalSummary.rentalMonthlyEquivalentMxn) }}/mes · {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerHectareMxn) }}/ha · ${{ softwareRentalSummary.rentalCostPerSquareMeterMxn.toFixed(3) }}/m²)
+            </span>
+            <span v-if="includeRetrofitting" class="mt-0.5 block text-[10px] text-emerald-300">
+              Incluye Retrofitting (+{{ formatCurrencyMxn(softwareRentalSummary.retrofittingCostMxn) }})
+              <template v-if="softwareRentalSummary.bundleDiscountMxn > 0">
+                − desc. paquete ({{ formatCurrencyMxn(softwareRentalSummary.bundleDiscountMxn) }})
+              </template>
             </span>
             <span v-if="softwareRentalSummary.extraHectares > 0" class="mt-0.5 block text-[10px] text-amber-300">
               Incluye +{{ softwareRentalSummary.extraHectares }} ha excedentes (+{{ formatCurrencyMxn(softwareRentalSummary.extraHectaresCostMxn) }})
@@ -1484,6 +1530,20 @@ const pestGaugeOptions = computed(() => ({
             <div class="flex items-center justify-between gap-4 rounded-lg border border-purple-400/25 bg-purple-500/10 px-3 py-2 font-semibold text-purple-200">
               <span>(−) Renta del software AgronIA — {{ softwareRentalSummary.plan.name }}</span>
               <span>−{{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }}</span>
+            </div>
+            <div
+              v-if="includeRetrofitting"
+              class="flex items-center justify-between gap-4 rounded-lg border border-amber-400/25 bg-amber-500/10 px-3 py-2 font-semibold text-amber-200"
+            >
+              <span>(−) Servicio de Retrofitting de dron (kit sensores + calibración, pago único)</span>
+              <span>−{{ formatCurrencyMxn(softwareRentalSummary.retrofittingCostMxn) }}</span>
+            </div>
+            <div
+              v-if="softwareRentalSummary.bundleDiscountMxn > 0"
+              class="flex items-center justify-between gap-4 px-3 text-emerald-300"
+            >
+              <span>(+) Descuento Paquete de Entrada Profesional</span>
+              <strong>+{{ formatCurrencyMxn(softwareRentalSummary.bundleDiscountMxn) }}</strong>
             </div>
             <div
               class="flex items-center justify-between gap-4 rounded-lg border px-3 py-2.5 text-sm font-extrabold"

@@ -400,6 +400,7 @@ export interface SoftwareRentalRoiInput {
   areaHectares: number
   areaSquareMeters?: number
   planKey?: SoftwareRentalPlanKey
+  includeRetrofitting?: boolean
   grossAvoidedLossMxn?: number
   preventiveImplementationCostMxn?: number
   netPreventiveSavingsMxn?: number
@@ -418,6 +419,10 @@ export interface SoftwareRentalRoiBreakdown {
   extraHectares: number
   extraHectaresCostMxn: number
   rentalCostPerCycleMxn: number
+  includeRetrofitting: boolean
+  retrofittingCostMxn: number
+  bundleDiscountMxn: number
+  totalCommercialInvestmentMxn: number
   rentalMonthlyEquivalentMxn: number
   rentalCostPerHectareMxn: number
   rentalCostPerSquareMeterMxn: number
@@ -432,6 +437,18 @@ export interface SoftwareRentalRoiBreakdown {
   rentalShareOfCycleProductionPercent: number
   isBenchmarkEstimate: boolean
 }
+
+export const AGRONIA_RETROFITTING_PRICING = {
+  kitCostMxn: 9500,
+  installationLaborMxn: 3500,
+  techMarginMxn: 5500,
+  retrofittingSalePriceMxn: 18_500,
+  retrofittingContributionMarginMxn: 9000,
+  starterBundlePriceMxn: 20_900,
+  starterBundleDiscountMxn: 550,
+  starterBundleVariableCostMxn: 9900,
+  starterBundleContributionMarginMxn: 11_000,
+} as const
 
 export const SOFTWARE_RENTAL_PLANS: Record<SoftwareRentalPlanKey, SoftwareRentalPlan> = {
   basico: {
@@ -513,6 +530,18 @@ export const calculateSoftwareRentalRoi = (
   const extraHectares = Math.max(0, Number((areaHectares - plan.includedHectares).toFixed(2)))
   const extraHectaresCostMxn = Math.round(extraHectares * plan.extraHectareRateMxn)
   const rentalCostPerCycleMxn = plan.basePricePerCycleMxn + extraHectaresCostMxn
+  const includeRetrofitting = Boolean(input.includeRetrofitting)
+  const retrofittingCostMxn = includeRetrofitting
+    ? AGRONIA_RETROFITTING_PRICING.retrofittingSalePriceMxn
+    : 0
+  const bundleDiscountMxn =
+    includeRetrofitting && plan.key === 'profesional' && extraHectares === 0
+      ? AGRONIA_RETROFITTING_PRICING.starterBundleDiscountMxn
+      : 0
+  const totalCommercialInvestmentMxn = Math.max(
+    0,
+    rentalCostPerCycleMxn + retrofittingCostMxn - bundleDiscountMxn,
+  )
   const rentalMonthlyEquivalentMxn = Math.round(rentalCostPerCycleMxn / 5)
   const rentalCostPerHectareMxn = Number((rentalCostPerCycleMxn / areaHectares).toFixed(2))
   const rentalCostPerSquareMeterMxn = Number((rentalCostPerCycleMxn / areaSquareMeters).toFixed(4))
@@ -520,7 +549,7 @@ export const calculateSoftwareRentalRoi = (
   const cycleProductionCostMxn = areaSquareMeters * benchmark.productionTotalPerM2
   const rentalShareOfCycleProductionPercent =
     cycleProductionCostMxn > 0
-      ? Number(((rentalCostPerCycleMxn / cycleProductionCostMxn) * 100).toFixed(2))
+      ? Number(((totalCommercialInvestmentMxn / cycleProductionCostMxn) * 100).toFixed(2))
       : 0
 
   let grossAvoidedLossMxn = 0
@@ -556,14 +585,16 @@ export const calculateSoftwareRentalRoi = (
     )
   }
 
-  const netBenefitAfterRentalMxn = Math.round(producerSavingsBeforeRentalMxn - rentalCostPerCycleMxn)
+  const netBenefitAfterRentalMxn = Math.round(
+    producerSavingsBeforeRentalMxn - totalCommercialInvestmentMxn,
+  )
   const roiMultiple =
-    rentalCostPerCycleMxn > 0
-      ? Number((producerSavingsBeforeRentalMxn / rentalCostPerCycleMxn).toFixed(2))
+    totalCommercialInvestmentMxn > 0
+      ? Number((producerSavingsBeforeRentalMxn / totalCommercialInvestmentMxn).toFixed(2))
       : 0
   const roiPercentAfterRental =
-    rentalCostPerCycleMxn > 0
-      ? Number(((netBenefitAfterRentalMxn / rentalCostPerCycleMxn) * 100).toFixed(1))
+    totalCommercialInvestmentMxn > 0
+      ? Number(((netBenefitAfterRentalMxn / totalCommercialInvestmentMxn) * 100).toFixed(1))
       : 0
 
   return {
@@ -575,6 +606,10 @@ export const calculateSoftwareRentalRoi = (
     extraHectares,
     extraHectaresCostMxn,
     rentalCostPerCycleMxn,
+    includeRetrofitting,
+    retrofittingCostMxn,
+    bundleDiscountMxn,
+    totalCommercialInvestmentMxn,
     rentalMonthlyEquivalentMxn,
     rentalCostPerHectareMxn,
     rentalCostPerSquareMeterMxn,
@@ -585,7 +620,7 @@ export const calculateSoftwareRentalRoi = (
     netBenefitAfterRentalMxn,
     roiMultiple,
     roiPercentAfterRental,
-    paybackCovered: producerSavingsBeforeRentalMxn >= rentalCostPerCycleMxn,
+    paybackCovered: producerSavingsBeforeRentalMxn >= totalCommercialInvestmentMxn,
     rentalShareOfCycleProductionPercent,
     isBenchmarkEstimate,
   }

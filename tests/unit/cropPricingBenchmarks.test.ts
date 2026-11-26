@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  AGRONIA_RETROFITTING_PRICING,
   CROP_PRICING_LIST,
   SOFTWARE_RENTAL_PLANS,
   calculateParcelPriceEstimate,
@@ -121,8 +122,28 @@ test('calculateSoftwareRentalRoi computes overage pricing, net benefit after ren
   })
   assert.equal(benchmark5Ha.recommendedPlanKey, 'profesional')
   assert.equal(benchmark5Ha.rentalCostPerCycleMxn, 2950)
+  assert.equal(benchmark5Ha.totalCommercialInvestmentMxn, 2950)
   assert.equal(benchmark5Ha.isBenchmarkEstimate, true)
   assert.ok(benchmark5Ha.producerSavingsBeforeRentalMxn > benchmark5Ha.rentalCostPerCycleMxn)
   assert.ok(benchmark5Ha.netBenefitAfterRentalMxn > 0)
   assert.equal(benchmark5Ha.paybackCovered, true)
+
+  // Con Retrofitting ($18,500) + 1er Ciclo Profesional ($2,950) - $550 descuento paquete = $20,900 MXN
+  assert.equal(AGRONIA_RETROFITTING_PRICING.retrofittingSalePriceMxn, 18_500)
+  assert.equal(AGRONIA_RETROFITTING_PRICING.starterBundlePriceMxn, 20_900)
+  const starterBundle = calculateSoftwareRentalRoi({
+    areaHectares: 5,
+    planKey: 'profesional',
+    includeRetrofitting: true,
+    grossAvoidedLossMxn: 32_000,
+    preventiveImplementationCostMxn: 4_000,
+    netPreventiveSavingsMxn: 28_000,
+    droneSavingsMxn: 2_500,
+    hasExportedSimulation: true,
+  })
+  assert.equal(starterBundle.retrofittingCostMxn, 18_500)
+  assert.equal(starterBundle.bundleDiscountMxn, 550)
+  assert.equal(starterBundle.totalCommercialInvestmentMxn, 20_900)
+  assert.equal(starterBundle.netBenefitAfterRentalMxn, 28_000 - 20_900)
+  assert.equal(starterBundle.paybackCovered, true)
 })
