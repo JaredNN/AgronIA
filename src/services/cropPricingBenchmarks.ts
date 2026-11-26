@@ -396,11 +396,23 @@ export interface SoftwareRentalPlan {
   recommendedBadge?: string
 }
 
+export type SuccessFeeRateOption = 0 | 10 | 12.5
+
+export const SUCCESS_FEE_RATE_OPTIONS: ReadonlyArray<{
+  ratePercent: SuccessFeeRateOption
+  label: string
+}> = [
+  { ratePercent: 0, label: '0% (Solo cuota fija)' },
+  { ratePercent: 10, label: '10% del ahorro (Recomendado)' },
+  { ratePercent: 12.5, label: '12.5% del ahorro' },
+]
+
 export interface SoftwareRentalRoiInput {
   areaHectares: number
   areaSquareMeters?: number
   planKey?: SoftwareRentalPlanKey
   includeRetrofitting?: boolean
+  successFeePercent?: number
   grossAvoidedLossMxn?: number
   preventiveImplementationCostMxn?: number
   netPreventiveSavingsMxn?: number
@@ -422,6 +434,8 @@ export interface SoftwareRentalRoiBreakdown {
   includeRetrofitting: boolean
   retrofittingCostMxn: number
   bundleDiscountMxn: number
+  successFeePercent: number
+  successFeeMxn: number
   totalCommercialInvestmentMxn: number
   rentalMonthlyEquivalentMxn: number
   rentalCostPerHectareMxn: number
@@ -431,6 +445,7 @@ export interface SoftwareRentalRoiBreakdown {
   droneSavingsMxn: number
   producerSavingsBeforeRentalMxn: number
   netBenefitAfterRentalMxn: number
+  producerRetentionPercent: number
   roiMultiple: number
   roiPercentAfterRental: number
   paybackCovered: boolean
@@ -538,19 +553,9 @@ export const calculateSoftwareRentalRoi = (
     includeRetrofitting && plan.key === 'profesional' && extraHectares === 0
       ? AGRONIA_RETROFITTING_PRICING.starterBundleDiscountMxn
       : 0
-  const totalCommercialInvestmentMxn = Math.max(
-    0,
-    rentalCostPerCycleMxn + retrofittingCostMxn - bundleDiscountMxn,
-  )
   const rentalMonthlyEquivalentMxn = Math.round(rentalCostPerCycleMxn / 5)
   const rentalCostPerHectareMxn = Number((rentalCostPerCycleMxn / areaHectares).toFixed(2))
   const rentalCostPerSquareMeterMxn = Number((rentalCostPerCycleMxn / areaSquareMeters).toFixed(4))
-
-  const cycleProductionCostMxn = areaSquareMeters * benchmark.productionTotalPerM2
-  const rentalShareOfCycleProductionPercent =
-    cycleProductionCostMxn > 0
-      ? Number(((totalCommercialInvestmentMxn / cycleProductionCostMxn) * 100).toFixed(2))
-      : 0
 
   let grossAvoidedLossMxn = 0
   let preventiveImplementationCostMxn = 0
@@ -585,9 +590,30 @@ export const calculateSoftwareRentalRoi = (
     )
   }
 
+  const successFeePercent = Number.isFinite(input.successFeePercent)
+    ? clamp(input.successFeePercent as number, 0, 30)
+    : 0
+  const successFeeMxn = Math.round(producerSavingsBeforeRentalMxn * (successFeePercent / 100))
+  const totalCommercialInvestmentMxn = Math.max(
+    0,
+    rentalCostPerCycleMxn + successFeeMxn + retrofittingCostMxn - bundleDiscountMxn,
+  )
+
+  const cycleProductionCostMxn = areaSquareMeters * benchmark.productionTotalPerM2
+  const rentalShareOfCycleProductionPercent =
+    cycleProductionCostMxn > 0
+      ? Number(((totalCommercialInvestmentMxn / cycleProductionCostMxn) * 100).toFixed(2))
+      : 0
+
   const netBenefitAfterRentalMxn = Math.round(
     producerSavingsBeforeRentalMxn - totalCommercialInvestmentMxn,
   )
+  const producerRetentionPercent =
+    producerSavingsBeforeRentalMxn > 0
+      ? Number(
+          ((Math.max(0, netBenefitAfterRentalMxn) / producerSavingsBeforeRentalMxn) * 100).toFixed(1),
+        )
+      : 0
   const roiMultiple =
     totalCommercialInvestmentMxn > 0
       ? Number((producerSavingsBeforeRentalMxn / totalCommercialInvestmentMxn).toFixed(2))
@@ -609,6 +635,8 @@ export const calculateSoftwareRentalRoi = (
     includeRetrofitting,
     retrofittingCostMxn,
     bundleDiscountMxn,
+    successFeePercent,
+    successFeeMxn,
     totalCommercialInvestmentMxn,
     rentalMonthlyEquivalentMxn,
     rentalCostPerHectareMxn,
@@ -618,6 +646,7 @@ export const calculateSoftwareRentalRoi = (
     droneSavingsMxn,
     producerSavingsBeforeRentalMxn,
     netBenefitAfterRentalMxn,
+    producerRetentionPercent,
     roiMultiple,
     roiPercentAfterRental,
     paybackCovered: producerSavingsBeforeRentalMxn >= totalCommercialInvestmentMxn,

@@ -4,6 +4,7 @@ import {
   AGRONIA_RETROFITTING_PRICING,
   CROP_PRICING_LIST,
   SOFTWARE_RENTAL_PLANS,
+  SUCCESS_FEE_RATE_OPTIONS,
   calculateParcelPriceEstimate,
   calculateSoftwareRentalRoi,
   recommendSoftwareRentalPlan,
@@ -146,4 +147,41 @@ test('calculateSoftwareRentalRoi computes overage pricing, net benefit after ren
   assert.equal(starterBundle.totalCommercialInvestmentMxn, 20_900)
   assert.equal(starterBundle.netBenefitAfterRentalMxn, 28_000 - 20_900)
   assert.equal(starterBundle.paybackCovered, true)
+})
+
+test('calculateSoftwareRentalRoi applies 10% and 12.5% hybrid success fee on proven producer savings', () => {
+  assert.deepEqual(
+    SUCCESS_FEE_RATE_OPTIONS.map(o => o.ratePercent),
+    [0, 10, 12.5],
+  )
+
+  const hybrid10 = calculateSoftwareRentalRoi({
+    areaHectares: 5,
+    planKey: 'profesional',
+    successFeePercent: 10,
+    grossAvoidedLossMxn: 105_000,
+    preventiveImplementationCostMxn: 5_000,
+    netPreventiveSavingsMxn: 100_000,
+    hasExportedSimulation: true,
+  })
+  assert.equal(hybrid10.successFeePercent, 10)
+  assert.equal(hybrid10.successFeeMxn, 10_000)
+  assert.equal(hybrid10.totalCommercialInvestmentMxn, 2950 + 10_000)
+  assert.equal(hybrid10.netBenefitAfterRentalMxn, 100_000 - 12_950)
+  assert.equal(hybrid10.producerRetentionPercent, 87.1)
+  assert.equal(hybrid10.paybackCovered, true)
+
+  const hybrid125 = calculateSoftwareRentalRoi({
+    areaHectares: 5,
+    planKey: 'profesional',
+    successFeePercent: 12.5,
+    grossAvoidedLossMxn: 105_000,
+    preventiveImplementationCostMxn: 5_000,
+    netPreventiveSavingsMxn: 100_000,
+    hasExportedSimulation: true,
+  })
+  assert.equal(hybrid125.successFeePercent, 12.5)
+  assert.equal(hybrid125.successFeeMxn, 12_500)
+  assert.equal(hybrid125.totalCommercialInvestmentMxn, 2950 + 12_500)
+  assert.equal(hybrid125.netBenefitAfterRentalMxn, 100_000 - 15_450)
 })

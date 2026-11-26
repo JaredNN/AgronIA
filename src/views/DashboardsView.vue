@@ -46,8 +46,10 @@ import { useParcelSimulationStore } from '../stores/parcelSimulation'
 import {
   AGRONIA_RETROFITTING_PRICING,
   SOFTWARE_RENTAL_PLAN_LIST,
+  SUCCESS_FEE_RATE_OPTIONS,
   calculateSoftwareRentalRoi,
   type SoftwareRentalPlanKey,
+  type SuccessFeeRateOption,
 } from '../services/cropPricingBenchmarks'
 
 use([
@@ -385,7 +387,11 @@ const financialComparisonChartOptions = computed(() => {
         'Tratamiento\nReactivo',
         'Impacto\nTotal',
         'Inversión\nPreventiva',
-        includeRetrofitting.value ? 'AgronIA\n(Paquete)' : 'Renta\nAgronIA',
+        includeRetrofitting.value
+          ? 'AgronIA\n(Paquete)'
+          : selectedSuccessFeePercent.value > 0
+            ? 'AgronIA\n(Híbrido)'
+            : 'Renta\nAgronIA',
         'Ahorro Neto\nProyectado',
       ],
       axisLabel: { color: '#c4ccb8', fontSize: 10, lineHeight: 13, interval: 0 },
@@ -436,6 +442,7 @@ const financialComparisonChartOptions = computed(() => {
 // ============================================================
 const selectedRentalPlanKey = ref<SoftwareRentalPlanKey | 'auto'>('auto')
 const includeRetrofitting = ref(false)
+const selectedSuccessFeePercent = ref<SuccessFeeRateOption>(10)
 const softwareRentalSummary = computed(() => {
   const sim = activeSimulation.value
   const overridePlan = selectedRentalPlanKey.value === 'auto' ? undefined : selectedRentalPlanKey.value
@@ -445,6 +452,7 @@ const softwareRentalSummary = computed(() => {
       areaSquareMeters: sim.report.parcel.areaSquareMeters,
       planKey: overridePlan,
       includeRetrofitting: includeRetrofitting.value,
+      successFeePercent: selectedSuccessFeePercent.value,
       grossAvoidedLossMxn: sim.economics.totalProjectedGrossAvoidedCost,
       preventiveImplementationCostMxn: sim.economics.preventiveTotalCost,
       netPreventiveSavingsMxn: sim.economics.totalProjectedNetSavings,
@@ -459,6 +467,7 @@ const softwareRentalSummary = computed(() => {
     areaSquareMeters: geometry?.areaSquareMeters ?? 50_000,
     planKey: overridePlan,
     includeRetrofitting: includeRetrofitting.value,
+    successFeePercent: selectedSuccessFeePercent.value,
     hasExportedSimulation: false,
   })
 })
@@ -1397,49 +1406,90 @@ const pestGaugeOptions = computed(() => ({
           </button>
         </div>
 
-        <!-- Retrofitting (Hardware) + Paquete de Entrada -->
-        <div class="flex flex-col gap-3 rounded-xl border border-amber-400/25 bg-gradient-to-r from-[#1a2219] via-[#172017] to-[#1f1c14] p-4 md:flex-row md:items-center md:justify-between">
-          <div class="space-y-1">
-            <div class="flex flex-wrap items-center gap-2">
-              <span class="rounded-full border border-amber-400/35 bg-amber-500/15 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-200">
-                Retrofitting de Dron + Paquete de Entrada
-              </span>
-              <span class="text-xs font-bold text-emerald-300">
-                Paquete Profesional (Retrofitting + 1er Ciclo 3–7 ha): {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.starterBundlePriceMxn) }} MXN
-              </span>
+        <!-- Modelo Híbrido (Comisión por ahorro) + Retrofitting -->
+        <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <div class="flex flex-col justify-between gap-3 rounded-xl border border-emerald-400/25 bg-gradient-to-r from-[#131d16] to-[#17211a] p-4">
+            <div class="space-y-1">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="rounded-full border border-emerald-400/35 bg-emerald-500/15 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-200">
+                  Modelo Híbrido · Comisión por Éxito
+                </span>
+                <span class="text-xs font-semibold text-emerald-300">
+                  Cuota base + % del ahorro comprobado
+                </span>
+              </div>
+              <p class="text-xs text-gray-300">
+                El productor solo paga comisión sobre el dinero que AgronIA comprueba evitarle perder (conserva entre <strong class="text-white">87.5% y 90%</strong> de cada peso rescatado).
+              </p>
             </div>
-            <p class="text-xs text-gray-300">
-              Reacondicionamiento único del dron cliente:
-              <strong class="text-white">{{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.retrofittingSalePriceMxn) }} MXN</strong>
-              <span class="text-gray-400">
-                (Kit sensores {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.kitCostMxn) }} +
-                calibración {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.installationLaborMxn) }} +
-                integración IA {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.techMarginMxn) }}).
-                En paquete ahorra {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.starterBundleDiscountMxn) }} MXN frente al costo por separado.
-              </span>
-            </p>
+            <div class="flex flex-wrap gap-2" role="group" aria-label="Comisión por ahorro comprobado">
+              <button
+                v-for="opt in SUCCESS_FEE_RATE_OPTIONS"
+                :key="opt.ratePercent"
+                type="button"
+                class="rounded-lg border px-3 py-1.5 text-[11px] font-bold transition"
+                :class="selectedSuccessFeePercent === opt.ratePercent
+                  ? 'border-emerald-400 bg-emerald-500/25 text-emerald-200 shadow-sm'
+                  : 'border-white/15 bg-black/25 text-gray-300 hover:border-emerald-400/40'"
+                @click="selectedSuccessFeePercent = opt.ratePercent"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
           </div>
-          <label class="inline-flex shrink-0 cursor-pointer items-center gap-2.5 rounded-xl border border-purple-400/35 bg-purple-500/15 px-3.5 py-2.5 text-xs font-semibold text-purple-100 transition hover:bg-purple-500/25">
-            <input
-              v-model="includeRetrofitting"
-              type="checkbox"
-              class="h-4 w-4 rounded border-purple-300 accent-purple-400"
-            >
-            <span>Incluir Retrofitting (1er ciclo)</span>
-          </label>
+
+          <div class="flex flex-col justify-between gap-3 rounded-xl border border-amber-400/25 bg-gradient-to-r from-[#1a2219] via-[#172017] to-[#1f1c14] p-4 sm:flex-row sm:items-center">
+            <div class="space-y-1">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="rounded-full border border-amber-400/35 bg-amber-500/15 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-200">
+                  Retrofitting de Dron + Paquete de Entrada
+                </span>
+                <span class="text-xs font-bold text-emerald-300">
+                  Paquete Profesional: {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.starterBundlePriceMxn) }} MXN
+                </span>
+              </div>
+              <p class="text-xs text-gray-300">
+                Reacondicionamiento único del dron:
+                <strong class="text-white">{{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.retrofittingSalePriceMxn) }} MXN</strong>
+                <span class="text-gray-400">
+                  (Kit {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.kitCostMxn) }} +
+                  mano obra {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.installationLaborMxn) }} +
+                  IA {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.techMarginMxn) }} · desc. {{ formatCurrencyMxn(AGRONIA_RETROFITTING_PRICING.starterBundleDiscountMxn) }} en paquete).
+                </span>
+              </p>
+            </div>
+            <label class="inline-flex shrink-0 cursor-pointer items-center gap-2.5 rounded-xl border border-purple-400/35 bg-purple-500/15 px-3.5 py-2.5 text-xs font-semibold text-purple-100 transition hover:bg-purple-500/25">
+              <input
+                v-model="includeRetrofitting"
+                type="checkbox"
+                class="h-4 w-4 rounded border-purple-300 accent-purple-400"
+              >
+              <span>Incluir Retrofitting (1er ciclo)</span>
+            </label>
+          </div>
         </div>
 
         <!-- 4 KPIs explícitos: Renta vs Ahorro vs Beneficio Neto vs ROI -->
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <div class="rounded-xl border border-purple-400/30 bg-purple-950/25 p-3.5">
             <span class="block text-[11px] font-semibold uppercase tracking-wider text-purple-200/80">
-              {{ includeRetrofitting ? 'Inversión AgronIA (1er ciclo + Dron)' : 'Costo de renta AgronIA (1 ciclo)' }}
+              {{ includeRetrofitting
+                ? 'Cobro total AgronIA (1er ciclo + Dron)'
+                : softwareRentalSummary.successFeePercent > 0
+                  ? 'Cobro total AgronIA (Base + Comisión)'
+                  : 'Costo de renta AgronIA (1 ciclo)' }}
             </span>
             <strong class="mt-1 block text-2xl font-extrabold text-purple-200">
               {{ formatCurrencyMxn(softwareRentalSummary.totalCommercialInvestmentMxn) }}
             </strong>
             <span class="mt-1 block text-[11px] text-gray-300">
-              Licencia {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }} (~{{ formatCurrencyMxn(softwareRentalSummary.rentalMonthlyEquivalentMxn) }}/mes · {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerHectareMxn) }}/ha · ${{ softwareRentalSummary.rentalCostPerSquareMeterMxn.toFixed(3) }}/m²)
+              Base {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }}
+              <template v-if="softwareRentalSummary.successFeePercent > 0">
+                + Comisión {{ softwareRentalSummary.successFeePercent }}% ({{ formatCurrencyMxn(softwareRentalSummary.successFeeMxn) }})
+              </template>
+              <template v-else>
+                (~{{ formatCurrencyMxn(softwareRentalSummary.rentalMonthlyEquivalentMxn) }}/mes · {{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerHectareMxn) }}/ha · ${{ softwareRentalSummary.rentalCostPerSquareMeterMxn.toFixed(3) }}/m²)
+              </template>
             </span>
             <span v-if="includeRetrofitting" class="mt-0.5 block text-[10px] text-emerald-300">
               Incluye Retrofitting (+{{ formatCurrencyMxn(softwareRentalSummary.retrofittingCostMxn) }})
@@ -1481,7 +1531,12 @@ const pestGaugeOptions = computed(() => ({
               {{ formatCurrencyMxn(softwareRentalSummary.netBenefitAfterRentalMxn) }}
             </strong>
             <span class="mt-1 block text-[11px] text-gray-300">
-              Ahorro neto al productor menos la renta del ciclo ({{ softwareRentalSummary.plan.name }})
+              <template v-if="softwareRentalSummary.netBenefitAfterRentalMxn > 0">
+                El productor conserva el <strong>{{ softwareRentalSummary.producerRetentionPercent }}%</strong> del ahorro neto generado.
+              </template>
+              <template v-else>
+                Ahorro neto al productor menos el cobro del ciclo ({{ softwareRentalSummary.plan.name }})
+              </template>
             </span>
           </div>
 
@@ -1528,8 +1583,15 @@ const pestGaugeOptions = computed(() => ({
               <span>{{ formatCurrencyMxn(softwareRentalSummary.producerSavingsBeforeRentalMxn) }}</span>
             </div>
             <div class="flex items-center justify-between gap-4 rounded-lg border border-purple-400/25 bg-purple-500/10 px-3 py-2 font-semibold text-purple-200">
-              <span>(−) Renta del software AgronIA — {{ softwareRentalSummary.plan.name }}</span>
+              <span>(−) Cuota base de plataforma AgronIA — {{ softwareRentalSummary.plan.name }}</span>
               <span>−{{ formatCurrencyMxn(softwareRentalSummary.rentalCostPerCycleMxn) }}</span>
+            </div>
+            <div
+              v-if="softwareRentalSummary.successFeePercent > 0"
+              class="flex items-center justify-between gap-4 rounded-lg border border-sky-400/25 bg-sky-500/10 px-3 py-2 font-semibold text-sky-200"
+            >
+              <span>(−) Comisión por éxito AgronIA ({{ softwareRentalSummary.successFeePercent }}% sobre ahorro comprobado)</span>
+              <span>−{{ formatCurrencyMxn(softwareRentalSummary.successFeeMxn) }}</span>
             </div>
             <div
               v-if="includeRetrofitting"
